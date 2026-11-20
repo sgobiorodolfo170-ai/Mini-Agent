@@ -10,8 +10,6 @@ import {
   unexpectedErrors
 } from './helpers'
 
-const INPUT = '输入消息，Enter 发送，Shift+Enter 换行'
-
 let ctx
 
 beforeEach(async () => {
@@ -39,8 +37,11 @@ describe('Agent 全链路（工具调用 + 分级确认 + 执行日志）', () =
 
     await win.getByTestId('nav-chat').click()
     await win.getByTestId('new-conv').click()
+    // 模式入口改为下拉（默认权限 / 自主模式），选中后由业务层决定发送路径
     await win.getByTestId('agent-toggle').click()
-    await win.getByPlaceholder(INPUT).fill('把结果写入文件')
+    await win.getByRole('menuitemradio', { name: /自主模式/ }).click()
+    // 任务态 placeholder 为「提出后续修改要求」，这里用稳定的 testid 定位输入框
+    await win.getByTestId('chat-input').fill('把结果写入文件')
     await win.keyboard.press('Enter')
 
     await win.getByText('Agent 请求确认').waitFor({ timeout: 45000 })
@@ -57,6 +58,39 @@ describe('Agent 全链路（工具调用 + 分级确认 + 执行日志）', () =
     // 步骤卡参数默认折叠（F17）：写入内容在参数 JSON 中，展开后断言回放
     await win.getByText('参数', { exact: true }).click()
     await win.getByText('E2E写入内容').first().waitFor({ timeout: 15000 })
+
+    expect(unexpectedErrors(consoleErrors)).toEqual([])
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('完整权限：写入不再逐次确认，直接执行并留下权限来源审计', async () => {
+    const { electronApp, win, mock, consoleErrors } = ctx
+    await setupProviderAndKey(win, mock.url, 'sk-good')
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'miniagent-agent-full-'))
+    await patchOpenDialog(electronApp, dir)
+    await win.getByTestId('nav-settings').click()
+    await win.getByTestId('settings-section-agent').click()
+    await win.getByText('+ 添加目录').click()
+    await win.getByText(dir).waitFor({ timeout: 15000 })
+    mock.state.agentFile = path.join(dir, 'full-out.txt')
+
+    await win.getByTestId('nav-chat').click()
+    await win.getByTestId('new-conv').click()
+    await win.getByTestId('agent-toggle').click()
+    await win.getByRole('menuitemradio', { name: /完整权限/ }).click()
+    await win.getByTestId('chat-input').fill('把结果写入文件')
+    await win.keyboard.press('Enter')
+
+    // 关键差异：不出现「Agent 请求确认」，任务直接完成
+    await win.getByText('文件已写入，任务完成。').waitFor({ timeout: 45000 })
+    expect(await win.getByText('Agent 请求确认').count()).toBe(0)
+    expect(fs.readFileSync(mock.state.agentFile, 'utf8')).toBe('E2E写入内容')
+
+    // 审计：确认来源记录为 permission:full（不是 user / session）
+    await win.getByTestId('nav-agent').click()
+    await win.getByTestId('agent-run').click()
+    await win.getByText('确认方式：permission:full').waitFor({ timeout: 15000 })
 
     expect(unexpectedErrors(consoleErrors)).toEqual([])
     fs.rmSync(dir, { recursive: true, force: true })

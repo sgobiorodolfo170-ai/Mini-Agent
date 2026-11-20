@@ -162,11 +162,13 @@ describe('chat store 发送路径', () => {
   it('agentMode 时走 agent.run 而不是 chat.send', async () => {
     const s = useChatStore()
     await s.select('c1')
-    s.agentMode = true
+    s.permission = 'autonomous'
     await s.send('帮我建个文件')
     expect(window.api.agent.run).toHaveBeenCalledWith({
       conversationId: 'c1',
-      goal: '帮我建个文件'
+      goal: '帮我建个文件',
+      permission: 'autonomous',
+      cluster: false
     })
     expect(window.api.chat.send).not.toHaveBeenCalled()
   })

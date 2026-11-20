@@ -66,9 +66,13 @@ async function configureRealProvider(win) {
     .waitFor({ timeout: 15000 })
   await win.getByTestId('p-save').click()
 
-  // Set provider + chat model as defaults (non-reasoning fast model)，主页面原生 select
-  await win.getByTestId('default-provider').selectOption({ label: name })
-  await win.getByTestId('default-model').selectOption({ label: providerCfg.chatModel })
+  // 服务与模型改为手动选择：在输入区的模型二级目录中指定（会话设置已改为全局，不再按会话选模型）
+  await win.getByTestId('nav-chat').click()
+  await win.getByTestId('new-conv').click()
+  await win.getByTestId('composer-model').click()
+  await win.getByRole('menuitemradio', { name: new RegExp(name) }).click()
+  await win.getByRole('menuitemradio', { name: new RegExp(providerCfg.chatModel) }).click()
+  await win.getByTestId('nav-chat').click()
 }
 
 async function waitReplyDone(win, timeout) {
@@ -156,6 +160,7 @@ describe('端砚真实提供商全链路（docs/test-提供商.md）', () => {
     const target = path.join(dir, 'real-e2e.txt')
     await win.getByTestId('nav-chat').click()
     await win.getByTestId('agent-toggle').click()
+    await win.getByRole('menuitemradio', { name: /自主模式/ }).click()
     await win
       .getByTestId('chat-input')
       .fill(

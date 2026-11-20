@@ -4,7 +4,7 @@ const repos = require('../../store/repos')
 const dbm = require('../../store/db')
 const { chatStream, GatewayError } = require('../gateway/client')
 const scheduler = require('../gateway/scheduler')
-const { resolveModel, msgOut } = require('../gateway/index')
+const { resolveModel, msgOut, effectiveParams, safeJson } = require('../gateway/index')
 const { decryptSecret } = require('../../store/keys')
 const { broadcast } = require('../notify')
 const { defineTools } = require('./tools')
@@ -20,6 +20,16 @@ function toolSchemas(tools) {
     type: 'function',
     function: { name: t.name, description: t.description, parameters: t.parameters }
   }))
+}
+
+// Agent 任务的采样参数解析：全局采样设置（设置 → 会话，键 chatSampling）优先，
+// 会话级 contextPolicy 仅作旧数据兼容。settings 是 getAllSettings() 的全量对象，
+// 必须先取出 chatSampling 再交给 effectiveParams，否则整包 settings 会被当成旧会话策略。
+function resolveAgentParams(settings, conv, provider, model) {
+  const s = settings || {}
+  const globalPolicy = s.chatSampling && typeof s.chatSampling === 'object' ? s.chatSampling : {}
+  const legacyPolicy = safeJson(conv && conv.contextPolicy, {}) || {}
+  return effectiveParams(globalPolicy, provider, model, legacyPolicy)
 }
 
 function summarize(toolName, args) {
@@ -110,7 +120,7 @@ async function withKeyRetry(db, provider, fn) {
   throw new Error(lastErr || '无可用 Key')
 }
 
-async function startAgentRun({ conversationId, goal }) {
+async function startAgentRun({ conversationId, goal, permission, cluster }) {
   const db = dbm.get()
   const { provider, model } = resolveModel(db, conversationId)
   if (!provider) throw new Error('未配置模型服务')
@@ -138,7 +148,11 @@ async function startAgentRun({ conversationId, goal }) {
     ac: new AbortController(),
     stopped: false,
     remember: new Set(),
-    confirms: new Map()
+    confirms: new Map(),
+    // 权限等级：full = 所有非只读调用直接放行（不再逐次确认）
+    permission: permission === 'full' ? 'full' : 'autonomous',
+    // Agent 集群：允许派生多个子 Agent 并行处理子任务
+    cluster: !!cluster
   }
   active.set(runId, state)
   broadcast('chat:event', {
@@ -154,14 +168,26 @@ async function startAgentRun({ conversationId, goal }) {
     provider,
     model,
     goal,
-    state
+    state,
+    settings
   }).catch(() => {})
   return { runId, userMsgId: userMsg.id, assistantMsgId: assistant.id }
 }
 
-async function doAgentRun({ runId, conversationId, assistantMsgId, provider, model, goal, state }) {
+async function doAgentRun({
+  runId,
+  conversationId,
+  assistantMsgId,
+  provider,
+  model,
+  goal,
+  state,
+  settings: inherited
+}) {
   const db = dbm.get()
-  const settings = repos.getAllSettings(db)
+  const settings = inherited || repos.getAllSettings(db)
+  const conv = repos.getConversation(db, conversationId)
+  const params = resolveAgentParams(settings, conv, provider, model)
   const electron = require('electron')
   const ctx = {
     authorizedDirs: settings.agentAuthorizedDirs || [],
@@ -178,11 +204,20 @@ async function doAgentRun({ runId, conversationId, assistantMsgId, provider, mod
   const tools = defineTools(ctx)
   const toolMap = Object.fromEntries(tools.map((t) => [t.name, t]))
   const memoryText = readMemoryFile(ctx.memoryPath)
+  const clusterNote = state.cluster
+    ? '\n\n当前已开启 Agent 集群：遇到可拆分的独立子任务时，请调用 spawn_agent 并行派出多个子 Agent 分别处理，最后由你汇总结果。'
+    : ''
+  const permissionNote =
+    state.permission === 'full'
+      ? '\n\n当前权限为完整权限：非只读工具调用将直接执行，不再逐次请求用户确认；仍须严格遵守授权目录限制。'
+      : ''
   const messages = [
     {
       role: 'system',
       content:
         '你是运行在用户 Windows 桌面上的 Agent。谨慎使用工具完成目标；写文件和执行命令前先用一句话说明计划。基于工具返回结果作答，不要臆造。' +
+        permissionNote +
+        clusterNote +
         (memoryText ? `\n\n以下是你的长期记忆（供参考，可按需更新）:\n${memoryText}` : '')
     },
     { role: 'user', content: goal }
@@ -194,12 +229,12 @@ async function doAgentRun({ runId, conversationId, assistantMsgId, provider, mod
   let status = 'done'
 
   const modelCallWith = (apiKey) => async (msgs) => {
+    const payload = { model, messages: msgs, stream: true, tools: toolSchemas(tools) }
+    if (Number(params.maxTokens)) payload.max_tokens = Number(params.maxTokens)
+    if (Number(params.temperature) >= 0) payload.temperature = Number(params.temperature)
+    if (Number(params.topP) > 0) payload.top_p = Number(params.topP)
     const r = await chatStream(
-      {
-        baseUrl: provider.base_url,
-        apiKey,
-        payload: { model, messages: msgs, stream: true, tools: toolSchemas(tools) }
-      },
+      { baseUrl: provider.base_url, apiKey, payload },
       {
         signal: state.ac.signal,
         onDelta: (d) => broadcast('chat:event', { type: 'delta', msgId: assistantMsgId, delta: d })
@@ -209,10 +244,18 @@ async function doAgentRun({ runId, conversationId, assistantMsgId, provider, mod
   }
   const decide = async ({ name, args, riskLevel }) => {
     const risk = escalateRisk(name, args, riskLevel)
-    if (risk === 'readonly') return { allowed: true, confirmedBy: 'auto' }
-    if (state.stopped) return { allowed: false, confirmedBy: 'stopped' }
+    // 每条返回路径都要写回 lastDecision，否则日志里的「确认方式」会沿用上一步的旧值
+    const settle = (decision) => {
+      lastDecision = { allowed: !!decision.allowed, confirmedBy: decision.confirmedBy }
+      return decision
+    }
+    if (risk === 'readonly') return settle({ allowed: true, confirmedBy: 'auto' })
+    if (state.stopped) return settle({ allowed: false, confirmedBy: 'stopped' })
+    // 完整权限：用户已在输入区显式选择，不再逐次弹确认，但审计记录标记来源
+    if (state.permission === 'full')
+      return settle({ allowed: true, confirmedBy: 'permission:full' })
     if (risk === 'side_effect' && state.remember.has(name))
-      return { allowed: true, confirmedBy: 'session' }
+      return settle({ allowed: true, confirmedBy: 'session' })
     const requestId = repos.uid()
     const decision = await new Promise((resolve) => {
       state.confirms.set(requestId, resolve)
@@ -226,11 +269,10 @@ async function doAgentRun({ runId, conversationId, assistantMsgId, provider, mod
       })
     })
     if (decision.allow && decision.remember) state.remember.add(name)
-    lastDecision = {
+    return settle({
       allowed: !!decision.allow,
       confirmedBy: decision.allow ? 'user' : 'denied'
-    }
-    return { allowed: !!decision.allow, confirmedBy: lastDecision.confirmedBy }
+    })
   }
   const execute = async (tool, args) => {
     const t0 = Date.now()
@@ -263,7 +305,7 @@ async function doAgentRun({ runId, conversationId, assistantMsgId, provider, mod
   // 子 Agent：复用同一套确认/日志/广播管道，深度固定为 1（工具集去掉 spawn_agent）。
   const subTools = tools.filter((t) => t.name !== 'spawn_agent')
   const subMap = Object.fromEntries(subTools.map((t) => [t.name, t]))
-  ctx.spawnAgent = async ({ goal: subGoal }) => {
+  const runSubAgent = async (subGoal) => {
     const sub = await withKeyRetry(db, provider, (apiKey) =>
       runAgentLoop({
         messages: [
@@ -284,6 +326,18 @@ async function doAgentRun({ runId, conversationId, assistantMsgId, provider, mod
       })
     )
     return lastAssistantContent(sub.messages) || '(子 Agent 无输出)'
+  }
+  // 单任务：串行执行；集群开启时同一轮多个子任务并发执行（各自独立上下文）
+  ctx.spawnAgent = async ({ goal: subGoal, goals }) => {
+    const list = Array.isArray(goals) && goals.length ? goals : [subGoal]
+    if (!state.cluster && list.length > 1) {
+      throw new Error('未开启 Agent 集群，一次只能派生一个子 Agent')
+    }
+    if (list.length === 1) return runSubAgent(String(list[0] || '').trim())
+    const results = await Promise.all(
+      list.map((g) => runSubAgent(String(g || '').trim()).catch((e) => `子任务失败：${e.message}`))
+    )
+    return results.map((r, i) => `【子任务 ${i + 1}】\n${r}`).join('\n\n')
   }
 
   try {
@@ -367,5 +421,6 @@ module.exports = {
   stopRun,
   listActiveRuns,
   summarize,
-  resolveWorkingDir
+  resolveWorkingDir,
+  resolveAgentParams
 }

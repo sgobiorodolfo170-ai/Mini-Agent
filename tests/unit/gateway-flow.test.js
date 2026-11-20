@@ -214,12 +214,37 @@ describe('sendChat 全链路', () => {
     expect(bodies[0].temperature).toBeUndefined()
 
     repos.updateConversation(dbm.get(), convId, {
-      contextPolicy: { temperature: 0.7, topP: 0.9, maxTokens: 100 }
+      contextPolicy: { temperature: 0.7, topP: 0.9 }
     })
     const r2 = await gateway.sendChat({ conversationId: convId, content: '自定义参数' })
     expect(await waitFor(() => doneOf(r2.assistantMsgId))).toBe(true)
     expect(bodies[1].temperature).toBe(0.7)
     expect(bodies[1].top_p).toBe(0.9)
-    expect(bodies[1].max_tokens).toBe(100)
+  })
+
+  // 最大输出长度改为提供商模型参数：会话 policy 中的 maxTokens 不再透传
+  it('max_tokens 取自模型参数而非会话 policy', async () => {
+    const { convId, pid } = seed()
+    const bodies = []
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, opts) => {
+      bodies.push(JSON.parse(opts.body))
+      return sseRes(['data: {"choices":[{"delta":{"content":"a"}}]}\n\n', 'data: [DONE]\n\n'])
+    })
+
+    repos.updateConversation(dbm.get(), convId, { contextPolicy: { maxTokens: 512 } })
+    const r1 = await gateway.sendChat({ conversationId: convId, content: '会话级无效' })
+    expect(await waitFor(() => doneOf(r1.assistantMsgId))).toBe(true)
+    expect(bodies[0].max_tokens).toBeUndefined()
+
+    const p = repos.getProvider(dbm.get(), pid)
+    repos.saveProvider(dbm.get(), {
+      id: pid,
+      name: p.name,
+      baseUrl: p.base_url,
+      models: [{ id: 'm1', vision: false, maxTokens: 256, maxChars: 4000 }]
+    })
+    const r2 = await gateway.sendChat({ conversationId: convId, content: '模型级生效' })
+    expect(await waitFor(() => doneOf(r2.assistantMsgId))).toBe(true)
+    expect(bodies[1].max_tokens).toBe(256)
   })
 })

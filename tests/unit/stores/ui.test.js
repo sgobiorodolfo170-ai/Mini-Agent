@@ -118,30 +118,26 @@ describe('ui store 其他交互', () => {
 })
 
 describe('ui store 会话布局偏好与确认（F01/F04/F22）', () => {
-  it('showDetails 默认收起，setShowDetails 持久化偏好', async () => {
+  // 会话设置已迁入设置页「会话」选项卡，聊天区不再有右侧抽屉，相关偏好随之移除
+  it('聊天区不再保留会话详情抽屉偏好', async () => {
     const s = useUiStore()
     await s.init()
-    expect(s.showDetails).toBe(false)
-    s.setShowDetails(true)
-    expect(window.api.settings.set).toHaveBeenCalledWith('chatDetailsOpen', true)
-    expect(s.showDetails).toBe(true)
+    expect(s.showDetails).toBeUndefined()
+    expect(s.detailsPinned).toBeUndefined()
+    expect(typeof s.setShowDetails).toBe('undefined')
   })
 
-  it('init 读取已保存的详情偏好，列表宽度夹取到 220–320', async () => {
+  it('init 读取已保存的列表偏好，列表宽度夹取到 220–320', async () => {
     window.api.settings.get.mockImplementation(
       async (k) =>
         ({
           theme: 'light',
-          chatDetailsOpen: true,
-          chatDetailsPinned: true,
           chatListVisible: false,
           chatListWidth: 999
         })[k] ?? null
     )
     const s = useUiStore()
     await s.init()
-    expect(s.showDetails).toBe(true)
-    expect(s.detailsPinned).toBe(true)
     expect(s.chatListVisible).toBe(false)
     expect(s.chatListWidth).toBe(320)
     s.setChatListWidth(100)

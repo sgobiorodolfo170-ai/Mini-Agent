@@ -10,7 +10,7 @@ import {
   unexpectedErrors
 } from './helpers'
 
-const INPUT = '输入消息，Enter 发送，Shift+Enter 换行'
+const INPUT = '输入“/”使用技能'
 
 let ctx
 

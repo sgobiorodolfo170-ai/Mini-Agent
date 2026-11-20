@@ -16,7 +16,7 @@ describe('应用基础', () => {
   it('启动：主窗口渲染导航与输入区，无控制台错误', async () => {
     await ctx.win.getByTestId('nav-chat').waitFor({ timeout: 15000 })
     await ctx.win.getByTestId('new-conv').waitFor()
-    await ctx.win.getByPlaceholder('输入消息，Enter 发送，Shift+Enter 换行').waitFor()
+    await ctx.win.getByPlaceholder('输入“/”使用技能').waitFor()
     expect(unexpectedErrors(ctx.consoleErrors)).toEqual([])
   })
 

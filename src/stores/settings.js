@@ -17,11 +17,6 @@ export const useSettingsStore = defineStore('settings', {
     initialized: false
   }),
   getters: {
-    defaultProviderId(state) {
-      return (
-        state.settings.defaultProviderId || (state.providers[0] && state.providers[0].id) || null
-      )
-    },
     enabledProviders(state) {
       return state.providers.filter((p) => p.enabled)
     },

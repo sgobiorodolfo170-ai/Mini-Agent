@@ -376,17 +376,26 @@ function defineTools(ctx) {
       name: 'spawn_agent',
       risk: 'side_effect',
       description:
-        '派生一个子 Agent 独立完成子任务并只返回最终结论（子 Agent 不可再派生；其工具调用走同样的确认流程）',
+        '派生子 Agent 独立完成子任务并只返回最终结论（子 Agent 不可再派生；其工具调用走同样的确认流程）。开启 Agent 集群时可用 goals 一次派发多个并行子任务',
       parameters: {
         type: 'object',
-        properties: { goal: { type: 'string', description: '子任务目标的完整自包含描述' } },
-        required: ['goal']
+        properties: {
+          goal: { type: 'string', description: '子任务目标的完整自包含描述（单个）' },
+          goals: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '多个互不依赖的子任务，集群模式下并行执行'
+          }
+        }
       },
-      handler: async ({ goal }) => {
+      handler: async ({ goal, goals }) => {
+        const list = Array.isArray(goals)
+          ? goals.map((g) => String(g || '').trim()).filter(Boolean)
+          : []
         const g = String(goal || '').trim()
-        if (!g) throw new Error('goal 不能为空')
+        if (!g && !list.length) throw new Error('goal 不能为空')
         if (typeof ctx.spawnAgent !== 'function') throw new Error('子 Agent 未启用')
-        return ctx.spawnAgent({ goal: g })
+        return ctx.spawnAgent(list.length > 1 ? { goals: list } : { goal: g || list[0] })
       }
     },
     {

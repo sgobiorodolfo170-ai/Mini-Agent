@@ -11,13 +11,18 @@ const ui = useUiStore()
 
 const sections = [
   { key: 'model', label: '模型服务' },
+  { key: 'chat', label: '会话' },
   { key: 'models', label: '本地嵌入模型' },
   { key: 'hotkeys', label: '快捷键' },
   { key: 'agent', label: '智能任务' },
   { key: 'appearance', label: '外观' },
   { key: 'data', label: '数据' }
 ]
-const section = ref('model')
+// 当前分组持久在 ui.settingsSection
+const section = computed({
+  get: () => ui.settingsSection || 'model',
+  set: (v) => (ui.settingsSection = v)
+})
 
 // ---------- 初始化同步（F09）：表单跟随 store 初始化完成再取值，避免默认值覆盖已存配置 ----------
 const hotkeys = ref({ quick: 'Alt+Space', selection: 'Alt+Q', capture: 'Alt+S' })
@@ -89,12 +94,14 @@ async function startEdit(p) {
     if (!ok) return
   }
   editingId.value = p.id
-  draft.value = JSON.parse(JSON.stringify({ ...p, models: [...(p.models || [])] }))
+  // 深拷贝：模型参数（maxTokens/maxChars）与视觉标记都在草稿内编辑
+  draft.value = JSON.parse(JSON.stringify({ ...p, models: p.models || [] }))
   draftOrigin.value = JSON.stringify(draft.value)
   pulled.value = []
   pickModel.value = ''
   newModel.value = ''
   keyForm.value = { label: '', secret: '' }
+  paramTarget.value = ''
 }
 async function closeEdit() {
   if (draftDirty.value) {
@@ -333,6 +340,72 @@ function saveAgent() {
   }
 }
 
+// ---------- 会话（全局采样参数） ----------
+// 这里的「会话」是全局默认：对所有会话生效，不再按单个会话单独设置。
+// 落库键 chatSampling；优先级见 gateway.effectiveParams（全局 → 模型参数 → 服务端默认）。
+const SAMPLING_FIELDS = [
+  { key: 'temperature', label: '随机性', api: 'temperature', help: '越低越稳定、越高越发散' },
+  { key: 'topP', label: '核采样', api: 'top_p', help: '控制候选词范围' },
+  { key: 'keepTurns', label: '保留轮数', api: 'keepTurns', help: '最近 N 轮对话进入上下文' }
+]
+const PRESETS = {
+  temperature: [
+    { label: '严谨', value: 0.2, hint: '事实问答、代码生成' },
+    { label: '均衡', value: 0.7, hint: '日常对话' },
+    { label: '发散', value: 1.1, hint: '创意写作' }
+  ],
+  topP: [
+    { label: '收敛', value: 0.5, hint: '收窄候选词范围' },
+    { label: '均衡', value: 0.9, hint: '推荐默认' },
+    { label: '开放', value: 1, hint: '不截断候选词' }
+  ],
+  keepTurns: [
+    { label: '精简', value: 6, hint: '短会话，省 token' },
+    { label: '标准', value: 20, hint: '推荐默认' },
+    { label: '长程', value: 50, hint: '多轮长对话' }
+  ]
+}
+// 本地草稿跟随 store 初始化后再取值，避免用默认值覆盖已存配置（F09）
+const sampling = ref({})
+function syncSampling() {
+  const v = settings.settings.chatSampling
+  sampling.value = v && typeof v === 'object' ? JSON.parse(JSON.stringify(v)) : {}
+}
+onMounted(() => {
+  if (settings.initialized) syncSampling()
+})
+watch(
+  () => [settings.initialized, settings.settings.chatSampling],
+  () => {
+    if (settings.initialized) syncSampling()
+  }
+)
+function samplingValue(key) {
+  const v = sampling.value[key]
+  return v === undefined || v === null ? '' : v
+}
+function isPreset(key, value) {
+  const v = sampling.value[key]
+  return v !== undefined && v !== null && Number(v) === value
+}
+// 数值与档位写同一字段；空值表示「不设置」，回退到该模型参数或服务端默认
+async function setSampling(key, value) {
+  const next = { ...sampling.value }
+  if (value === '' || value === null || value === undefined) delete next[key]
+  else next[key] = Number(value)
+  sampling.value = next
+  await settings.set('chatSampling', next)
+}
+function onSamplingInput(key, e) {
+  const raw = e.target.value
+  setSampling(key, raw === '' ? null : raw)
+}
+async function resetSampling() {
+  sampling.value = {}
+  await settings.set('chatSampling', {})
+  ui.toast('已恢复为默认采样参数', 'success')
+}
+
 // ---------- 外观 ----------
 const themeOptions = [
   { value: 'light', label: '浅色' },
@@ -363,9 +436,25 @@ async function importData() {
   }
 }
 
-const defaultProvider = computed(
-  () => settings.providers.find((p) => p.id === settings.settings.defaultProviderId) || null
-)
+// 模型参数编辑（模型级：最大输出长度与上下文上限）
+// 参数属于供应商草稿的一部分，跟随「保存供应商」一并落库，保持单一保存边界。
+const paramTarget = ref('') // 当前展开的模型条目标识：providerId + '/' + modelId
+function paramKey(p, id) {
+  return `${p.id}/${id}`
+}
+function openParamEditor(p, id) {
+  const key = paramKey(p, id)
+  paramTarget.value = paramTarget.value === key ? '' : key
+}
+function modelParam(m, field) {
+  const v = m && m[field]
+  return v === undefined || v === null ? '' : v
+}
+function setModelParam(m, field, value) {
+  if (!m) return
+  const n = value === '' || value === null ? null : Number(value)
+  m[field] = Number.isFinite(n) && n > 0 ? n : null
+}
 </script>
 
 <template>
@@ -399,46 +488,81 @@ const defaultProvider = computed(
           正在加载配置…
         </div>
 
+        <!-- 会话：全局采样参数，对所有会话生效（不再按单个会话设置） -->
+        <section v-show="section === 'chat'" class="space-y-4">
+          <div>
+            <h2 class="text-base font-semibold">会话</h2>
+            <p class="text-xs text-ink-muted mt-1">
+              以下参数对所有会话生效。留空表示不设置，回退到该模型自身的参数或服务端默认。
+            </p>
+          </div>
+
+          <div class="card p-4 max-w-[760px] space-y-4">
+            <div
+              v-for="f in SAMPLING_FIELDS"
+              :key="f.key"
+              :data-testid="'chat-field-' + f.key"
+              class="space-y-1"
+            >
+              <div class="flex items-center gap-2 flex-wrap">
+                <span class="field-label !mb-0 shrink-0 w-[68px]">{{ f.label }}</span>
+                <span class="text-xs text-ink-muted w-[72px] shrink-0">{{ f.api }}</span>
+                <input
+                  type="number"
+                  class="field-input !h-8 !w-20 shrink-0"
+                  :data-testid="'chat-input-' + f.key"
+                  :value="samplingValue(f.key)"
+                  :placeholder="f.key === 'keepTurns' ? '20' : '默认'"
+                  :step="f.key === 'keepTurns' ? 1 : 0.1"
+                  :min="f.key === 'keepTurns' ? 1 : 0"
+                  :max="f.key === 'temperature' ? 2 : f.key === 'topP' ? 1 : 100"
+                  :aria-label="f.label"
+                  @change="onSamplingInput(f.key, $event)"
+                />
+                <button
+                  v-for="p in PRESETS[f.key]"
+                  :key="p.label"
+                  type="button"
+                  class="btn-compact !h-8 !px-2 !text-[11px] border shrink-0"
+                  :class="
+                    isPreset(f.key, p.value)
+                      ? 'bg-brand-soft text-brand-ink border-brand/40'
+                      : 'border-line-control text-ink-secondary hover:bg-subtle'
+                  "
+                  :title="p.hint"
+                  :data-testid="'chat-preset-' + f.key + '-' + p.value"
+                  @click="setSampling(f.key, p.value)"
+                >
+                  {{ p.label }}
+                  <span class="text-ink-muted">{{ p.value }}</span>
+                </button>
+              </div>
+              <span class="field-help">{{ f.help }}</span>
+            </div>
+
+            <div class="flex items-center justify-between gap-3 border-t border-line-subtle pt-3">
+              <p class="text-xs text-ink-muted">
+                最大输出长度与上下文上限属于模型自身参数，请到「模型服务 → 编辑供应商 →
+                模型参数」中按模型配置。
+              </p>
+              <button
+                class="btn-secondary !h-8 shrink-0 text-xs"
+                data-testid="chat-sampling-reset"
+                @click="resetSampling"
+              >
+                恢复默认
+              </button>
+            </div>
+          </div>
+        </section>
+
         <!-- 模型服务 -->
         <section v-show="section === 'model'" class="space-y-4">
           <h2 class="text-base font-semibold">模型服务</h2>
           <p class="text-xs text-ink-muted">
-            先添加供应商并保存，再添加 Key、拉取模型；会话默认使用这里的供应商与模型。
+            先添加供应商并保存，再添加
+            Key、拉取模型；每个模型的输出长度与上下文上限在该卡片的「模型参数」中配置。会话使用哪个服务与模型，在「会话」选项卡中按会话选择。
           </p>
-          <div class="flex gap-3">
-            <label class="flex-1">
-              <span class="field-label">默认供应商</span>
-              <select
-                :value="settings.settings.defaultProviderId || ''"
-                data-testid="default-provider"
-                class="field-input"
-                @change="settings.set('defaultProviderId', $event.target.value || null)"
-              >
-                <option value="">未设置</option>
-                <option v-for="p in settings.providers" :key="p.id" :value="p.id">
-                  {{ p.name }}
-                </option>
-              </select>
-            </label>
-            <label class="flex-1">
-              <span class="field-label">默认模型</span>
-              <select
-                :value="settings.settings.defaultModel || ''"
-                data-testid="default-model"
-                class="field-input"
-                @change="settings.set('defaultModel', $event.target.value || null)"
-              >
-                <option value="">未设置</option>
-                <option
-                  v-for="m in (defaultProvider || { models: [] }).models"
-                  :key="m.id"
-                  :value="m.id"
-                >
-                  {{ m.id }}{{ m.vision ? '（视觉）' : '' }}
-                </option>
-              </select>
-            </label>
-          </div>
 
           <div
             v-for="p in settings.providers"
@@ -546,6 +670,15 @@ const defaultProvider = computed(
                     <span>{{ m.id }}</span>
                     <button
                       class="icon-btn-sm !w-5 !h-5"
+                      :title="'模型参数：' + m.id"
+                      :aria-label="'配置模型参数 ' + m.id"
+                      :aria-expanded="paramTarget === paramKey(p, m.id) ? 'true' : 'false'"
+                      @click="openParamEditor(p, m.id)"
+                    >
+                      <UiIcon name="settings" :size="12" />
+                    </button>
+                    <button
+                      class="icon-btn-sm !w-5 !h-5"
                       :aria-label="'移除模型 ' + m.id"
                       @click="draft.models.splice(i, 1)"
                     >
@@ -556,6 +689,50 @@ const defaultProvider = computed(
                     >还没有模型，拉取或手动添加</span
                   >
                 </div>
+
+                <!-- 模型参数：最大输出长度与上下文上限（按模型保存） -->
+                <div
+                  v-for="m in draft.models.filter((x) => paramTarget === paramKey(p, x.id))"
+                  :key="'param-' + m.id"
+                  class="mt-2 rounded-lg border border-line-subtle bg-subtle p-3 space-y-2"
+                  data-testid="model-params"
+                >
+                  <div class="text-xs text-ink-secondary">模型参数 · {{ m.id }}</div>
+                  <div class="grid grid-cols-2 gap-3">
+                    <label>
+                      <span class="field-label !text-xs">最大输出长度</span>
+                      <input
+                        :value="modelParam(m, 'maxTokens')"
+                        type="number"
+                        min="1"
+                        placeholder="默认"
+                        data-testid="model-max-tokens"
+                        class="field-input !h-8 text-xs"
+                        @input="setModelParam(m, 'maxTokens', $event.target.value)"
+                      />
+                      <span class="field-help !mt-0.5">max_tokens，留空用服务端默认</span>
+                    </label>
+                    <label>
+                      <span class="field-label !text-xs">上下文上限（字符）</span>
+                      <input
+                        :value="modelParam(m, 'maxChars')"
+                        type="number"
+                        min="1"
+                        placeholder="默认 12000"
+                        data-testid="model-max-chars"
+                        class="field-input !h-8 text-xs"
+                        @input="setModelParam(m, 'maxChars', $event.target.value)"
+                      />
+                      <span class="field-help !mt-0.5">历史消息进入请求的字符预算</span>
+                    </label>
+                  </div>
+                  <div class="flex justify-end">
+                    <button class="btn-secondary !h-7 !px-2 text-xs" @click="paramTarget = ''">
+                      收起
+                    </button>
+                  </div>
+                </div>
+
                 <div class="flex gap-2 mt-2">
                   <select
                     v-if="pulled.length"

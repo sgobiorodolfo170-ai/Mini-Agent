@@ -9,6 +9,9 @@ const { searchKb } = require('../rag/index')
 
 const active = new Map() // assistantMsgId -> AbortController
 
+const DEFAULT_CONTEXT_CHARS = 12000
+const DEFAULT_KEEP_TURNS = 20
+
 function safeJson(s, d) {
   try {
     return s ? JSON.parse(s) : d == null ? d : JSON.parse(JSON.stringify(d))
@@ -33,15 +36,52 @@ function msgOut(m) {
   }
 }
 
+// 服务与模型完全由用户手动选择（默认供应商/默认模型设置已删除）：
+// ① 会话指定了供应商 → 用它；② 未指定但指定了模型 → 找拥有该模型的供应商；
+// ③ 都没指定 → 第一个启用供应商 + 它的第一个模型。
 function resolveModel(db, conversationId) {
   const conv = conversationId ? repos.getConversation(db, conversationId) : null
-  const settings = repos.getAllSettings(db)
   const providers = repos.listProviders(db).filter((p) => p.enabled !== 0)
-  const providerId = (conv && conv.providerId) || settings.defaultProviderId
-  const provider = providers.find((p) => p.id === providerId) || providers[0] || null
-  const models = safeJson(provider && provider.models, []) || []
-  const model = (conv && conv.model) || settings.defaultModel || (models[0] && models[0].id) || null
+  const modelsOf = (p) => safeJson(p && p.models, []) || []
+  const convModel = (conv && conv.model) || null
+  const provider =
+    providers.find((p) => p.id === (conv && conv.providerId)) ||
+    (convModel && providers.find((p) => modelsOf(p).some((m) => m.id === convModel))) ||
+    providers[0] ||
+    null
+  const models = modelsOf(provider)
+  const model = convModel || (models[0] && models[0].id) || null
   return { conv, provider, model }
+}
+
+// 提供商模型参数：最大输出长度与上下文上限属于模型级配置（会话设置不再提供）。
+function modelParams(provider, modelId) {
+  const models = safeJson(provider && provider.models, []) || []
+  return models.find((m) => m.id === modelId) || {}
+}
+
+// 生效的采样/上下文参数（优先级从高到低）：
+// 全局采样设置（设置 → 会话）→ 该模型参数 → 不发送（用服务端默认）；
+// 最大输出长度与上下文上限仍属于模型参数（设置 → 模型服务 → 模型参数）。
+// 注：会话级 contextPolicy 是历史遗留的兼容层，仅供旧数据回放，不再由界面写入。
+function effectiveParams(globalPolicy, provider, modelId, legacyPolicy) {
+  const g = globalPolicy || {}
+  const l = legacyPolicy || {}
+  const m = modelParams(provider, modelId)
+  const pick = (...vals) => {
+    for (const v of vals) {
+      if (v === undefined || v === null || v === '') continue
+      return v
+    }
+    return undefined
+  }
+  return {
+    temperature: pick(g.temperature, l.temperature, m.temperature),
+    topP: pick(g.topP, l.topP, m.topP),
+    maxTokens: pick(m.maxTokens),
+    maxChars: pick(m.maxChars),
+    keepTurns: pick(g.keepTurns, l.keepTurns)
+  }
 }
 
 function isVisionModel(provider, model) {
@@ -109,7 +149,7 @@ async function startStream({ conversationId, assistantMsgId, kbIds, attachments 
   let acc = ''
   try {
     if (!provider) throw new Error('未配置模型服务，请先在设置中添加供应商')
-    if (!model) throw new Error('未配置模型，请在设置或会话详情中选择')
+    if (!model) throw new Error('未配置模型，请在「设置 → 会话」中选择')
 
     const warnings = []
     let kbBlocks = []
@@ -122,7 +162,9 @@ async function startStream({ conversationId, assistantMsgId, kbIds, attachments 
     }
 
     const rows = repos.listMessages(db, conversationId)
-    const policy = safeJson(conv && conv.contextPolicy, {}) || {}
+    const legacyPolicy = safeJson(conv && conv.contextPolicy, {}) || {}
+    const globalPolicy = safeJson(repos.getSetting(db, 'chatSampling'), {}) || {}
+    const params = effectiveParams(globalPolicy, provider, model, legacyPolicy)
     const historyRows = rows.filter(
       (m) =>
         m.id !== assistantMsgId &&
@@ -137,8 +179,8 @@ async function startStream({ conversationId, assistantMsgId, kbIds, attachments 
     const messages = buildContext({
       systemPrompt: conv && conv.systemPrompt,
       history,
-      maxChars: policy.maxChars || Number(repos.getSetting(db, 'chatMaxChars')) || 12000,
-      keepTurns: policy.keepTurns || 20,
+      maxChars: Number(params.maxChars) || DEFAULT_CONTEXT_CHARS,
+      keepTurns: Number(params.keepTurns) || DEFAULT_KEEP_TURNS,
       kbBlocks
     })
     const apiMsgs = toApiMessages(messages)
@@ -147,10 +189,10 @@ async function startStream({ conversationId, assistantMsgId, kbIds, attachments 
     }
 
     const payload = { model, messages: apiMsgs, stream: true }
-    if (policy.temperature != null && policy.temperature !== '')
-      payload.temperature = Number(policy.temperature)
-    if (policy.topP != null && policy.topP !== '') payload.top_p = Number(policy.topP)
-    if (policy.maxTokens) payload.max_tokens = Number(policy.maxTokens)
+    if (params.temperature != null) payload.temperature = Number(params.temperature)
+    if (params.topP != null) payload.top_p = Number(params.topP)
+    // 最大输出长度来自提供商模型参数（会话设置不再单独配置）
+    if (Number(params.maxTokens)) payload.max_tokens = Number(params.maxTokens)
 
     const keyRows = repos.listAllKeysWithSecret(db).filter((x) => x.providerId === provider.id)
     if (!keyRows.length) throw new Error(`供应商「${provider.name}」没有可用的 Key`)
@@ -334,4 +376,14 @@ function stopChat(msgId) {
   return false
 }
 
-module.exports = { sendChat, regenerate, editResend, stopChat, resolveModel, msgOut, safeJson }
+module.exports = {
+  sendChat,
+  regenerate,
+  editResend,
+  stopChat,
+  resolveModel,
+  modelParams,
+  effectiveParams,
+  msgOut,
+  safeJson
+}

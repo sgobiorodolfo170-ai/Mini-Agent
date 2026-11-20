@@ -21,12 +21,10 @@ export const useUiStore = defineStore('ui', {
     theme: 'dark',
     toasts: [],
     pendingAttachment: null,
-    // 会话详情默认收起（F01）；用户偏好持久化
-    showDetails: false,
-    detailsPinned: false,
     chatListVisible: true,
     chatListWidth: 240,
     confirmState: null, // { title, message, impact, confirmText, danger, _resolve }
+    settingsSection: 'model', // 设置页当前分组
     _media: null
   }),
   getters: {
@@ -36,14 +34,10 @@ export const useUiStore = defineStore('ui', {
     async init() {
       const t = await window.api.settings.get('theme')
       this.theme = t || 'dark'
-      const [details, pinned, listVisible, listWidth] = await Promise.all([
-        window.api.settings.get('chatDetailsOpen'),
-        window.api.settings.get('chatDetailsPinned'),
+      const [listVisible, listWidth] = await Promise.all([
         window.api.settings.get('chatListVisible'),
         window.api.settings.get('chatListWidth')
       ])
-      this.showDetails = details === true
-      this.detailsPinned = pinned === true
       this.chatListVisible = listVisible !== false
       this.chatListWidth = clampListWidth(listWidth)
       applyTheme(this.theme)
@@ -67,14 +61,6 @@ export const useUiStore = defineStore('ui', {
       this.theme = t
       window.api.settings.set('theme', t)
       applyTheme(t)
-    },
-    setShowDetails(v) {
-      this.showDetails = !!v
-      window.api.settings.set('chatDetailsOpen', this.showDetails)
-    },
-    setDetailsPinned(v) {
-      this.detailsPinned = !!v
-      window.api.settings.set('chatDetailsPinned', this.detailsPinned)
     },
     toggleChatList() {
       this.chatListVisible = !this.chatListVisible

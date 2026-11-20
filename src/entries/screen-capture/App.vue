@@ -6,6 +6,12 @@ const start = ref({ x: 0, y: 0 })
 const rect = ref({ x: 0, y: 0, width: 0, height: 0 })
 
 function pd(e) {
+  // 右键取消截图（与 Esc 等价的退出方式）
+  if (e.button === 2) {
+    e.preventDefault()
+    cancel()
+    return
+  }
   if (e.button !== 0) return
   dragging.value = true
   start.value = { x: e.clientX, y: e.clientY }
@@ -31,8 +37,25 @@ async function pu() {
   else await window.api.cancel()
 }
 
+// 取消只触发一次，避免右键与 mouseup 重复调用
+let cancelled = false
+function cancel() {
+  if (cancelled) return
+  cancelled = true
+  dragging.value = false
+  window.api.cancel()
+}
+
 function key(e) {
-  if (e.key === 'Escape') window.api.cancel()
+  if (e.key === 'Escape') {
+    e.preventDefault()
+    cancel()
+  }
+}
+
+// 截图遮罩用右键菜单会打断操作，统一屏蔽
+function menu(e) {
+  e.preventDefault()
 }
 
 onMounted(() => {
@@ -40,6 +63,7 @@ onMounted(() => {
   window.addEventListener('mousemove', pm)
   window.addEventListener('mouseup', pu)
   window.addEventListener('keydown', key)
+  window.addEventListener('contextmenu', menu)
 })
 
 onBeforeUnmount(() => {
@@ -47,6 +71,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('mousemove', pm)
   window.removeEventListener('mouseup', pu)
   window.removeEventListener('keydown', key)
+  window.removeEventListener('contextmenu', menu)
 })
 </script>
 
@@ -71,7 +96,7 @@ onBeforeUnmount(() => {
       v-else
       class="absolute top-6 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded-lg bg-black/60 text-white text-xs"
     >
-      拖拽框选截图区域，Esc 取消
+      拖拽框选截图区域，Esc 或右键取消
     </div>
   </div>
 </template>

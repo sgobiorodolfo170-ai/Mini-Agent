@@ -1,10 +1,11 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import MessageItem from '../components/MessageItem.vue'
-import ChatDetails from '../components/ChatDetails.vue'
 import UiIcon from '../components/UiIcon.vue'
 import UiDialog from '../components/UiDialog.vue'
 import ConvRow from '../components/ConvRow.vue'
+import AgentComposer from '../components/composer/AgentComposer.vue'
+import { useAgentStore } from '../stores/agent'
 import { useChatStore } from '../stores/chat'
 import { useSettingsStore } from '../stores/settings'
 import { useKbStore } from '../stores/kb'
@@ -16,16 +17,17 @@ const settings = useSettingsStore()
 const kb = useKbStore()
 const ui = useUiStore()
 const projects = useProjectsStore()
+const agent = useAgentStore()
 
 const input = ref('')
 const search = ref('')
 const sending = ref(false)
 const showKbPopover = ref(false)
+const kbPopoverEl = ref(null)
 const showMoreMenu = ref(false)
 const editingTitleId = ref(null)
 const scrollEl = ref(null)
 const stickBottom = ref(true)
-const vw = ref(typeof window !== 'undefined' ? window.innerWidth : 1280)
 let searchTimer = null
 
 const conv = computed(() => chat.activeConv)
@@ -46,36 +48,20 @@ const projectGroups = computed(() =>
 )
 
 // 页头显示最终生效的服务与模型（F21：不能只显示“跟随默认”）
+// 与 gateway.resolveModel 同口径：会话手动选定的供应商/模型 → 第一个启用供应商及其首个模型。
 const activeProvider = computed(() => {
   const pid = conv.value && conv.value.providerId
   return (
-    settings.providers.find((p) => p.id === pid) ||
-    settings.providers.find((p) => p.id === settings.defaultProviderId) ||
+    settings.enabledProviders.find((p) => p.id === pid) ||
     settings.enabledProviders[0] ||
+    settings.providers.find((p) => p.id === pid) ||
     null
   )
 })
 const models = computed(() => (activeProvider.value && activeProvider.value.models) || [])
 const activeModelId = computed(
-  () =>
-    (conv.value && conv.value.model) ||
-    settings.settings.defaultModel ||
-    (models.value[0] && models.value[0].id) ||
-    ''
+  () => (conv.value && conv.value.model) || (models.value[0] && models.value[0].id) || ''
 )
-const convPolicy = computed(() => {
-  if (!conv.value) return {}
-  const p = conv.value.contextPolicy
-  if (typeof p === 'string') {
-    try {
-      return JSON.parse(p || '{}')
-    } catch {
-      return {}
-    }
-  }
-  return p || {}
-})
-
 // ---------- 滚动策略（F14）：贴底才自动跟随，历史阅读不被抢滚动 ----------
 function scrollToBottom() {
   const el = scrollEl.value
@@ -121,7 +107,7 @@ function searchNow() {
   chat.setFilter(search.value)
 }
 
-// ---------- 发送（F05/F06）：IME 守卫 + 发送锁 + 失败恢复草稿 ----------
+// 发送（F05/F06）：发送锁 + 失败恢复草稿。键盘行为（Enter / Shift+Enter / IME）由 ComposerInput 负责
 async function send() {
   if (sending.value || chat.hasStreaming) return
   const content = input.value.trim()
@@ -144,16 +130,13 @@ async function send() {
     sending.value = false
   }
 }
-function onKeydown(e) {
-  // 中文输入法组合期间 Enter 只确认候选，不发送（F05）
-  if (e.isComposing || e.keyCode === 229) return
-  if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault()
-    send()
-  }
-}
+// 停止：普通对话走 gateway 的流式中止；智能任务走 agent 运行中止（两条链路各有权柄）
 function stopStream() {
-  if (streamingMsg.value) chat.stop(streamingMsg.value.id)
+  const m = streamingMsg.value
+  if (!m) return
+  const runId = m.meta && m.meta.agentRunId
+  if (runId) agent.stopRun(runId)
+  else chat.stop(m.id)
 }
 
 // ---------- 列表行：重命名 / 置顶 / 删除确认（F04/F13） ----------
@@ -242,27 +225,6 @@ async function removeProject(p) {
   if (ok) await projects.remove(p.id)
 }
 
-// ---------- 会话设置 ----------
-function setProvider(pid) {
-  if (conv.value) chat.updateConv(conv.value.id, { providerId: pid || null, model: null })
-}
-function setModel(m) {
-  if (conv.value) chat.updateConv(conv.value.id, { model: m || null })
-}
-function setField(field, value) {
-  if (!conv.value) return
-  const p = { ...convPolicy.value }
-  if (value === '' || value == null) delete p[field]
-  else p[field] = value
-  chat.updateConv(conv.value.id, { contextPolicy: p })
-}
-function setPrompt(v) {
-  if (conv.value) chat.updateConv(conv.value.id, { systemPrompt: v || null })
-}
-function setProject(v) {
-  if (conv.value) chat.updateConv(conv.value.id, { projectId: v || null })
-}
-
 function toggleKb(id) {
   const i = chat.selectedKbIds.indexOf(id)
   if (i >= 0) chat.selectedKbIds.splice(i, 1)
@@ -274,32 +236,229 @@ async function exportConv(mode) {
   showMoreMenu.value = false
   await window.api.chat.export({ cid: conv.value.id, mode })
 }
-
-// ---------- 输入框自动增高（方案 6.1：最高 160px 后内部滚动） ----------
-const inputEl = ref(null)
-function autoGrow() {
-  const el = inputEl.value
-  if (!el) return
-  el.style.height = 'auto'
-  el.style.height = Math.min(160, el.scrollHeight) + 'px'
+// ---------- 输入区（AgentComposer）：一切展示值来自真实业务状态 ----------
+// 呈现变体：任务模式下进入「任务后续输入」；模式值本身来自 chat.agentMode（真实影响发送路径）
+const composerVariant = computed(() => (chat.agentMode ? 'task-followup' : 'standard'))
+const composerPlaceholder = computed(() =>
+  chat.agentMode ? '提出后续修改要求' : '输入“/”使用技能'
+)
+// 输入区可访问说明（placeholder 不作为唯一标签，规范 §8.3）
+const composerHint = computed(() =>
+  chat.agentMode
+    ? 'Enter 发送，Shift+Enter 换行；可调用工具，涉及写入的操作将请求确认'
+    : 'Enter 发送，Shift+Enter 换行'
+)
+// 权限三级：默认权限（纯对话）/ 自主模式（写操作逐次确认）/ 完整权限（不再逐次确认）
+// 选中值写回 chat.permission，真实决定 agent.run 的确认策略
+const PERMISSION_META = {
+  default: { label: '默认权限', hint: '普通对话，不调用工具', icon: 'chat' },
+  autonomous: {
+    label: '自主模式',
+    hint: '可调用工具，涉及写入的操作将请求确认',
+    icon: 'shield'
+  },
+  full: {
+    label: '完整权限',
+    hint: '可调用工具，非只读操作直接执行，不再逐次确认',
+    icon: 'shield'
+  }
+}
+const modeAction = computed(() => {
+  const cur = PERMISSION_META[chat.permission] || PERMISSION_META.default
+  return {
+    id: chat.permission,
+    label: cur.label,
+    icon: cur.icon,
+    selected: chat.permission !== 'default',
+    enabled: true,
+    hint: cur.hint,
+    options: ['default', 'autonomous', 'full'].map((id) => ({
+      id,
+      label: PERMISSION_META[id].label,
+      hint: PERMISSION_META[id].hint,
+      icon: PERMISSION_META[id].icon,
+      selected: chat.permission === id
+    }))
+  }
+})
+function selectMode(id) {
+  if (!PERMISSION_META[id]) return
+  chat.permission = id
+  // 权限降到默认时集群无意义（不执行任务），一并关闭避免留下无效状态
+  if (id === 'default') chat.agentCluster = false
 }
 
-// ---------- 窗口宽度与详情停靠（F01：≥1360 且用户固定时停靠，否则抽屉） ----------
-const detailsDocked = computed(() => ui.showDetails && ui.detailsPinned && vw.value >= 1360)
-const detailsOverlay = computed(() => ui.showDetails && !detailsDocked.value)
-function onResize() {
-  vw.value = window.innerWidth
+// 添加能力：项目现有的附件入口是截图（Alt+S 同一链路），不虚构文件/网页菜单
+const addAction = { label: '添加截图', icon: 'plus', enabled: true }
+async function addAttachment() {
+  try {
+    await window.api.app.captureStart()
+  } catch (e) {
+    ui.toast('启动截图失败：' + String((e && e.message) || e), 'error')
+  }
+}
+
+// 上下文入口：项目现有的知识库选择（真实检索能力），保留在输入区左侧
+const kbNames = computed(() =>
+  kb.kbs.filter((k) => chat.selectedKbIds.includes(k.id)).map((k) => k.name)
+)
+const contextAction = computed(() => ({
+  label: chat.selectedKbIds.length ? `知识库(${chat.selectedKbIds.length})` : '知识库',
+  icon: 'kb',
+  active: showKbPopover.value,
+  enabled: true
+}))
+
+// Agent 集群：仅在任务模式下有意义。开启后 agent.run 允许一次派发多个并行子 Agent
+const clusterAction = computed(() => ({
+  label: 'Agent 集群',
+  icon: 'cluster',
+  active: chat.agentCluster,
+  enabled: chat.permission !== 'default',
+  hint:
+    chat.permission === 'default'
+      ? '切到自主模式或完整权限后可开启集群'
+      : chat.agentCluster
+        ? '已开启：可将独立子任务并行派发给多个子 Agent'
+        : '开启后可将独立子任务并行派发给多个子 Agent'
+}))
+function toggleCluster() {
+  if (chat.permission === 'default') return
+  chat.agentCluster = !chat.agentCluster
+}
+
+// 模型：当前会话生效的服务与模型（真实选择结果）
+const composerModel = computed(() => {
+  if (!activeModelId.value) return null
+  return {
+    id: activeModelId.value,
+    name: activeModelId.value,
+    tierLabel: ''
+  }
+})
+// 二级目录：一级按供应商分组，二级是该供应商已配置的模型
+const modelGroups = computed(() =>
+  settings.enabledProviders
+    .filter((p) => (p.models || []).length)
+    .map((p) => ({
+      id: p.id,
+      name: p.name,
+      models: (p.models || []).map((m) => ({
+        id: m.id,
+        label: m.id,
+        hint: m.vision ? '支持图片输入' : '',
+        selected:
+          p.id === (activeProvider.value && activeProvider.value.id) && m.id === activeModelId.value
+      }))
+    }))
+)
+// 选中模型：同时把会话切到该供应商，避免模型与供应商不匹配
+function selectModel({ providerId, modelId }) {
+  if (!conv.value) return
+  const patch = { providerId: providerId || null, model: modelId || null }
+  chat.updateConv(conv.value.id, patch)
+}
+
+// 上下文占用：分母与 gateway 一致（当前生效模型的 maxChars 参数，未配置时 12000）
+const activeModelParams = computed(() => {
+  const list = (activeProvider.value && activeProvider.value.models) || []
+  return list.find((m) => m.id === activeModelId.value) || {}
+})
+const contextUsage = computed(() => {
+  const limit = Number(activeModelParams.value.maxChars) || 12000
+  if (!limit) return null
+  const used = chat.messages.reduce((n, m) => n + (m.content ? m.content.length : 0), 0)
+  return { value: Math.min(1, used / limit), label: `${used} / ${limit} 字符` }
+})
+
+// 顶部状态徽标：来自 agent.runs 的真实计数，无数据时整体不渲染
+const startOfToday = () => {
+  const d = new Date()
+  d.setHours(0, 0, 0, 0)
+  return d.getTime()
+}
+const runningRuns = computed(() => agent.runs.filter((r) => r.status === 'running'))
+const doneRunsToday = computed(() =>
+  agent.runs.filter((r) => r.status === 'done' && (r.ended_at || 0) >= startOfToday())
+)
+// 徽标点击跳转「智能任务」并选中对应运行记录（业务层已有能力，非占位）
+function openRun(item) {
+  ui.view = 'agent'
+  const target =
+    item.id === 'running'
+      ? runningRuns.value[0]
+      : item.id === 'done'
+        ? doneRunsToday.value[0]
+        : runningRuns.value[0]
+  if (target) agent.select(target.id)
+}
+const composerStatusItems = computed(() => {
+  const items = []
+  const goRuns = () => {
+    ui.view = 'agent'
+  }
+  if (chat.agentMode) {
+    if (runningRuns.value.length) {
+      items.push({
+        id: 'running',
+        label: '处理中',
+        value: runningRuns.value.length,
+        icon: 'listCheck',
+        tone: 'info',
+        onClick: goRuns
+      })
+    }
+    if (doneRunsToday.value.length) {
+      items.push({
+        id: 'done',
+        label: '已完成',
+        value: doneRunsToday.value.length,
+        icon: 'checkCircle',
+        tone: 'success',
+        onClick: goRuns
+      })
+    }
+    return items
+  }
+  if (runningRuns.value.length) {
+    items.push({
+      id: 'background',
+      label: '后台',
+      value: `${runningRuns.value.length} 项`,
+      icon: 'listCheck',
+      tone: 'default',
+      onClick: goRuns
+    })
+  }
+  return items
+})
+
+// 运行状态指示：仅在真实流式执行中为 running
+const runtimeState = computed(() => (chat.hasStreaming ? 'running' : 'idle'))
+function stopComposer() {
+  stopStream()
+}
+
+// 点击面板外部关闭知识库面板（Esc 由 onWindowKeydown 处理）
+function onDocPointerDown(e) {
+  if (!showKbPopover.value) return
+  if (kbPopoverEl.value && kbPopoverEl.value.contains(e.target)) return
+  const trigger = e.target && e.target.closest ? e.target.closest('[data-testid="kb-chip"]') : null
+  if (trigger) return
+  showKbPopover.value = false
 }
 function onWindowKeydown(e) {
-  if (e.key === 'Escape' && ui.showDetails && !ui.confirmState) ui.setShowDetails(false)
+  if (e.key !== 'Escape' || ui.confirmState) return
+  // 输入区弹出的面板优先关闭，且不清空输入文本（规范 §5.2）
+  if (showKbPopover.value) showKbPopover.value = false
 }
 onMounted(() => {
-  window.addEventListener('resize', onResize)
   window.addEventListener('keydown', onWindowKeydown)
+  document.addEventListener('pointerdown', onDocPointerDown, true)
 })
 onBeforeUnmount(() => {
-  window.removeEventListener('resize', onResize)
   window.removeEventListener('keydown', onWindowKeydown)
+  document.removeEventListener('pointerdown', onDocPointerDown, true)
   clearTimeout(searchTimer)
 })
 
@@ -520,7 +679,7 @@ function startResize(e) {
 
     <!-- 聊天主区 -->
     <section class="flex-1 min-w-0 flex flex-col">
-      <!-- 页头：列表开关 / 标题 / 生效模型 / 会话设置 / 更多（方案 5.3） -->
+      <!-- 页头：列表开关 / 标题 / 生效模型 / 更多（设置入口统一在侧栏「设置」） -->
       <header
         class="shrink-0 h-14 flex items-center gap-2 px-4 border-b border-line-subtle bg-canvas"
       >
@@ -549,15 +708,6 @@ function startResize(e) {
         </div>
         <button v-if="!hasService" class="btn-secondary !h-8 text-xs" @click="ui.view = 'settings'">
           配置服务
-        </button>
-        <button
-          class="btn-secondary !h-8 text-xs"
-          :disabled="!conv"
-          :aria-expanded="ui.showDetails"
-          @click="ui.setShowDetails(!ui.showDetails)"
-        >
-          <UiIcon name="panelRight" :size="16" />
-          会话设置
         </button>
         <div class="relative">
           <button
@@ -664,169 +814,90 @@ function startResize(e) {
         </button>
       </div>
 
-      <!-- 输入区（方案 6.1） -->
-      <div class="shrink-0 border-t border-line-subtle bg-subtle px-4 py-3 space-y-2">
-        <div v-if="ui.pendingAttachment" class="flex items-center gap-2 text-xs">
-          <img
-            :src="ui.pendingAttachment"
-            class="h-10 rounded-lg border border-line-control"
-            alt="截图附件"
-          />
-          <span class="text-ink-secondary">截图附件</span>
-          <button class="text-red-600 hover:underline" @click="ui.pendingAttachment = null">
-            移除
-          </button>
-        </div>
-        <div class="flex items-center gap-2 text-xs flex-wrap">
-          <button
-            class="btn-compact border"
-            :class="
-              showKbPopover
-                ? 'border-brand text-brand-ink bg-brand-soft'
-                : 'border-line-control text-ink-secondary bg-surface hover:bg-subtle'
-            "
-            data-testid="kb-chip"
-            :aria-expanded="showKbPopover"
-            @click="showKbPopover = !showKbPopover"
+      <!-- 输入区（AgentComposer）：状态徽标 + 单张白卡（上层输入 / 下层操作栏） -->
+      <div class="shrink-0 bg-canvas px-6 pb-5 pt-3">
+        <div class="mx-auto w-full" style="max-width: 1136px">
+          <AgentComposer
+            :variant="composerVariant"
+            :placeholder="composerPlaceholder"
+            :hint="composerHint"
+            :value="input"
+            :submitting="sending"
+            :streaming="chat.hasStreaming"
+            :model="composerModel"
+            :model-groups="modelGroups"
+            :status-items="composerStatusItems"
+            :mode-action="modeAction"
+            :context-action="contextAction"
+            :add-action="addAction"
+            :cluster-action="clusterAction"
+            :context-usage="contextUsage"
+            :runtime-state="runtimeState"
+            :send-label="chat.agentMode ? '开始任务' : '发送'"
+            @update:value="input = $event"
+            @submit="send"
+            @stop="stopComposer"
+            @add="addAttachment"
+            @context="showKbPopover = !showKbPopover"
+            @toggle-cluster="toggleCluster"
+            @select-mode="selectMode"
+            @select-model="selectModel"
+            @status-select="openRun"
           >
-            <UiIcon name="kb" :size="14" />
-            知识库<span v-if="chat.selectedKbIds.length">({{ chat.selectedKbIds.length }})</span>
-          </button>
-          <button
-            class="btn-compact border"
-            :class="
-              chat.agentMode
-                ? 'border-brand text-brand-ink bg-brand-soft'
-                : 'border-line-control text-ink-secondary bg-surface hover:bg-subtle'
-            "
-            title="开启后发送内容将作为智能任务执行；涉及写入的操作会先请求确认"
-            data-testid="agent-toggle"
-            :aria-pressed="chat.agentMode"
-            @click="chat.agentMode = !chat.agentMode"
-          >
-            <UiIcon name="agent" :size="14" />
-            任务模式
-          </button>
-          <span v-if="chat.selectedKbIds.length" class="text-ink-muted">
-            将检索
-            {{
-              kb.kbs
-                .filter((k) => chat.selectedKbIds.includes(k.id))
-                .map((k) => k.name)
-                .join('、')
-            }}
-          </span>
-          <span v-if="chat.agentMode" class="text-ink-muted"
-            >可调用工具，涉及写入的操作将请求确认</span
-          >
-        </div>
-        <div
-          v-if="showKbPopover"
-          class="rounded-lg border border-line-subtle bg-surface p-2.5 text-xs space-y-1.5 max-h-40 overflow-y-auto"
-        >
-          <div v-if="!kb.kbs.length" class="text-ink-muted">还没有知识库，到「知识库」页创建</div>
-          <label
-            v-for="k in kb.kbs"
-            :key="k.id"
-            class="flex items-center gap-2 cursor-pointer min-h-[28px]"
-          >
-            <input
-              type="checkbox"
-              :checked="chat.selectedKbIds.includes(k.id)"
-              @change="toggleKb(k.id)"
-            />
-            <span>{{ k.name }}</span>
-            <span class="text-ink-muted">{{
-              k.stats ? k.stats.docs + ' 文档 · ' + k.stats.chunks + ' 分块' : ''
-            }}</span>
-          </label>
-        </div>
-        <div class="flex items-end gap-2">
-          <textarea
-            ref="inputEl"
-            v-model="input"
-            rows="2"
-            placeholder="输入消息，Enter 发送，Shift+Enter 换行"
-            aria-label="消息输入框"
-            data-testid="chat-input"
-            class="field-area flex-1 max-h-40"
-            @keydown="onKeydown"
-            @input="autoGrow"
-          />
-          <button
-            v-if="chat.hasStreaming"
-            class="btn h-10 px-4 rounded-lg text-sm bg-red-700 hover:bg-red-800 text-white"
-            data-testid="chat-stop"
-            @click="stopStream"
-          >
-            <UiIcon name="stop" :size="16" />
-            停止
-          </button>
-          <button
-            v-else
-            class="btn-primary"
-            :disabled="!input.trim() || sending"
-            data-testid="chat-send"
-            @click="send"
-          >
-            {{ sending ? '发送中…' : chat.agentMode ? '开始任务' : '发送' }}
-          </button>
+            <template #attachment>
+              <div
+                v-if="ui.pendingAttachment"
+                class="mb-2 flex items-center gap-2 text-xs"
+                data-testid="composer-attachment"
+              >
+                <img
+                  :src="ui.pendingAttachment"
+                  class="h-10 rounded-lg border border-line-subtle"
+                  alt="截图附件"
+                />
+                <span class="text-ink-secondary">截图附件</span>
+                <button class="text-link hover:underline" @click="ui.pendingAttachment = null">
+                  移除
+                </button>
+              </div>
+            </template>
+            <template #context-panel>
+              <div
+                v-if="showKbPopover"
+                ref="kbPopoverEl"
+                class="ac-menu ac-menu--left w-72 !max-w-[calc(100vw-48px)]"
+                role="group"
+                aria-label="选择知识库"
+              >
+                <div v-if="!kb.kbs.length" class="ac-menu__empty">
+                  还没有知识库，到「知识库」页创建
+                </div>
+                <label
+                  v-for="k in kb.kbs"
+                  :key="k.id"
+                  class="ac-menu__item cursor-pointer items-center"
+                >
+                  <input
+                    type="checkbox"
+                    :checked="chat.selectedKbIds.includes(k.id)"
+                    @change="toggleKb(k.id)"
+                  />
+                  <span class="ac-menu__text">
+                    <span class="ac-menu__label">{{ k.name }}</span>
+                    <span v-if="k.stats" class="ac-menu__hint">
+                      {{ k.stats.docs }} 文档 · {{ k.stats.chunks }} 分块
+                    </span>
+                  </span>
+                </label>
+              </div>
+            </template>
+          </AgentComposer>
+          <p v-if="kbNames.length" class="mt-2 px-1 text-xs text-ink-muted">
+            将检索：{{ kbNames.join('、') }}
+          </p>
         </div>
       </div>
     </section>
-
-    <!-- 会话设置：默认收起；宽窗可停靠，窄窗覆盖抽屉（F01） -->
-    <aside
-      v-if="detailsDocked"
-      class="w-80 shrink-0 border-l border-line-subtle bg-subtle overflow-y-auto p-4 text-sm"
-      aria-label="会话设置"
-    >
-      <ChatDetails
-        :conv="conv"
-        :providers="settings.providers"
-        :models="models"
-        :policy="convPolicy"
-        :projects="projects.projects"
-        :docked="true"
-        :details-pinned="ui.detailsPinned"
-        @set-provider="setProvider"
-        @set-model="setModel"
-        @set-prompt="setPrompt"
-        @set-project="setProject"
-        @set-field="setField"
-        @export="exportConv"
-        @unpin="ui.setDetailsPinned(false)"
-      />
-    </aside>
-    <!-- 覆盖式抽屉：容器不拦截点击，仅面板可交互（非模态，方案 §4.3） -->
-    <div
-      v-if="detailsOverlay"
-      class="fixed inset-0 z-40 flex justify-end pointer-events-none"
-      aria-label="会话设置抽屉"
-    >
-      <div
-        class="pointer-events-auto w-80 max-w-[85vw] h-full border-l border-line-subtle bg-subtle overflow-y-auto p-4 text-sm shadow-modal"
-      >
-        <ChatDetails
-          :conv="conv"
-          :providers="settings.providers"
-          :models="models"
-          :policy="convPolicy"
-          :projects="projects.projects"
-          :docked="false"
-          :details-pinned="ui.detailsPinned"
-          :can-pin="vw >= 1360"
-          @close="ui.setShowDetails(false)"
-          @set-provider="setProvider"
-          @set-model="setModel"
-          @set-prompt="setPrompt"
-          @set-project="setProject"
-          @set-field="setField"
-          @export="exportConv"
-          @pin="ui.setDetailsPinned(true)"
-        />
-      </div>
-    </div>
 
     <!-- 添加项目工作目录（替代设置页的命令工作目录） -->
     <UiDialog :open="showProjectDialog" title="添加项目" @close="showProjectDialog = false">

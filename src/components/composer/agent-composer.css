@@ -1,0 +1,473 @@
+/* 对话输入区（AgentComposer）局部样式
+ * 命名空间：.agent-composer / .ac-*，不污染 button、textarea、body 等全局选择器。
+ * 颜色一律映射 src/common/tokens.css 的语义变量（浅深主题共用），
+ * 仅阴影、圆角与几何尺寸为本组件局部值，对应施工规范 §2.3 / §2.2。
+ * 桌面默认：卡片高 106px = 上内边距 14 + 单行文本 22 + 操作栏上间距 26 + 控件行 32 + 下内边距 12。
+ */
+.agent-composer {
+  --ac-radius: 22px;
+  --ac-shadow: 0 6px 22px rgba(15, 23, 42, 0.055);
+  --ac-shadow-pill: 0 1px 2px rgba(15, 23, 42, 0.04);
+  --ac-ease: 140ms ease-out;
+  container-type: inline-size;
+  width: 100%;
+  min-width: 0;
+}
+html.dark .agent-composer {
+  --ac-shadow: 0 6px 22px rgba(0, 0, 0, 0.32);
+  --ac-shadow-pill: 0 1px 2px rgba(0, 0, 0, 0.24);
+}
+
+/* ---------- 顶部状态徽标（卡片之外，不嵌入卡片） ---------- */
+.ac-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-bottom: 15px;
+}
+.ac-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  max-width: 100%;
+  padding: 0 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 9999px;
+  background: var(--bg-surface);
+  box-shadow: var(--ac-shadow-pill);
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1;
+  white-space: nowrap;
+}
+.ac-pill--interactive {
+  transition: background-color var(--ac-ease);
+}
+.ac-pill--interactive:hover:not(:disabled) {
+  background: var(--bg-subtle);
+}
+.ac-pill:disabled {
+  cursor: not-allowed;
+  color: var(--text-muted);
+}
+.ac-pill__label {
+  color: var(--text-secondary);
+}
+.ac-pill__value {
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+.ac-pill__icon {
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+.ac-pill--info .ac-pill__icon {
+  color: var(--status-info-ink);
+}
+.ac-pill--success .ac-pill__icon {
+  color: var(--status-ok-ink);
+}
+.ac-pill--warning .ac-pill__icon {
+  color: var(--status-warn-ink);
+}
+
+/* ---------- 单张输入卡片 ---------- */
+.ac-card {
+  position: relative;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--ac-radius);
+  background: var(--bg-surface);
+  box-shadow: var(--ac-shadow);
+}
+/* 键盘聚焦时给整张卡片可见但克制的焦点反馈（文本域本身去掉默认 outline，
+   规范 §2.5 / §8.3 要求聚焦必须可感知；此处用 2px 低透明度品牌环，不改变布局） */
+.ac-card:has(.ac-textarea:focus-visible) {
+  box-shadow:
+    0 0 0 2px color-mix(in srgb, var(--focus) 16%, transparent),
+    var(--ac-shadow);
+}
+
+.ac-input-area {
+  padding: 14px 18px 0;
+}
+.ac-textarea {
+  display: block;
+  width: 100%;
+  min-height: 22px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 14px;
+  line-height: 22px;
+  resize: none;
+  overflow-y: hidden;
+}
+.ac-textarea::placeholder {
+  color: var(--text-muted);
+}
+.ac-textarea:focus,
+.ac-textarea:focus-visible {
+  outline: none;
+}
+.ac-textarea:disabled {
+  cursor: not-allowed;
+  color: var(--text-muted);
+}
+
+/* ---------- 底部操作栏：单行、左右两组、垂直居中、无分割线 ---------- */
+.ac-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 26px 12px 12px;
+}
+.ac-left {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+.ac-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  margin-left: auto;
+}
+.ac-anchor {
+  position: relative;
+  display: inline-flex;
+  min-width: 0;
+}
+
+/* 图标按钮：30px 点击区，图标 14–18px */
+.ac-btn {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  color: var(--text-secondary);
+  transition:
+    background-color var(--ac-ease),
+    color var(--ac-ease);
+}
+.ac-btn:hover:not(:disabled) {
+  background: var(--bg-subtle);
+  color: var(--text-primary);
+}
+.ac-btn:disabled {
+  cursor: not-allowed;
+  color: var(--text-muted);
+}
+
+/* 下拉入口（权限 / 模式 / 上下文 / 模型通用） */
+.ac-select {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  height: 30px;
+  padding: 0 8px;
+  border-radius: 8px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1;
+  transition:
+    background-color var(--ac-ease),
+    color var(--ac-ease);
+}
+.ac-select:hover:not(:disabled) {
+  background: var(--bg-subtle);
+  color: var(--text-primary);
+}
+.ac-select:disabled {
+  cursor: not-allowed;
+  color: var(--text-muted);
+}
+.ac-select__label {
+  overflow: hidden;
+  min-width: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ac-select__chev {
+  flex-shrink: 0;
+  opacity: 0.65;
+}
+/* 选中态（自主模式）用品牌强调色，其余保持中性灰 */
+.ac-select--emphasis,
+.ac-select--emphasis:hover:not(:disabled) {
+  color: var(--brand-ink);
+}
+/* 展开中的下拉入口保持可见的激活底色，与菜单浮层形成对应关系 */
+.ac-select[aria-expanded='true']:not(:disabled) {
+  background: var(--bg-subtle);
+  color: var(--text-primary);
+}
+
+.ac-model {
+  max-width: 100%;
+}
+.ac-model .ac-select__label {
+  max-width: 200px;
+  color: var(--text-primary);
+  font-size: 14px;
+}
+.ac-tier {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+/* 上下文占用环：业务层给出真实比例时才渲染，不显示无意义动画 */
+.ac-usage {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+}
+.ac-usage__ring {
+  width: 16px;
+  height: 16px;
+  border-radius: 9999px;
+  /* 用 closest-side 精确控制环宽 3px（百分比按半径换算），避免尺寸随字号漂移 */
+  mask: radial-gradient(circle closest-side, transparent calc(100% - 3px), #000 calc(100% - 3px));
+  -webkit-mask: radial-gradient(
+    circle closest-side,
+    transparent calc(100% - 3px),
+    #000 calc(100% - 3px)
+  );
+  /* 低占用时也要能看出「这是个状态环」，轨道用比 border-subtle 更实的灰 */
+  filter: saturate(1.05);
+}
+.ac-usage--warn .ac-usage__ring,
+.ac-usage--bad .ac-usage__ring {
+  /* 高占用时补一圈淡淡的提示环，不单靠细弧颜色传达 */
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--status-warn-ink) 14%, transparent);
+}
+
+/* 运行状态指示：仅真实进行中旋转，14–16px */
+.ac-ring {
+  flex-shrink: 0;
+  width: 15px;
+  height: 15px;
+  border: 2px solid var(--border-subtle);
+  border-top-color: var(--brand);
+  border-radius: 9999px;
+  animation: ac-spin 900ms linear infinite;
+}
+
+/* 发送按钮：32px 圆形，位于操作栏最末端 */
+.ac-send {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 9999px;
+  background: var(--brand);
+  color: var(--on-brand);
+  transition: background-color var(--ac-ease);
+}
+.ac-send:hover:not(:disabled) {
+  background: var(--brand-hover);
+}
+.ac-send:active:not(:disabled) {
+  background: var(--brand-active);
+}
+.ac-send:disabled {
+  cursor: not-allowed;
+  background: var(--bg-subtle);
+  color: var(--text-muted);
+}
+
+/* 停止入口：与发送同位置，不改变操作栏高度 */
+.ac-stop {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 9999px;
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1;
+  transition:
+    background-color var(--ac-ease),
+    color var(--ac-ease);
+}
+.ac-stop:hover {
+  background: var(--bg-subtle);
+  color: var(--text-primary);
+}
+
+/* ---------- 弹出菜单（复用项目浮层语言：白底 / 细边框 / shadow-menu） ---------- */
+.ac-menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 236px;
+  max-width: 300px;
+  max-height: 288px;
+  overflow-y: auto;
+  padding: 4px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 14px;
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-menu);
+  animation: ac-menu-in var(--ac-ease);
+}
+.ac-menu--left {
+  left: 0;
+}
+.ac-menu--right {
+  right: 0;
+}
+.ac-menu__item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 10px;
+  color: var(--text-primary);
+  font-size: 13px;
+  text-align: left;
+  transition: background-color var(--ac-ease);
+}
+.ac-menu__item:hover:not(:disabled),
+.ac-menu__item:focus-visible {
+  background: var(--bg-subtle);
+}
+.ac-menu__item:disabled {
+  cursor: not-allowed;
+  color: var(--text-muted);
+}
+.ac-menu__icon {
+  flex-shrink: 0;
+  margin-top: 1px;
+  color: var(--text-muted);
+}
+.ac-menu__text {
+  flex: 1;
+  min-width: 0;
+}
+.ac-menu__label {
+  display: block;
+}
+.ac-menu__hint {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 16px;
+}
+.ac-menu__check {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--brand-ink);
+}
+.ac-menu__chev {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--text-muted);
+}
+.ac-menu__back {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  padding: 7px 8px;
+  border-radius: 9px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-align: left;
+  transition: background-color var(--ac-ease);
+}
+.ac-menu__back:hover {
+  background: var(--bg-subtle);
+  color: var(--text-primary);
+}
+.ac-menu__title {
+  padding: 2px 10px 6px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 16px;
+}
+.ac-menu__empty {
+  padding: 8px 10px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+@keyframes ac-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes ac-menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* 窄宽度：优先保留发送按钮、模型名与模式入口；低优先级文案缩为纯图标（规范 §7.2） */
+@container (max-width: 620px) {
+  .ac-select--collapsible .ac-select__label {
+    display: none;
+  }
+  .ac-select--collapsible {
+    padding: 0 6px;
+  }
+  .ac-model .ac-select__label {
+    max-width: 132px;
+  }
+}
+@container (max-width: 440px) {
+  .ac-actions {
+    gap: 6px;
+    padding-right: 8px;
+    padding-left: 8px;
+  }
+  .ac-input-area {
+    padding-right: 14px;
+    padding-left: 14px;
+  }
+  .ac-model .ac-select__label {
+    max-width: 92px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ac-ring {
+    animation: none;
+  }
+  .ac-menu {
+    animation: none;
+  }
+}

@@ -1,8 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { closeApp, launchApp, setupProviderAndKey, startChat, unexpectedErrors } from './helpers'
 
-const INPUT = '输入消息，Enter 发送，Shift+Enter 换行'
-
 let ctx
 
 beforeEach(async () => {

@@ -7,12 +7,19 @@ export const useChatStore = defineStore('chat', {
     activeId: null,
     messages: [],
     selectedKbIds: [],
-    agentMode: false,
+    // 权限等级：default（普通对话）/ autonomous（自主模式，逐次确认）/ full（完整权限，不再逐次确认）
+    permission: 'default',
+    // Agent 集群：允许一次派发多个子 Agent 并行处理
+    agentCluster: false,
     // 搜索筛选与完整会话数据分开存放：activeConv 始终从完整列表取值（F03）
     filterQuery: '',
     filterIds: []
   }),
   getters: {
+    // 任务模式 = 任一非默认权限。保留旧字段名，避免既有调用点与测试失效
+    agentMode(state) {
+      return state.permission !== 'default'
+    },
     activeConv(state) {
       return state.conversations.find((c) => c.id === state.activeId) || null
     },
@@ -74,7 +81,12 @@ export const useChatStore = defineStore('chat', {
     async send(content, attachments = []) {
       if (!this.activeId) await this.create()
       if (this.agentMode) {
-        return window.api.agent.run({ conversationId: this.activeId, goal: content })
+        return window.api.agent.run({
+          conversationId: this.activeId,
+          goal: content,
+          permission: this.permission,
+          cluster: this.agentCluster
+        })
       }
       return window.api.chat.send({
         conversationId: this.activeId,

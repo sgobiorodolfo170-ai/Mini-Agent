@@ -93,20 +93,12 @@ describe('settings store 初始化', () => {
 })
 
 describe('settings store 计算属性', () => {
-  it('defaultProviderId 优先取设置值，缺省回退第一个供应商', async () => {
+  // 默认供应商/默认模型设置已移除：服务与模型由用户在选择处手动指定
+  it('不再暴露 defaultProviderId 计算属性', async () => {
     const s = useSettingsStore()
     await s.init()
-    expect(s.defaultProviderId).toBe('p1')
-
-    window.api.settings.all.mockResolvedValue({})
-    const s2 = useSettingsStore()
-    await s2.init()
-    expect(s2.defaultProviderId).toBe('p1') // providers[0].id
-
-    window.api.providers.list.mockResolvedValue([])
-    const s3 = useSettingsStore()
-    await s3.init()
-    expect(s3.defaultProviderId).toBeNull()
+    expect(s.defaultProviderId).toBeUndefined()
+    expect(s.settings.defaultProviderId).toBe('p1')
   })
 
   it('enabledProviders 只返回启用的供应商', async () => {
