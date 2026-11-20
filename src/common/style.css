@@ -1,0 +1,183 @@
+@import './tokens.css';
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  @apply bg-canvas text-ink font-ui text-sm;
+  overflow: hidden;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  @apply rounded bg-zinc-400 dark:bg-zinc-700;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@layer components {
+  /* 布局容器：主区允许压缩，滚动收敛到单容器 */
+  .page-main,
+  .scroll-region {
+    min-width: 0;
+    min-height: 0;
+  }
+  .scroll-region {
+    overflow-y: auto;
+  }
+
+  /* 按钮（方案 §7）：主按钮 h-10，普通 h-9，紧凑 h-8 */
+  .btn {
+    @apply inline-flex select-none items-center justify-center gap-2 whitespace-nowrap rounded-lg text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40;
+  }
+  .btn-primary {
+    @apply btn h-10 bg-brand px-4 text-onbrand hover:bg-brand-hover active:bg-brand-active;
+  }
+  .btn-secondary {
+    @apply btn h-9 border border-line-control bg-surface px-3.5 text-ink-primary hover:bg-subtle;
+  }
+  .btn-compact {
+    @apply btn h-8 px-2.5 text-xs;
+  }
+  .btn-ghost {
+    @apply btn h-9 px-3 text-ink-secondary hover:bg-subtle hover:text-ink-primary;
+  }
+  .btn-danger {
+    @apply btn h-9 bg-red-700 px-3.5 text-white hover:bg-red-800;
+  }
+
+  .icon-btn {
+    @apply inline-flex h-9 w-9 items-center justify-center rounded-lg text-ink-secondary transition-colors hover:bg-subtle hover:text-ink-primary disabled:opacity-40;
+  }
+  .icon-btn-sm {
+    @apply inline-flex h-8 w-8 items-center justify-center rounded-md text-ink-secondary transition-colors hover:bg-subtle hover:text-ink-primary;
+  }
+
+  /* 输入控件：36px 起，独立标签（方案 §7） */
+  .field-input {
+    @apply h-9 w-full min-w-0 rounded-lg border border-line-control bg-surface px-3 text-sm text-ink-primary placeholder:text-ink-muted hover:border-ink-muted focus:border-brand;
+  }
+  .field-area {
+    @apply w-full min-w-0 resize-none rounded-lg border border-line-control bg-surface px-3 py-2 text-sm leading-[22px] text-ink-primary placeholder:text-ink-muted hover:border-ink-muted focus:border-brand;
+  }
+
+  .field-label {
+    @apply mb-1.5 block text-sm text-ink-secondary;
+  }
+  .field-help {
+    @apply mt-1 text-xs text-ink-muted;
+  }
+  .field-error {
+    @apply mt-1 flex items-center gap-1 text-xs text-red-600 dark:text-red-400;
+  }
+
+  .badge {
+    @apply inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-xs leading-[18px];
+  }
+
+  .card {
+    @apply rounded-xl border border-line-subtle bg-surface;
+  }
+
+  /* 列表行：44px 起，选中品牌浅底 */
+  .list-row {
+    @apply flex min-h-[44px] w-full cursor-pointer items-center gap-1.5 rounded-lg px-3 text-left text-sm text-ink-primary;
+  }
+
+  /* 消息编辑器随容器伸缩，禁止固定宽度（F02） */
+  .message-editor {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+  }
+  .message-text {
+    overflow-wrap: anywhere;
+  }
+  .code-scroll,
+  .table-scroll {
+    max-width: 100%;
+    overflow-x: auto;
+  }
+}
+
+/* ---------- Markdown 正文（方案 §3.2：会话正文 15px/26px） ---------- */
+.md-body {
+  @apply break-words text-[15px] leading-[26px];
+}
+.md-body p {
+  @apply my-3;
+}
+.md-body h1,
+.md-body h2,
+.md-body h3 {
+  @apply mb-2 mt-4 font-semibold text-ink-primary;
+}
+.md-body h1 {
+  @apply text-[22px] leading-8;
+}
+.md-body h2 {
+  @apply text-[19px] leading-7;
+}
+.md-body h3 {
+  @apply text-base leading-6;
+}
+.md-body ul {
+  @apply my-3 list-disc space-y-1 pl-5;
+}
+.md-body ol {
+  @apply my-3 list-decimal space-y-1 pl-5;
+}
+.md-body blockquote {
+  @apply my-3 border-l-2 border-line-control py-0.5 pl-3 text-ink-secondary;
+}
+.md-body code:not(.hljs) {
+  @apply rounded border border-line-subtle bg-subtle px-1 py-0.5 font-code text-[13px] text-brand-ink;
+}
+.md-body pre {
+  @apply code-scroll my-2 rounded-lg bg-zinc-900 p-3 font-code text-[13px] leading-[21px] text-zinc-100 dark:bg-black/60;
+}
+.md-body table {
+  @apply my-2 border-collapse text-sm;
+}
+.md-body th,
+.md-body td {
+  @apply border border-line-subtle px-2 py-1;
+}
+.md-body a {
+  @apply text-link underline;
+}
+.md-body hr {
+  @apply my-4 border-line-subtle;
+}
+
+.code-block {
+  @apply code-scroll my-2 overflow-hidden rounded-lg border border-line-subtle;
+}
+.code-head {
+  @apply flex justify-between items-center px-3 py-1.5 bg-subtle text-xs text-ink-muted;
+}
+.cursor-blink {
+  @apply animate-pulse text-brand;
+}

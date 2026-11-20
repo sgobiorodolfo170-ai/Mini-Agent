@@ -1,0 +1,29 @@
+appId: com.miniagent.desktop
+productName: miniagent
+directories:
+  buildResources: build
+  output: dist-app
+files:
+  - out/**
+  - assets/**
+  - package.json
+asar: true
+# 原生模块（onnxruntime-node / faiss-node）的 .node 与 dll 无法从 asar 内加载，整目录解包
+asarUnpack:
+  - '**/node_modules/onnxruntime-node/**'
+  - '**/node_modules/faiss-node/**'
+  - '**/node_modules/bindings/**'
+  - '**/node_modules/file-uri-to-path/**'
+electronDownload:
+  mirror: https://npmmirror.com/mirrors/electron/
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: build/icon.ico
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  shortcutName: miniagent

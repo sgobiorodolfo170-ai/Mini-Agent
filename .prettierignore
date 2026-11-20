@@ -1,0 +1,9 @@
+node_modules
+out
+dist-app
+build
+assets
+coverage
+package-lock.json
+*.md
+docs/架构总览.html

@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>miniagent 架构总览</title>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;600&family=Noto+Serif+SC:wght@400&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper:#f4f4f5; --paper-2:#e4e4e7; --ink:#27272a; --muted:#52525b; --soft:#71717a;
+    --rule:rgba(39,39,42,0.12); --accent:#6366f1; --accent-tint:rgba(99,102,241,0.10); --link:#f38145;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--ink);font-family:'Geist','Noto Sans SC',sans-serif;}
+  .page{max-width:1360px;margin:0 auto;padding:56px 40px 40px;}
+  .eyebrow{font-family:'Geist Mono',monospace;font-size:11px;font-weight:500;letter-spacing:0.18em;text-transform:uppercase;color:var(--soft);}
+  h1{font-family:'Instrument Serif','Noto Serif SC',serif;font-weight:400;font-size:28px;margin:10px 0 0;}
+  .subtitle{font-size:14px;color:var(--muted);margin-top:8px;}
+  figure{margin:36px 0 0;}
+  svg{width:100%;height:auto;display:block;}
+  .caption{margin-top:6px;font-size:12px;color:var(--soft);}
+  .cards{display:grid;grid-template-columns:1.1fr 1fr 0.9fr;gap:16px;margin-top:32px;}
+  .card{background:#ffffff;border:1px solid var(--rule);border-radius:6px;padding:20px;}
+  .card .eyebrow{font-size:9px;}
+  .card-header{display:flex;align-items:center;gap:8px;margin:10px 0 10px;}
+  .card-header h3{font-size:15px;font-weight:600;margin:0;}
+  .dot{width:7px;height:7px;border-radius:50%;flex:none;}
+  .dot-ink{background:var(--ink);} .dot-accent{background:var(--accent);} .dot-soft{background:var(--soft);}
+  .card ul{margin:0;padding-left:16px;font-size:13px;line-height:1.75;}
+  footer{margin-top:36px;padding-top:16px;border-top:1px solid var(--rule);font-family:'Geist Mono',monospace;font-size:10px;letter-spacing:0.06em;color:var(--soft);}
+</style>
+</head>
+<body>
+<div class="page">
+  <header>
+    <p class="eyebrow">miniagent · v1.0 · Electron 45 + Vue 3</p>
+    <h1>miniagent 架构总览</h1>
+    <p class="subtitle">三进程 Electron 架构：渲染层只做 UI，模型网关、Agent 运行时、RAG 与系统集成全部收敛在主进程，SQLite 单文件落盘。</p>
+  </header>
+
+  <figure>
+  <svg viewBox="0 0 1280 720" role="img" aria-labelledby="miniagent-architecture-title miniagent-architecture-desc" xmlns="http://www.w3.org/2000/svg">
+    <title id="miniagent-architecture-title">miniagent 架构总览</title>
+    <desc id="miniagent-architecture-desc">miniagent Windows 桌面应用架构总览：Vue 3 渲染层经 preload IPC 连接主进程的模型网关、Agent 运行时、RAG 管道、系统集成与 SQLite 存储，并调用 OpenAI 兼容模型 API 与本机系统。</desc>
+    <defs>
+      <marker id="ma-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+        <polygon points="0 0, 8 3, 0 6" fill="#52525b"/>
+      </marker>
+      <marker id="ma-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+        <polygon points="0 0, 8 3, 0 6" fill="#6366f1"/>
+      </marker>
+      <marker id="ma-arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+        <polygon points="0 0, 8 3, 0 6" fill="#f38145"/>
+      </marker>
+    </defs>
+
+    <rect width="100%" height="100%" fill="#f4f4f5"/>
+
+    <!-- zones -->
+    <rect x="40" y="144" width="304" height="232" rx="8" fill="rgba(39,39,42,0.02)" stroke="rgba(39,39,42,0.10)" stroke-width="0.8"/>
+    <rect x="56" y="148" width="112" height="12" rx="2" fill="#f4f4f5"/>
+    <text x="112" y="157" fill="rgba(39,39,42,0.40)" font-size="7" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing="0.14em">RENDERER · VUE 3</text>
+
+    <rect x="384" y="40" width="496" height="600" rx="8" fill="rgba(39,39,42,0.02)" stroke="rgba(39,39,42,0.10)" stroke-width="0.8"/>
+    <rect x="400" y="44" width="152" height="12" rx="2" fill="#f4f4f5"/>
+    <text x="476" y="53" fill="rgba(39,39,42,0.40)" font-size="7" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing="0.14em">MAIN PROCESS · NODE.JS</text>
+
+    <rect x="920" y="40" width="320" height="280" rx="8" fill="rgba(39,39,42,0.02)" stroke="rgba(39,39,42,0.10)" stroke-width="0.8"/>
+    <rect x="936" y="44" width="72" height="12" rx="2" fill="#f4f4f5"/>
+    <text x="972" y="53" fill="rgba(39,39,42,0.40)" font-size="7" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing="0.14em">EXTERNAL</text>
+
+    <!-- arrows -->
+    <path d="M 312,208 H 360 Q 368,208 368,200 V 128 Q 368,120 376,120 H 424" fill="none" stroke="#52525b" stroke-width="1.2" marker-end="url(#ma-arrow)"/>
+    <line x1="312" y1="244" x2="424" y2="244" stroke="#52525b" stroke-width="1.2" marker-end="url(#ma-arrow)"/>
+    <path d="M 312,280 H 372 Q 380,280 380,288 V 352 Q 380,360 388,360 H 424" fill="none" stroke="#52525b" stroke-width="1.2" marker-end="url(#ma-arrow)"/>
+    <path d="M 312,312 H 356 Q 364,312 364,320 V 472 Q 364,480 372,480 H 424" fill="none" stroke="#52525b" stroke-width="1.2" marker-end="url(#ma-arrow)"/>
+    <line x1="840" y1="120" x2="952" y2="120" stroke="#f38145" stroke-width="1.2" marker-end="url(#ma-arrow-link)"/>
+    <line x1="840" y1="244" x2="952" y2="244" stroke="#52525b" stroke-width="1.2" marker-end="url(#ma-arrow)"/>
+
+    <!-- arrow labels (mask + 6px gap) -->
+    <rect x="376" y="102" width="44" height="12" rx="2" fill="#f4f4f5"/>
+    <text x="398" y="111" fill="#71717a" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing="0.06em">chat.*</text>
+
+    <rect x="344" y="226" width="48" height="12" rx="2" fill="#f4f4f5"/>
+    <text x="368" y="235" fill="#71717a" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing="0.06em">agent.*</text>
+
+    <rect x="388" y="342" width="28" height="12" rx="2" fill="#f4f4f5"/>
+    <text x="402" y="351" fill="#71717a" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing="0.06em">kb.*</text>
+
+    <rect x="316" y="294" width="40" height="12" rx="2" fill="#f4f4f5"/>
+    <text x="336" y="303" fill="#71717a" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing="0.06em">sys.*</text>
+
+    <rect x="864" y="102" width="64" height="12" rx="2" fill="#f4f4f5"/>
+    <text x="896" y="111" fill="#b46a37" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing="0.06em">SSE STREAM</text>
+
+    <rect x="872" y="226" width="48" height="12" rx="2" fill="#f4f4f5"/>
+    <text x="896" y="235" fill="#71717a" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing="0.06em">TOOLS</text>
+
+    <!-- nodes -->
+    <rect x="72" y="176" width="240" height="168" rx="6" fill="#f4f4f5"/>
+    <rect x="72" y="176" width="240" height="168" rx="6" fill="rgba(82,82,91,0.10)" stroke="#71717a" stroke-width="1"/>
+    <rect x="80" y="182" width="32" height="12" rx="2" fill="transparent" stroke="rgba(113,113,122,0.5)" stroke-width="0.8"/>
+    <text x="96" y="191" fill="rgba(113,113,122,0.8)" font-size="7" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing="0.08em">UI</text>
+    <text x="192" y="228" fill="#27272a" font-size="12" font-weight="600" font-family="'Geist','Noto Sans SC',sans-serif" text-anchor="middle">桌面界面（Vue 3 + Pinia）</text>
+    <text x="192" y="250" fill="#52525b" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">vue3 · pinia · tailwind 3.4</text>
+    <text x="192" y="266" fill="#52525b" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">views: chat · agent · kb · settings</text>
+    <text x="192" y="282" fill="#52525b" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">entries: main · quick · ball · capture</text>
+
+    <rect x="424" y="72" width="416" height="96" rx="6" fill="#f4f4f5"/>
+    <rect x="424" y="72" width="416" height="96" rx="6" fill="rgba(99,102,241,0.10)" stroke="#6366f1" stroke-width="1.2"/>
+    <rect x="432" y="78" width="64" height="12" rx="2" fill="transparent" stroke="rgba(99,102,241,0.4)" stroke-width="0.8"/>
+    <text x="464" y="87" fill="rgba(99,102,241,0.8)" font-size="7" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing="0.08em">GATEWAY</text>
+    <text x="632" y="114" fill="#27272a" font-size="12" font-weight="600" font-family="'Geist','Noto Sans SC',sans-serif" text-anchor="middle">模型网关</text>
+    <text x="632" y="132" fill="#52525b" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">key state machine · failover · rotation</text>
+    <text x="632" y="148" fill="#52525b" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">undici SSE · safeStorage (DPAPI)</text>
+
+    <rect x="424" y="192" width="416" height="96" rx="6" fill="#f4f4f5"/>
+    <rect x="424" y="192" width="416" height="96" rx="6" fill="#ffffff" stroke="#27272a" stroke-width="1"/>
+    <rect x="432" y="198" width="48" height="12" rx="2" fill="transparent" stroke="rgba(39,39,42,0.4)" stroke-width="0.8"/>
+    <text x="456" y="207" fill="rgba(39,39,42,0.8)" font-size="7" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing="0.08em">AGENT</text>
+    <text x="632" y="234" fill="#27272a" font-size="12" font-weight="600" font-family="'Geist','Noto Sans SC',sans-serif" text-anchor="middle">Agent 运行时</text>
+    <text x="632" y="252" fill="#52525b" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">function calling loop ≤ 15 steps</text>
+    <text x="632" y="268" fill="#52525b" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">9 tools · risk-tier confirm · dir whitelist</text>
+
+    <rect x="424" y="312" width="416" height="96" rx="6" fill="#f4f4f5"/>
+    <rect x="424" y="312" width="416" height="96" rx="6" fill="#ffffff" stroke="#27272a" stroke-width="1"/>
+    <rect x="432" y="318" width="36" height="12" rx="2" fill="transparent" stroke="rgba(39,39,42,0.4)" stroke-width="0.8"/>
+    <text x="450" y="327" fill="rgba(39,39,42,0.8)" font-size="7" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing="0.08em">RAG</text>
+    <text x="632" y="354" fill="#27272a" font-size="12" font-weight="600" font-family="'Geist','Noto Sans SC',sans-serif" text-anchor="middle">RAG 管道</text>
+    <text x="632" y="372" fill="#52525b" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">pdf / docx / md → chunks → /embeddings</text>
+    <text x="632" y="388" fill="#52525b" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">float32 BLOB · cosine Top-K · [n] citations</text>
+
+    <rect x="424" y="432" width="416" height="96" rx="6" fill="#f4f4f5"/>
+    <rect x="424" y="432" width="416" height="96" rx="6" fill="#ffffff" stroke="#27272a" stroke-width="1"/>
+    <rect x="432" y="438" width="36" height="12" rx="2" fill="transparent" stroke="rgba(39,39,42,0.4)" stroke-width="0.8"/>
+    <text x="450" y="447" fill="rgba(39,39,42,0.8)" font-size="7" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing="0.08em">SYS</text>
+    <text x="632" y="474" fill="#27272a" font-size="12" font-weight="600" font-family="'Geist','Noto Sans SC',sans-serif" text-anchor="middle">系统集成</text>
+    <text x="632" y="492" fill="#52525b" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">tray · hotkeys · text-grab · capture</text>
+    <text x="632" y="508" fill="#52525b" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">clipboard · notify · backup export</text>
+
+    <rect x="424" y="552" width="416" height="56" rx="6" fill="#f4f4f5"/>
+    <rect x="424" y="552" width="416" height="56" rx="6" fill="rgba(39,39,42,0.05)" stroke="#52525b" stroke-width="1"/>
+    <rect x="432" y="558" width="48" height="12" rx="2" fill="transparent" stroke="rgba(82,82,91,0.5)" stroke-width="0.8"/>
+    <text x="456" y="567" fill="rgba(82,82,91,0.8)" font-size="7" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing="0.08em">STORE</text>
+    <text x="632" y="582" fill="#27272a" font-size="12" font-weight="600" font-family="'Geist','Noto Sans SC',sans-serif" text-anchor="middle">SQLite 存储</text>
+    <text x="632" y="598" fill="#52525b" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">node:sqlite · 11 tables · float32 vector BLOB</text>
+
+    <rect x="952" y="72" width="256" height="96" rx="6" fill="#f4f4f5"/>
+    <rect x="952" y="72" width="256" height="96" rx="6" fill="rgba(39,39,42,0.03)" stroke="rgba(39,39,42,0.30)" stroke-width="1"/>
+    <rect x="960" y="78" width="44" height="12" rx="2" fill="transparent" stroke="rgba(39,39,42,0.30)" stroke-width="0.8"/>
+    <text x="982" y="87" fill="rgba(39,39,42,0.55)" font-size="7" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing="0.08em">HTTP</text>
+    <text x="1080" y="114" fill="#27272a" font-size="12" font-weight="600" font-family="'Geist','Noto Sans SC',sans-serif" text-anchor="middle">模型 API</text>
+    <text x="1080" y="132" fill="#52525b" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">OpenAI-compatible relays</text>
+    <text x="1080" y="148" fill="#52525b" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">chat/completions · embeddings</text>
+
+    <rect x="952" y="192" width="256" height="96" rx="6" fill="#f4f4f5"/>
+    <rect x="952" y="192" width="256" height="96" rx="6" fill="rgba(39,39,42,0.03)" stroke="rgba(39,39,42,0.30)" stroke-width="1"/>
+    <rect x="960" y="198" width="28" height="12" rx="2" fill="transparent" stroke="rgba(39,39,42,0.30)" stroke-width="0.8"/>
+    <text x="974" y="207" fill="rgba(39,39,42,0.55)" font-size="7" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing="0.08em">OS</text>
+    <text x="1080" y="234" fill="#27272a" font-size="12" font-weight="600" font-family="'Geist','Noto Sans SC',sans-serif" text-anchor="middle">本机系统</text>
+    <text x="1080" y="252" fill="#52525b" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">fs · PowerShell · clipboard</text>
+    <text x="1080" y="268" fill="#52525b" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">screen capture · tray · global keys</text>
+
+    <!-- legend -->
+    <line x1="40" y1="664" x2="1240" y2="664" stroke="rgba(39,39,42,0.10)" stroke-width="0.8"/>
+    <text x="40" y="684" fill="#52525b" font-size="8" font-family="'Geist Mono',monospace" letter-spacing="0.14em">LEGEND</text>
+    <rect x="120" y="676" width="16" height="12" rx="2" fill="rgba(82,82,91,0.10)" stroke="#71717a" stroke-width="0.8"/>
+    <text x="142" y="686" fill="#52525b" font-size="10" font-family="'Geist','Noto Sans SC',sans-serif">渲染层 UI</text>
+    <rect x="230" y="676" width="16" height="12" rx="2" fill="#ffffff" stroke="#27272a" stroke-width="0.8"/>
+    <text x="252" y="686" fill="#52525b" font-size="10" font-family="'Geist','Noto Sans SC',sans-serif">主进程模块</text>
+    <rect x="352" y="676" width="16" height="12" rx="2" fill="rgba(39,39,42,0.05)" stroke="#52525b" stroke-width="0.8"/>
+    <text x="374" y="686" fill="#52525b" font-size="10" font-family="'Geist','Noto Sans SC',sans-serif">存储</text>
+    <rect x="442" y="676" width="16" height="12" rx="2" fill="rgba(39,39,42,0.03)" stroke="rgba(39,39,42,0.3)" stroke-width="0.8"/>
+    <text x="464" y="686" fill="#52525b" font-size="10" font-family="'Geist','Noto Sans SC',sans-serif">外部系统</text>
+    <rect x="548" y="676" width="16" height="12" rx="2" fill="rgba(99,102,241,0.10)" stroke="#6366f1" stroke-width="0.8"/>
+    <text x="570" y="686" fill="#52525b" font-size="10" font-family="'Geist','Noto Sans SC',sans-serif">焦点模块</text>
+    <line x1="672" y1="682" x2="700" y2="682" stroke="#f38145" stroke-width="1.2" marker-end="url(#ma-arrow-link)"/>
+    <text x="712" y="686" fill="#52525b" font-size="10" font-family="'Geist','Noto Sans SC',sans-serif">外部调用（SSE）</text>
+  </svg>
+  <p class="caption">图示为主干连线：渲染层经 preload 暴露的 window.api（contextIsolation · sandbox）以命名空间 IPC 调用主进程；各模块落库、RAG 调 /embeddings、系统集成钩子等次级连线已并入节点说明。</p>
+  </figure>
+
+  <section class="cards">
+    <div class="card">
+      <p class="eyebrow">PROCESS · WINDOWS</p>
+      <div class="card-header"><span class="dot dot-ink"></span><h3>进程与窗口</h3></div>
+      <ul>
+        <li>主窗口 · 快速输入窗（Alt+Space，预创建 ≤300ms 唤起）· 悬浮球 · 框选截屏层（Alt+S）</li>
+        <li>contextIsolation + sandbox，preload 按窗注入最小 API 面</li>
+        <li>关闭主窗隐藏至托盘，托盘「退出」才真退出</li>
+      </ul>
+    </div>
+    <div class="card">
+      <p class="eyebrow">DATA · KEYS</p>
+      <div class="card-header"><span class="dot dot-accent"></span><h3>数据与密钥</h3></div>
+      <ul>
+        <li>node:sqlite（Electron 45 内置 Node 24.22）11 张业务表，软删字段预留同步</li>
+        <li>Key 经 safeStorage（Windows DPAPI）加密落库，渲染层只见尾 4 位</li>
+        <li>向量 Float32 BLOB + 纯 JS 余弦 Top-K，零原生模块</li>
+      </ul>
+    </div>
+    <div class="card">
+      <p class="eyebrow">QA · DELIVERY</p>
+      <div class="card-header"><span class="dot dot-soft"></span><h3>质量基线</h3></div>
+      <ul>
+        <li>89/89 单测（17 文件） · ESLint 0 错误 · Prettier 全过</li>
+        <li>MINIAGENT_SMOKE=1 无人值守冒烟 SMOKE_OK</li>
+        <li>electron-builder NSIS 安装包已装机验证</li>
+      </ul>
+    </div>
+  </section>
+
+  <footer>miniagent v1.0 · 架构依据 docs/技术设计.md v0.3 · 2026-11-19 · diagram-design</footer>
+</div>
+</body>
+</html>

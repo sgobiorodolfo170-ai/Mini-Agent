@@ -1,0 +1,64 @@
+/* 设计令牌（视觉整改方案 v1.0 §2/§3）：浅深主题共用变量名，业务组件只引用语义变量 */
+:root {
+  color-scheme: light;
+  --bg-canvas: #f5f7fb;
+  --bg-surface: #ffffff;
+  --bg-subtle: #f1f5f9;
+  --bg-elevated: #ffffff;
+  --border-subtle: #e2e8f0;
+  --border-control: #7c899d;
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --text-muted: #5f6f85;
+  --brand: #4f46e5;
+  --brand-hover: #4338ca;
+  --brand-active: #3730a3;
+  --brand-soft: #eef2ff;
+  --brand-ink: #3730a3;
+  --link: #4338ca;
+  --focus: #4f46e5;
+  --on-brand: #ffffff;
+  --overlay: rgba(15, 23, 42, 0.4);
+  --shadow-menu: 0 8px 24px rgba(15, 23, 42, 0.12);
+  --shadow-modal: 0 20px 64px rgba(0, 0, 0, 0.24);
+  --status-ok-ink: #166534;
+  --status-ok-bg: #f0fdf4;
+  --status-warn-ink: #92400e;
+  --status-warn-bg: #fffbeb;
+  --status-error-ink: #b91c1c;
+  --status-error-bg: #fef2f2;
+  --status-info-ink: #1d4ed8;
+  --status-info-bg: #eff6ff;
+  --font-ui:
+    'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei UI', 'Microsoft YaHei', 'PingFang SC',
+    sans-serif;
+  --font-code: 'Cascadia Code', Consolas, 'SFMono-Regular', monospace;
+}
+
+html.dark {
+  color-scheme: dark;
+  --bg-canvas: #0f1117;
+  --bg-surface: #171b24;
+  --bg-subtle: #1e2430;
+  --bg-elevated: #222938;
+  --border-subtle: #303849;
+  --border-control: #64748b;
+  --text-primary: #f1f5f9;
+  --text-secondary: #cbd5e1;
+  --text-muted: #94a3b8;
+  --brand-soft: #2a3056;
+  --brand-ink: #c7d2fe;
+  --link: #a5b4fc;
+  --focus: #818cf8;
+  --overlay: rgba(0, 0, 0, 0.56);
+  --shadow-menu: 0 8px 24px rgba(0, 0, 0, 0.4);
+  --shadow-modal: 0 20px 64px rgba(0, 0, 0, 0.56);
+  --status-ok-ink: #86efac;
+  --status-ok-bg: #14291f;
+  --status-warn-ink: #fcd34d;
+  --status-warn-bg: #302814;
+  --status-error-ink: #fca5a5;
+  --status-error-bg: #351e25;
+  --status-info-ink: #bfdbfe;
+  --status-info-bg: #1b2b45;
+}

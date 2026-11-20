@@ -1,0 +1,92 @@
+{
+  "userData": "C:\\Users\\Administrator\\AppData\\Local\\Temp\\miniagent-layout-EbjUqv",
+  "errors": [],
+  "shots": [
+    "01-chat-empty-desktop.png",
+    "02-chat-minimum.png",
+    "03-message-edit-overflow.png",
+    "04-search-settings-disappear.png",
+    "05-settings-provider-minimum.png",
+    "06-settings-desktop.png",
+    "07-kb-desktop.png",
+    "08-agent-empty.png",
+    "09-agent-result-truncated.png"
+  ],
+  "checks": {
+    "identity": {
+      "url": "file:///C:/Users/Administrator/Documents/PREing/miniagent/out/renderer/entries/main-window/index.html",
+      "title": "miniagent"
+    },
+    "desktop": {
+      "viewport": [1280, 800],
+      "sections": [
+        {
+          "tag": "ASIDE",
+          "width": 240
+        },
+        {
+          "tag": "SECTION",
+          "width": 696
+        },
+        {
+          "tag": "ASIDE",
+          "width": 288
+        }
+      ],
+      "bodyOverflow": false,
+      "title": "miniagent",
+      "textLength": 63
+    },
+    "draftPreserved": "布局检查草稿",
+    "minimum": {
+      "viewport": [980, 601],
+      "sections": [
+        {
+          "tag": "ASIDE",
+          "width": 240
+        },
+        {
+          "tag": "SECTION",
+          "width": 396
+        },
+        {
+          "tag": "ASIDE",
+          "width": 288
+        }
+      ],
+      "bodyOverflow": false,
+      "title": "miniagent",
+      "textLength": 115
+    },
+    "edit": {
+      "width": 384,
+      "right": 747.84375,
+      "windowWidth": 980
+    },
+    "positiveSearch": {
+      "apiResult": [
+        {
+          "id": "cf9925fc-0626-4195-833b-4b68b09303ba",
+          "title": "新会话",
+          "pinned": 0,
+          "providerId": null,
+          "model": null,
+          "systemPrompt": null,
+          "contextPolicy": "{}",
+          "createdAt": 1795114743951,
+          "updatedAt": 1795114743951
+        }
+      ],
+      "uiCount": 0
+    },
+    "search": {
+      "activeId": "cf9925fc-0626-4195-833b-4b68b09303ba",
+      "activeConv": null,
+      "conversationCount": 0,
+      "messageCount": 1
+    },
+    "searchAfterClear": 0,
+    "completedStopButton": true,
+    "overlay": 0
+  }
+}

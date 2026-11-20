@@ -1,0 +1,698 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>miniagent 项目分析</title>
+    <link
+      href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;600&family=Noto+Serif+SC:wght@400&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --paper: #f4f4f5;
+        --paper-2: #e4e4e7;
+        --ink: #27272a;
+        --muted: #52525b;
+        --soft: #71717a;
+        --rule: rgba(39, 39, 42, 0.12);
+        --accent: #6366f1;
+        --accent-tint: rgba(99, 102, 241, 0.1);
+        --link: #f38145;
+        --ok: #3d8b5f;
+        --warn: #c07f1f;
+        --bad: #b94747;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--paper);
+        color: var(--ink);
+        font-family: 'Geist', 'Noto Sans SC', sans-serif;
+        font-size: 14px;
+        line-height: 1.7;
+      }
+      .page {
+        max-width: 1160px;
+        margin: 0 auto;
+        padding: 56px 40px 40px;
+      }
+      .eyebrow {
+        font-family: 'Geist Mono', monospace;
+        font-size: 11px;
+        font-weight: 500;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        color: var(--soft);
+      }
+      h1 {
+        font-family: 'Instrument Serif', 'Noto Serif SC', serif;
+        font-weight: 400;
+        font-size: 30px;
+        margin: 10px 0 0;
+      }
+      .subtitle {
+        font-size: 14px;
+        color: var(--muted);
+        margin-top: 8px;
+        max-width: 760px;
+      }
+      h2 {
+        font-size: 17px;
+        font-weight: 600;
+        margin: 48px 0 4px;
+      }
+      h2 .no {
+        font-family: 'Geist Mono', monospace;
+        font-size: 11px;
+        color: var(--accent);
+        margin-right: 10px;
+        letter-spacing: 0.1em;
+      }
+      .h2sub {
+        font-size: 13px;
+        color: var(--soft);
+        margin: 0 0 16px;
+      }
+      section {
+        border-top: 1px solid var(--rule);
+        margin-top: 24px;
+        padding-top: 8px;
+      }
+      .stats {
+        display: grid;
+        grid-template-columns: repeat(6, 1fr);
+        gap: 12px;
+        margin-top: 28px;
+      }
+      .stat {
+        background: #fff;
+        border: 1px solid var(--rule);
+        border-radius: 6px;
+        padding: 14px 16px;
+      }
+      .stat b {
+        display: block;
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+      .stat span {
+        display: block;
+        font-size: 11px;
+        color: var(--soft);
+        margin-top: 2px;
+      }
+      .stat .dim {
+        color: var(--muted);
+        font-weight: 500;
+      }
+      .cols {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+        margin-top: 16px;
+      }
+      .cols3 {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 16px;
+        margin-top: 16px;
+      }
+      .card {
+        background: #fff;
+        border: 1px solid var(--rule);
+        border-radius: 6px;
+        padding: 18px 20px;
+      }
+      .card h3 {
+        font-size: 14px;
+        font-weight: 600;
+        margin: 0 0 8px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        flex: none;
+      }
+      .card ul {
+        margin: 0;
+        padding-left: 16px;
+        font-size: 13px;
+        line-height: 1.8;
+        color: var(--muted);
+      }
+      .card ul b {
+        color: var(--ink);
+        font-weight: 600;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 14px;
+        background: #fff;
+        border: 1px solid var(--rule);
+        border-radius: 6px;
+        overflow: hidden;
+        font-size: 13px;
+      }
+      th {
+        background: var(--paper-2);
+        text-align: left;
+        font-weight: 600;
+        font-size: 12px;
+        color: var(--muted);
+        padding: 9px 14px;
+      }
+      td {
+        padding: 9px 14px;
+        border-top: 1px solid var(--rule);
+        vertical-align: top;
+        color: var(--muted);
+      }
+      td.k {
+        color: var(--ink);
+        font-weight: 500;
+        white-space: nowrap;
+      }
+      td code,
+      li code {
+        font-family: 'Geist Mono', monospace;
+        font-size: 11.5px;
+        background: var(--paper-2);
+        padding: 1px 5px;
+        border-radius: 3px;
+        color: var(--ink);
+      }
+      .chip {
+        display: inline-block;
+        font-size: 11px;
+        font-weight: 600;
+        padding: 1px 8px;
+        border-radius: 99px;
+        font-family: 'Geist Mono', 'Noto Sans SC', monospace;
+        white-space: nowrap;
+      }
+      .ok {
+        background: rgba(61, 139, 95, 0.12);
+        color: var(--ok);
+      }
+      .warn {
+        background: rgba(192, 127, 31, 0.14);
+        color: var(--warn);
+      }
+      .bad {
+        background: rgba(185, 71, 71, 0.12);
+        color: var(--bad);
+      }
+      .accent {
+        background: var(--accent-tint);
+        color: var(--accent);
+      }
+      .note {
+        font-size: 12px;
+        color: var(--soft);
+        margin-top: 10px;
+      }
+      .p0 {
+        background: rgba(185, 71, 71, 0.06);
+      }
+      .path {
+        font-family: 'Geist Mono', monospace;
+        font-size: 11px;
+        color: var(--soft);
+      }
+      footer {
+        margin-top: 44px;
+        padding-top: 16px;
+        border-top: 1px solid var(--rule);
+        font-family: 'Geist Mono', monospace;
+        font-size: 10px;
+        letter-spacing: 0.06em;
+        color: var(--soft);
+        display: flex;
+        justify-content: space-between;
+      }
+      @media (max-width: 900px) {
+        .stats {
+          grid-template-columns: repeat(3, 1fr);
+        }
+        .cols,
+        .cols3 {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <header>
+        <p class="eyebrow">miniagent · v1.0.0 · 分析日期 2026-11-20</p>
+        <h1>miniagent 项目分析</h1>
+        <p class="subtitle">
+          Windows 桌面个人 AI 助理(Electron 45 + Vue 3):多会话对话 · 多 Key 调度 · 划词/截屏 ·
+          本地知识库 RAG · Agent
+          工具调用。本报告基于全量代码扫描、需求/设计文档与测试基线的交叉核对。
+        </p>
+      </header>
+
+      <div class="stats">
+        <div class="stat"><b>8,732</b><span>源码行数(src + electron,65 文件)</span></div>
+        <div class="stat"><b>243</b><span>单元测试(30 文件)全绿</span></div>
+        <div class="stat"><b>15+3</b><span>E2E 用例(mock + 真实提供商)全绿</span></div>
+        <div class="stat">
+          <b class="dim">66.3<small>/72.9/79.6</small></b
+          ><span>覆盖率 语句/分支/函数 %(门槛 58/68/73)</span>
+        </div>
+        <div class="stat"><b>11</b><span>张 SQLite 数据表(全软删 + 同步预留)</span></div>
+        <div class="stat"><b>21</b><span>个 Agent 内置工具(三级风险确认)</span></div>
+      </div>
+
+      <section>
+        <h2><span class="no">01</span>项目定位与现状</h2>
+        <p class="h2sub">一句话:把「问答—查资料—干活」收敛进一个全本地的 Windows 托盘应用。</p>
+        <div class="cols">
+          <div class="card">
+            <h3><span class="dot dot" style="background: var(--accent)"></span>现状</h3>
+            <ul>
+              <li>
+                <b>v1.0 已交付</b>:NSIS 安装包(dist-app/,117.8MB,未签名)完成静默安装与安装版冒烟;
+              </li>
+              <li>
+                <b>迭代节奏极快</b>:2026-11-19 立项,两天内走完 v0.1→v0.9 九个修订,里程碑 M0–M5
+                全部关闭;
+              </li>
+              <li>
+                <b>质量工程完备</b>:单测 + e2e + coverage 门槛 + eslint/prettier + GitHub
+                Actions(windows-latest:lint→coverage→mock e2e)。
+              </li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3><span class="dot" style="background: var(--link)"></span>架构判断</h3>
+            <ul>
+              <li>
+                <b>分层干净</b>:渲染层 4 窗口沙箱化(contextIsolation/sandbox),preload 按
+                <code>--bridge</code> 暴露最小 API 面;全部网络与系统访问收敛主进程;
+              </li>
+              <li>
+                <b>零原生模块</b>:node:sqlite 内置 + JS 暴力余弦检索,规避 ABI
+                风险,个人规模(万级块)毫秒级,决策合理且已在技术设计留痕;
+              </li>
+              <li>
+                <b>纯函数化测试友好</b>:调度器/Agent 循环/守卫/切块均为依赖注入的纯函数,这是 243
+                个用例能稳定全绿的结构性原因。
+              </li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2><span class="no">02</span>核心能力评估</h2>
+        <p class="h2sub">
+          四条主线,亮点与局限并存;局限多数已记录在完成报告 §5,属「知情取舍」而非遗漏。
+        </p>
+        <div class="cols">
+          <div class="card">
+            <h3>
+              <span class="dot" style="background: var(--accent)"></span>对话 + 多 Key
+              网关(electron/main/gateway/)
+            </h3>
+            <ul>
+              <li>
+                <b>亮点</b>:OpenAI 兼容协议统一接入任意中转;Key 状态机(可用/无效/冷却)完整,429
+                指数冷却封顶 30min,SSE 手写解析 + AbortController;vision
+                多模态组装、会话级模型覆盖、上下文字符预算截断都有;
+              </li>
+              <li>
+                <b>局限</b>:流式建立后中断不换 Key 重试(仅请求建立阶段);Key 重试逻辑与 Agent
+                侧重复且次数不一致(3 vs 2,见 05)。
+              </li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>
+              <span class="dot" style="background: var(--accent)"></span>知识库
+              RAG(electron/main/rag/)
+            </h3>
+            <ul>
+              <li>
+                <b>亮点</b>:pdf/docx/md/txt 全纯 JS 抽取(mammoth/pdfjs legacy),Markdown
+                标题树切块(800/120)、SHA1 去重、[n] 编号注入与 kbRefs 引用卡片,链路闭环且有真实
+                docx/pdf 样本测试;
+              </li>
+              <li>
+                <b>局限</b>:暴力余弦无 ANN(自用规模可接受);图片型 PDF 无
+                OCR;文档变更无增量重导入;四个切块/检索参数(kbTopK 等)主进程可读但无 UI 入口。
+              </li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>
+              <span class="dot" style="background: var(--accent)"></span>Agent
+              运行时(electron/main/agent/)
+            </h3>
+            <ul>
+              <li>
+                <b>亮点</b>:21 工具覆盖文件/命令/联网/浏览器/MCP/子
+                Agent/记忆/计划;三级风险门(只读放行/副作用确认/破坏性命令内容级正则强制逐次确认)设计成熟;每次调用落库可回放;MCP
+                为自实现 JSON-RPC over stdio;
+              </li>
+              <li>
+                <b>局限</b>:browser_* 仅文本级交互;mcp_call_tool
+                每次起停进程,高频调用开销大;run_command 固定 PowerShell。
+              </li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>
+              <span class="dot" style="background: var(--accent)"></span
+              >系统级快捷(electron/main/sys/ + 4 窗口)
+            </h3>
+            <ul>
+              <li>
+                <b>亮点</b>:快速窗/悬浮球/托盘/全局快捷键齐备;划词用 PowerShell SendKeys + 剪贴板
+                diff 零依赖实现(150ms 后还原原剪贴板);截屏经 desktopCapturer 框选裁剪走 vision;
+              </li>
+              <li>
+                <b>局限</b
+                >:仅光标所在屏;管理员权限/全屏窗口可能取不到选区(文档已给「改用截屏」兜底)。
+              </li>
+            </ul>
+          </div>
+        </div>
+        <p class="note">
+          数据流(聊天):ChatView.send → chat store → IPC chat:send → gateway.sendChat 落库 streaming
+          占位 → resolveModel → KB 向量检索 → buildContext → scheduler.pickKey → chatStream(SSE)→
+          delta 广播 → chat.handleEvent 增量渲染 → done 落库带 kbRefs/warnings
+          meta。链路单一清晰,事件契约经 e2e 验证。
+        </p>
+      </section>
+
+      <section>
+        <h2><span class="no">03</span>需求覆盖对照</h2>
+        <p class="h2sub">
+          对照需求文档 v0.2 §4 逐条核对(✗ 均经代码 grep 核实);M1–M5
+          验收口径整体达成,缺口集中在细节条款。
+        </p>
+        <table>
+          <tr>
+            <th style="width: 130px">需求域</th>
+            <th>已实现</th>
+            <th style="width: 340px">缺口(需求有、代码无)</th>
+          </tr>
+          <tr>
+            <td class="k">4.1 对话助手</td>
+            <td>
+              <span class="chip ok">✓ 多会话/流式/MD 高亮</span>
+              <span class="chip ok">✓ 停止/重新生成/编辑重发</span>
+              <span class="chip ok">✓ 导出 MD/JSON</span>
+              <span class="chip ok">✓ 上下文截断/系统提示词/temperature/maxTokens</span>
+            </td>
+            <td>
+              <span class="chip bad">✗ 消息删除</span>
+              <span class="chip bad">✗ top_p 参数</span>(grep 全仓无 top_p)
+            </td>
+          </tr>
+          <tr>
+            <td class="k">4.2 Key 管理</td>
+            <td>
+              <span class="chip ok">✓ 供应商/Key 状态机</span>
+              <span class="chip ok">✓ 手动+一键探测</span>
+              <span class="chip ok">✓ 故障转移/轮询</span>
+              <span class="chip ok">✓ DPAPI 加密/视觉标记</span>
+            </td>
+            <td>
+              <span class="chip bad">✗ 周期自动探测</span>(字段 probe_interval_min 可存可编,但
+              electron/ 无任何 setInterval 调度)
+            </td>
+          </tr>
+          <tr>
+            <td class="k">4.3 系统级快捷</td>
+            <td><span class="chip ok">✓ 快速窗/托盘/划词/截屏</span></td>
+            <td>
+              <span class="chip warn">△ 截屏仅光标所在屏</span
+              >(需求允许多屏为增强;划词历史场景复用快速窗已留痕)
+            </td>
+          </tr>
+          <tr>
+            <td class="k">4.4 知识库 RAG</td>
+            <td>
+              <span class="chip ok">✓ 多库/四格式导入</span>
+              <span class="chip ok">✓ 标题切块/向量化/Top-K 注入</span>
+              <span class="chip ok">✓ 引用卡片/重建索引/删除连带清理</span>
+              <span class="chip ok">✓ 检索测试面板</span>
+            </td>
+            <td>
+              <span class="chip bad">✗ 引用跳转定位</span>(卡片有来源/相似度,无跳转)
+              <span class="chip bad">✗ 增量更新</span>(无文件 watch/重导入)
+              <span class="chip warn">△ 导入失败无重试</span>(fire-and-forget,仅广播 error)
+            </td>
+          </tr>
+          <tr>
+            <td class="k">4.5 Agent</td>
+            <td>
+              <span class="chip ok">✓ 全部验收项</span>(21 工具/分级确认/授权目录/日志回放/停止)
+            </td>
+            <td>—</td>
+          </tr>
+          <tr>
+            <td class="k">4.6 交互形态</td>
+            <td><span class="chip ok">✓ 三栏/主题/悬浮球/设置五分组</span></td>
+            <td>
+              <span class="chip bad">✗ 数据目录自定义</span>(userData 仅测试环境可经 env
+              改,设置页只展示路径)
+            </td>
+          </tr>
+          <tr>
+            <td class="k">4.7 数据与存储</td>
+            <td>
+              <span class="chip ok">✓ SQLite 全本地</span>
+              <span class="chip ok">✓ 同步预留(uuid/updated_at/软删)</span>
+              <span class="chip ok">✓ 备份导出导入</span>
+            </td>
+            <td>—</td>
+          </tr>
+        </table>
+      </section>
+
+      <section>
+        <h2><span class="no">04</span>质量与测试基线</h2>
+        <p class="h2sub">
+          测试不是摆设——e2e 曾揪出 7 个单测不可能发现的生产级缺陷(preload 沙箱崩溃、reactive Proxy
+          过不了 contextBridge、Electron 45 解密包装对象等)。
+        </p>
+        <div class="cols3">
+          <div class="card">
+            <h3>单元测试 · 243 用例 / 30 文件</h3>
+            <ul>
+              <li>
+                主进程:SSE/流式客户端/调度器/探测/上下文/网关全链路(mock fetch)/仓库层/Key
+                加解密/守卫+风险升级/循环/28 例工具处理器/MCP 真实子进程握手;
+              </li>
+              <li>RAG:切块/真实 docx+pdf 解析/嵌入/导入→检索→去重闭环;</li>
+              <li>渲染层:5 个 Pinia store(jsdom)事件流状态机。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>E2E · playwright-core 驱动真实应用</h3>
+            <ul>
+              <li>
+                mock 套件 15 用例:会话 CRUD、流式全链路、429 换 Key、RAG 带引用、Agent
+                真实落盘、DPAPI 落盘 enc: 前缀;
+              </li>
+              <li>real-provider 3 用例:真实中转站全链路(不进 CI);</li>
+              <li>
+                基建:本地 OpenAI 兼容 mock 服务(SSE 三模式/429 注入/确定性 embedding/坏鉴权头拦截)。
+              </li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>防回退机制</h3>
+            <ul>
+              <li>coverage thresholds 58/68/73(语句/分支/函数),当前余量 8/5/6.6 个百分点;</li>
+              <li>CI:windows-latest,lint → coverage → mock e2e;</li>
+              <li>僵尸流防护:启动把遗留 streaming 消息收敛为 stopped;</li>
+              <li>覆盖口径:JS 逻辑层,Vue 组件由 e2e 兜底(设计如此,非欠账)。</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2><span class="no">05</span>代码健康度</h2>
+        <p class="h2sub">
+          无 TODO/FIXME 残留、无僵尸依赖(devDependencies
+          逐项核实全部在用);问题集中在死代码、双份逻辑与巨型视图组件。
+        </p>
+        <table>
+          <tr>
+            <th style="width: 150px">类别</th>
+            <th>明细</th>
+          </tr>
+          <tr>
+            <td class="k">死代码(全仓零调用,已核实)</td>
+            <td>
+              <code>gateway/client.js:92</code> chatOnce ·
+              <code>store/keys.js:63</code> maskKey(仅自测用) ·
+              <code>store/repos.js:134</code> updateKeySecret ·
+              <code>agent/index.js:341</code> listActiveRuns · UiIcon 10
+              个未引用图标(copy/send/eye/key/db/chevrons/folder/external);另有
+              <code>src/views/ChatView.vue:446</code> 两分支相同的无意义三元
+            </td>
+          </tr>
+          <tr>
+            <td class="k">重复逻辑</td>
+            <td>
+              <b>Key 重试两份实现</b>:gateway/index.js:160-219(maxAttempts=3)与 agent/index.js:62-92
+              withKeyRetry(maxAttempts=2),pickKey/applyKeyResult/logKeyEvent
+              模式相同、次数口径不一致;ChatView 置顶区与最近区模板逐字重复 ~140 行;extract-embed
+              测试与 extract 测试用例重叠
+            </td>
+          </tr>
+          <tr>
+            <td class="k">巨型文件</td>
+            <td>
+              SettingsView.vue 864 行 · ChatView.vue 740 行 · store/repos.js 614 行(纯 SQL 可接受)·
+              agent/tools.js 536 行;前两者应拆子组件/分组模块
+            </td>
+          </tr>
+          <tr>
+            <td class="k">配置空转</td>
+            <td>
+              <code>probe_interval_min</code>/<code>probeModel</code>(UI
+              可编辑但永不调度)、<code>kbTopK</code>/<code>chatMaxChars</code>/<code>kbChunkMaxLen</code>/<code>kbChunkOverlap</code>(主进程读取但无
+              UI 入口,只能备份导入或手写 IPC)
+            </td>
+          </tr>
+          <tr>
+            <td class="k">文档漂移</td>
+            <td>
+              README.md 仍写「better-sqlite3 + sqlite-vec」「55 单测」,实际为 node:sqlite + JS
+              余弦、243 用例;需求文档 §6 目录草案也还留有 better-sqlite3 字样
+            </td>
+          </tr>
+        </table>
+      </section>
+
+      <section>
+        <h2><span class="no">06</span>风险与安全评估</h2>
+        <p class="h2sub">
+          安全设计(分级确认/授权白名单/DPAPI/最小 API
+          面)是本项目最强项;剩余风险多为「自用可接受」级别,已逐一标注缓解现状。
+        </p>
+        <table>
+          <tr>
+            <th style="width: 170px">风险</th>
+            <th>评估与缓解现状</th>
+            <th style="width: 90px">级别</th>
+          </tr>
+          <tr>
+            <td class="k">Key 明文暴露面</td>
+            <td>
+              safeStorage 不可用时降级 <code>plain:</code> base64 落盘(有格式标记);备份勾选含 Key
+              时导出明文 JSON(UI 已警示)。自用场景可接受,但应意识到这是设计内的明文通道
+            </td>
+            <td><span class="chip warn">中·知情</span></td>
+          </tr>
+          <tr>
+            <td class="k">划词改写剪贴板</td>
+            <td>
+              模拟 Ctrl+C 后 150ms
+              还原用户原剪贴板,存在并发竞态窗口(期间用户复制会丢失内容)。低频操作,可接受;窗口期内可提示
+            </td>
+            <td><span class="chip warn">中</span></td>
+          </tr>
+          <tr>
+            <td class="k">主进程阻塞点</td>
+            <td>
+              <code>chat:export</code> 同步
+              writeFileSync(ipc.js:187),大会话导出卡全应用;kb:import/rebuild 为
+              fire-and-forget,失败仅广播无重试
+            </td>
+            <td><span class="chip warn">低-中</span></td>
+          </tr>
+          <tr>
+            <td class="k">外部依赖脆弱点</td>
+            <td>
+              DDG 兜底搜索依赖其 HTML 端点页面结构(改版即报错,配置 Tavily 可规避);web_fetch
+              为简化正文抽取;browser_* 仅文本级交互
+            </td>
+            <td><span class="chip warn">低</span></td>
+          </tr>
+          <tr>
+            <td class="k">Agent 误操作</td>
+            <td>
+              授权目录默认为空 + 三级确认 + 破坏性命令正则强制逐次确认 + 全量审计落库 + 60s
+              超时;纵深防御完整,是同类个人工具少见的成熟度
+            </td>
+            <td><span class="chip ok">低·已缓解</span></td>
+          </tr>
+        </table>
+      </section>
+
+      <section>
+        <h2><span class="no">07</span>建议路线</h2>
+        <p class="h2sub">
+          按「先兑现已承诺需求,再收敛质量,最后扩展」排序;P0 两项都是小改动大收益。
+        </p>
+        <div class="cols3">
+          <div class="card p0">
+            <h3><span class="chip bad">P0</span>兑现需求缺口</h3>
+            <ul>
+              <li>
+                <b>周期自动探测</b>:需求 4.2 明确要求且 UI
+                已可配间隔,只差主进程一个定时调度(setInterval + 换 Key
+                时防抖),建议补齐或明确从需求中删除该条;
+              </li>
+              <li>
+                <b>修正文档漂移</b>:README/需求文档的存储引擎与测试数改为实际(node:sqlite +
+                243),避免误导后续维护;
+              </li>
+              <li>
+                <b>消息删除</b>:需求 4.1 列明,目前只有会话级删除;补 repos + IPC + store 约 1
+                个小时工作量。
+              </li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3><span class="chip warn">P1</span>质量收敛</h3>
+            <ul>
+              <li>统一 Key 重试为单一调度模块(顺手统一 3 vs 2 的次数口径);</li>
+              <li>
+                清死代码 5 处 + 无用图标;ChatView 重复模板抽 ConversationList 组件,SettingsView
+                按五分组拆分;
+              </li>
+              <li>
+                四个空转配置(kbTopK 等)补设置 UI 或删字段;chat:export
+                改异步流写;导入失败加手动重试按钮。
+              </li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3><span class="chip accent">P2</span>v1.x 扩展</h3>
+            <ul>
+              <li>流式中断同 Key 重连 + 全 Key 顺序重试(完成报告 §8 首条);</li>
+              <li>FTS5 会话全文检索 + 会话标签;本地 embedding sidecar(断网/隐私场景);</li>
+              <li>
+                多屏截屏 + OCR 兜底划词;引用跳转定位;同步预留字段已就位,可启动端到端同步设计。
+              </li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <footer>
+        <span>miniagent · 项目分析 · 2026-11-20</span>
+        <span>依据:全量代码扫描 + 需求文档 v0.2 + 完成报告 v0.9 · 缺口结论均经 grep 核实</span>
+      </footer>
+    </div>
+  </body>
+</html>

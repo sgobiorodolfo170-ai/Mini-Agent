@@ -1,0 +1,32 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+out/
+out/
+dist-app/
+release/
+coverage/
+.tmp-spike-models/
+
+# logs
+*.log
+
+# env & secrets
+.env
+.env.*
+*.local
+docs/test-提供商.md
+
+# os / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# local tool / agent artifacts
+.zwork/
+.diagram-design
+NVIDIA Corporation/
