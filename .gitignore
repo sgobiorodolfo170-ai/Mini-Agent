@@ -4,7 +4,6 @@ node_modules/
 # build output
 dist/
 out/
-out/
 dist-app/
 release/
 coverage/
@@ -30,3 +29,4 @@ Thumbs.db
 .zwork/
 .diagram-design
 NVIDIA Corporation/
+.box-agent/
