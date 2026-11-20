@@ -93,7 +93,7 @@ describe('exportAll / importAll', () => {
   it('rejects foreign files', async () => {
     const file = tmpFile()
     fs.writeFileSync(file, JSON.stringify({ app: 'other' }))
-    await expect(importAll(dbm.get(), file, {})).rejects.toThrow(/miniagent/)
+    await expect(importAll(dbm.get(), file, {})).rejects.toThrow(/Mini Agent/)
     fs.rmSync(file, { force: true })
   })
 

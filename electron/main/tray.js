@@ -8,7 +8,7 @@ function createTray({ onShowMain, onQuick, onQuit }) {
   const iconPath = path.join(__dirname, '../../assets/tray.png')
   const icon = nativeImage.createFromPath(iconPath)
   tray = new Tray(icon.isEmpty() ? nativeImage.createEmpty() : icon)
-  tray.setToolTip('miniagent')
+  tray.setToolTip('Mini Agent')
   tray.setContextMenu(
     Menu.buildFromTemplate([
       { label: '打开主窗口', click: onShowMain },

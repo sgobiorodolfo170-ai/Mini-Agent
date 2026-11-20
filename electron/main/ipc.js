@@ -453,7 +453,7 @@ function registerIpc(ctx) {
   // backup
   h('data:export', async ({ includeKeys }) => {
     const dest = await dialog.showSaveDialog(windows.get('main'), {
-      defaultPath: `miniagent-backup-${new Date().toISOString().slice(0, 10)}.json`,
+      defaultPath: `Mini-Agent-backup-${new Date().toISOString().slice(0, 10)}.json`,
       filters: [{ name: 'JSON', extensions: ['json'] }]
     })
     if (dest.canceled || !dest.filePath) return null

@@ -1,5 +1,5 @@
 appId: com.miniagent.desktop
-productName: miniagent
+productName: Mini Agent
 directories:
   buildResources: build
   output: dist-app
@@ -26,4 +26,4 @@ nsis:
   oneClick: false
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
-  shortcutName: miniagent
+  shortcutName: Mini Agent

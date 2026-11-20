@@ -837,7 +837,7 @@ function startResize(e) {
             v-model="projectName"
             data-testid="project-name"
             data-autofocus
-            placeholder="如：miniagent 开发"
+            placeholder="如：Mini Agent 开发"
             class="field-input"
             @keydown.enter="submitProject"
           />

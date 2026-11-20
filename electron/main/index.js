@@ -16,6 +16,10 @@ let forceQuit = false
 const isTestMode = !!process.env.MINIAGENT_USER_DATA
 if (isTestMode) {
   app.setPath('userData', process.env.MINIAGENT_USER_DATA)
+} else {
+  // 显示名（productName）变更不应改变数据目录：固定沿用 miniagent，
+  // 保证历史数据库、密钥与已下载模型继续可用。
+  app.setPath('userData', path.join(app.getPath('appData'), 'miniagent'))
 }
 
 process.on('uncaughtException', (e) => {

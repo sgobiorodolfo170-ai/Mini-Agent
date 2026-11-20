@@ -43,7 +43,7 @@ function createMainWindow() {
     show: false,
     backgroundColor: '#101014',
     icon: appIcon(),
-    title: 'miniagent',
+    title: 'Mini Agent',
     webPreferences: webPrefs('index', 'main')
   })
   win.setMenuBarVisibility(false)

@@ -179,7 +179,7 @@ function close() {
       style="-webkit-app-region: drag"
     >
       <UiIcon name="chat" :size="14" class="text-brand-ink" />
-      <span class="text-xs text-ink-secondary">miniagent 快速问答</span>
+      <span class="text-xs text-ink-secondary">Mini Agent 快速问答</span>
       <div class="flex-1" />
       <button
         class="w-7 h-7 rounded-md hover:bg-surface text-ink-secondary hover:text-ink-primary flex items-center justify-center"

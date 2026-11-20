@@ -933,7 +933,7 @@ const defaultProvider = computed(
             <button class="btn-secondary" @click="importData">导入备份</button>
           </div>
           <div v-if="settings.info" class="text-xs text-ink-muted">
-            miniagent v{{ settings.info.version }} · {{ settings.info.driver }} · 数据目录
+            Mini Agent v{{ settings.info.version }} · {{ settings.info.driver }} · 数据目录
             {{ settings.info.dataDir }}
           </div>
         </section>

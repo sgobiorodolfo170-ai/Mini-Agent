@@ -1,6 +1,6 @@
 // Web search providers for the web_search tool. No Electron dependencies.
 // Tavily 优先（配置 Key 时），DuckDuckGo HTML 端点免 Key 兜底。
-const UA = 'Mozilla/5.0 (miniagent)'
+const UA = 'Mozilla/5.0 (Mini-Agent)'
 
 function decodeEntities(s) {
   return String(s)

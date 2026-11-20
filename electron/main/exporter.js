@@ -88,7 +88,7 @@ async function importAll(db, srcPath, { encryptSecret = (s) => s } = {}) {
   const raw = fs.readFileSync(srcPath, 'utf8')
   const data = JSON.parse(raw)
   if (!data || data.app !== 'miniagent' || !data.version) {
-    throw new Error('不是有效的 miniagent 备份文件')
+    throw new Error('不是有效的 Mini Agent 备份文件')
   }
   const secretById = new Map((data.secrets || []).map((s) => [s.id, s.secret]))
   const encryptedById = new Map()

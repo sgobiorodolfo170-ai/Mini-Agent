@@ -169,7 +169,7 @@ function defineTools(ctx) {
         if (!/^https?:$/.test(u.protocol)) throw new Error('仅支持 http(s) URL')
         const res = await fetch(u.toString(), {
           signal: AbortSignal.timeout(20000),
-          headers: { 'User-Agent': 'Mozilla/5.0 (miniagent)' }
+          headers: { 'User-Agent': 'Mozilla/5.0 (Mini-Agent)' }
         })
         const html = await res.text()
         return htmlToText(html).slice(0, 20000) || '(空页面)'

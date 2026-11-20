@@ -89,7 +89,7 @@ function createMcpClient({ command, args = [], spawnFn = spawn, timeoutMs = 1500
     const r = await request('initialize', {
       protocolVersion: PROTOCOL_VERSION,
       capabilities: {},
-      clientInfo: { name: 'miniagent', version: '1.0.0' }
+      clientInfo: { name: 'mini-agent', version: '1.0.0' }
     })
     notify('notifications/initialized')
     return r

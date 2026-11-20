@@ -1,4 +1,4 @@
-# miniagent
+# Mini Agent
 
 Windows 桌面个人 AI 助理（自用）：主窗口多会话对话 · 多 Key 管理 · 托盘/快捷唤起 · 划词 · 截屏问 AI · 本地知识库（RAG，支持本地离线嵌入） · Agent 工具调用。
 
