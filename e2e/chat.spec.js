@@ -88,12 +88,13 @@ describe('对话全链路（真实 UI → IPC → 网关 → mock 模型服务�
     ctx = null
 
     const second = await launchApp({ reuseUserData: userData })
-    await second.win.getByText('新会话', { exact: true }).first().waitFor({ timeout: 15000 })
+    // 首轮提示词「持久化问题」自动命名会话（优化失败时回退原文截断），不再叫「新会话」
+    await second.win.getByText('持久化问题', { exact: true }).first().waitFor({ timeout: 15000 })
     await second.win.getByTestId('nav-settings').click()
     await second.win.getByTestId('provider-name').waitFor({ timeout: 15000 })
     await second.win.getByTestId('nav-chat').click()
     // 显式点击侧栏会话（启动自动恢复是异步竞态；真实用户行为是点击会话项查看历史）
-    await second.win.getByText('新会话', { exact: true }).first().click()
+    await second.win.getByText('持久化问题', { exact: true }).first().click()
     await second.win.getByText('E2E模拟回复').waitFor({ timeout: 30000 })
     await closeApp(second.electronApp, second.mock)
   })

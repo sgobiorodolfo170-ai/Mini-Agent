@@ -9,6 +9,7 @@ const rag = require('./rag/index')
 const localModels = require('./rag/local-models')
 const faissIndex = require('./rag/faiss-index')
 const { getScheduler } = require('./probe-scheduler')
+const { getUpdater } = require('./updater')
 const { probeKey } = require('./gateway/probe')
 const { captureRegion } = require('./sys/capture')
 const { captureSelectedText } = require('./sys/selection')
@@ -442,14 +443,43 @@ function registerIpc(ctx) {
     if (['quick', 'main', 'ball'].includes(name)) windows.hide(name)
     return true
   })
+  // 自绘标题栏的窗口控制（主窗口）
+  h('win:minimize', () => {
+    const win = windows.get('main')
+    if (win && !win.isDestroyed()) win.minimize()
+    return true
+  })
+  h('win:toggleMaximize', () => {
+    const win = windows.get('main')
+    if (!win || win.isDestroyed()) return false
+    if (win.isMaximized()) win.unmaximize()
+    else win.maximize()
+    return win.isMaximized()
+  })
+  h('win:isMaximized', () => {
+    const win = windows.get('main')
+    return !!(win && !win.isDestroyed() && win.isMaximized())
+  })
   h('app:info', () => ({
     version: ctx.version,
+    commit: (ctx.buildInfo && ctx.buildInfo.commit) || '',
+    builtAt: (ctx.buildInfo && ctx.buildInfo.builtAt) || '',
     dataDir: app.getPath('userData'),
     dbPath: dbm.info() && dbm.info().path,
     driver: dbm.info() && dbm.info().driver,
     platform: process.platform,
     node: process.versions.node
   }))
+  // GitHub 更新：state 只读缓存（渲染层启动时补齐），check 触发一次真实检查。
+  // 主进程还没初始化 updater（如仅注册 IPC 的场景）时返回空态而不是抛错。
+  h('updater:state', () => {
+    const u = getUpdater()
+    return u ? u.getState() : null
+  })
+  h('updater:check', ({ force = true } = {}) => {
+    const u = getUpdater()
+    return u ? u.check({ force: !!force }) : null
+  })
   h('autostart:get', () => app.getLoginItemSettings().openAtLogin)
   h('autostart:set', (v) => {
     app.setLoginItemSettings({ openAtLogin: !!v })

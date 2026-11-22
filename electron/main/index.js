@@ -6,9 +6,12 @@ const notify = require('./notify')
 const windows = require('./windows')
 const tray = require('./tray')
 const shortcutsMod = require('./shortcuts')
+const updaterMod = require('./updater')
+const buildInfo = require('./build-info')
 const { registerIpc, probeAllForProvider } = require('./ipc')
 const { initProbeScheduler, stopProbeScheduler } = require('./probe-scheduler')
 const { getHub } = require('./events/hub')
+const { initUpdater, getUpdater, stopUpdater } = updaterMod
 
 let forceQuit = false
 
@@ -61,6 +64,20 @@ function startCapture() {
   const { screen } = require('electron')
   const d = screen.getDisplayNearestPoint(screen.getCursorScreenPoint())
   windows.createCaptureWindow(d)
+}
+
+// 更新检查的离线数据源（仅 e2e/离线调试用）：环境变量指向本地 JSON，
+// 内容形如 { latest: {...}, compare: {...} }。未配置时返回 null，走真实 GitHub 请求。
+function readUpdateFeed(file) {
+  if (!file) return null
+  const fs = require('fs')
+  return async () => {
+    try {
+      return JSON.parse(fs.readFileSync(file, 'utf8'))
+    } catch (e) {
+      throw new Error('读取更新数据源失败：' + ((e && e.message) || e))
+    }
+  }
 }
 
 function applyHotkeysNow() {
@@ -117,7 +134,8 @@ if (!gotLock) {
       startCapture,
       requestQuit,
       applyHotkeysNow,
-      version: app.getVersion()
+      version: app.getVersion(),
+      buildInfo: buildInfo.getBuildInfo()
     })
 
     // 周期自动探测（需求 4.2）：每分钟一跳，按供应商 probe_interval_min 到期探测。
@@ -126,6 +144,18 @@ if (!gotLock) {
       initProbeScheduler({ probeProvider: (id) => probeAllForProvider(id) }).start()
     }
 
+    // GitHub 更新检查：启动 3s 后静默检查一次，之后每 6 小时一跳；
+    // 命中新提交时推送 updater:changed，左侧栏据此显示「更新」入口。
+    // MINIAGENT_UPDATE_FEED 指向本地 JSON（e2e 用），避免测试触网。
+    const updateFeed = readUpdateFeed(process.env.MINIAGENT_UPDATE_FEED)
+    initUpdater({
+      currentVersion: app.getVersion(),
+      currentCommit: buildInfo.getBuildCommit(),
+      feed: updateFeed,
+      onState: (state) => notify.broadcast('updater:changed', state)
+    })
+    // 测试模式默认不联网；给了离线数据源才启动，让 e2e 能覆盖真实判定链路
+    if (!isTestMode || updateFeed) getUpdater().start()
     // Unattended smoke mode: boot fully, then report and quit cleanly.
     if (process.env.MINIAGENT_SMOKE) {
       setTimeout(() => {
@@ -139,6 +169,7 @@ if (!gotLock) {
     forceQuit = true
     shortcutsMod.unregisterAll()
     stopProbeScheduler()
+    stopUpdater()
     try {
       dbm.close()
     } catch {

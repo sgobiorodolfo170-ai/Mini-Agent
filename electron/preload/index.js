@@ -118,6 +118,16 @@ function buildMain() {
       setHotkeys: (m) => inv('hotkeys:set', m),
       captureStart: () => inv('capture:start')
     },
+    updater: {
+      state: () => inv('updater:state'),
+      check: (o) => inv('updater:check', o || {})
+    },
+    window: {
+      minimize: () => inv('win:minimize'),
+      toggleMaximize: () => inv('win:toggleMaximize'),
+      isMaximized: () => inv('win:isMaximized'),
+      hide: () => inv('win:hide', 'main')
+    },
     on
   })
 }

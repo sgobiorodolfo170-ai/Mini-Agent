@@ -4,7 +4,7 @@ import os from 'os'
 import { _electron } from 'playwright-core'
 import { createMockServer } from './mock-server'
 
-export async function launchApp({ reuseUserData = null } = {}) {
+export async function launchApp({ reuseUserData = null, env = {} } = {}) {
   const userData = reuseUserData || fs.mkdtempSync(path.join(os.tmpdir(), 'miniagent-e2e-'))
   const mock = await createMockServer()
   const electronApp = await _electron.launch({
@@ -13,7 +13,8 @@ export async function launchApp({ reuseUserData = null } = {}) {
     env: {
       ...process.env,
       MINIAGENT_USER_DATA: userData,
-      ELECTRON_ENABLE_LOGGING: ''
+      ELECTRON_ENABLE_LOGGING: '',
+      ...env
     }
   })
 

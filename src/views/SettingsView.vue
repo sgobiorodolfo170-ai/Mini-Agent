@@ -1186,8 +1186,11 @@ function setModelParam(m, field, value) {
               <button class="btn-secondary" @click="importData">导入备份</button>
             </div>
             <div v-if="settings.info" class="text-xs text-ink-muted">
-              Mini Agent v{{ settings.info.version }} · {{ settings.info.driver }} · 数据目录
-              {{ settings.info.dataDir }}
+              Mini Agent v{{ settings.info.version
+              }}<span v-if="settings.info.commit">
+                · 构建 {{ settings.info.commit.slice(0, 7) }}</span
+              >
+              · {{ settings.info.driver }} · 数据目录 {{ settings.info.dataDir }}
             </div>
           </section>
         </div>

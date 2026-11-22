@@ -55,7 +55,11 @@ const paths = {
   key: 'M15 9a4 4 0 1 0-3.5 3.97L10 14.5H8v2H6v2H3v-3l8.5-8.5A4 4 0 0 1 15 9Z M15.5 8.5v.01',
   clock: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Z M12 7v5l3 3',
   db: 'M12 8c4.4 0 8-1.3 8-3s-3.6-3-8-3-8 1.3-8 3 3.6 3 8 3Z M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5 M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3',
-  file: 'M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Z M14 3v5h5'
+  download: 'M12 4v11 M7 10l5 5 5-5 M4 20h16',
+  file: 'M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Z M14 3v5h5',
+  winMinimize: 'M5 12h14',
+  winMaximize: 'M6 6h12v12H6V6Z',
+  winRestore: 'M9 9h9v9H9V9Z M6 15V6h9'
 }
 
 const d = computed(() => paths[props.name] || '')

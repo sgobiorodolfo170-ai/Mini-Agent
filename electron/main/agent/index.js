@@ -2,8 +2,9 @@ const os = require('os')
 const path = require('path')
 const repos = require('../../store/repos')
 const dbm = require('../../store/db')
-const { chatStream, GatewayError } = require('../gateway/client')
+const { chatStream, chatOnce, GatewayError } = require('../gateway/client')
 const scheduler = require('../gateway/scheduler')
+const title = require('../gateway/title')
 const { resolveModel, msgOut, effectiveParams, safeJson } = require('../gateway/index')
 const { decryptSecret } = require('../../store/keys')
 const { broadcast } = require('../notify')
@@ -248,6 +249,8 @@ async function startAgentRun({
       throw new Error(`父任务状态更新失败：${upd.reason}`)
     }
   }
+  // 「第一轮」在插入本条消息前判定（对齐 gateway.sendChat 的语义）
+  const isFirstRound = repos.listMessages(db, conversationId).length === 0
   const userMsg = repos.insertMessage(db, {
     conversationId,
     role: 'user',
@@ -261,6 +264,16 @@ async function startAgentRun({
     status: 'streaming',
     meta: { agentRunId: runId }
   })
+  // 任务会话标题 = 第一轮目标（goal）优化后的结果；异步执行，不阻塞运行链路。
+  // 标题仍是默认值才生成（title 模块内部校验），测试环境走原文截断回退
+  if (isFirstRound) {
+    title
+      .titleConversation(
+        { dbm, repos, scheduler, chatOnce, resolveModel, decryptSecret, broadcast },
+        { conversationId, content: goal }
+      )
+      .catch(() => {})
+  }
   const state = {
     ac: new AbortController(),
     stopped: false,

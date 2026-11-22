@@ -572,8 +572,17 @@ function install() {
         stopStreamsOf(conversationId)
         const userMsg = pushMessage(conversationId, 'user', content, { attachments })
         const assistant = pushMessage(conversationId, 'assistant', '', { status: 'streaming' })
-        if (!conv.title || conv.title === '新会话')
-          conv.title = String(content || '').slice(0, 24) || '新会话'
+        // 与主进程一致：第一轮提示词优化后作为会话标题（mock 用轻量改写模拟优化结果）
+        if (conv.title === '新会话' || !conv.title) {
+          const draft = String(content || '').trim().replace(/\s+/g, ' ')
+          const optimized = draft ? `请处理任务：${draft.slice(0, 16)}` : ''
+          conv.title = (optimized || '新会话').slice(0, 24)
+          emit('chat:event', {
+            type: 'conversationRenamed',
+            conversationId,
+            title: conv.title
+          })
+        }
         touchConv(conversationId)
         emit('chat:event', {
           type: 'snapshot',
@@ -817,8 +826,11 @@ function install() {
           status: 'streaming',
           meta: { agentRunId: runId }
         })
-        if (!conv.title || conv.title === '新会话')
-          conv.title = String(goal || '').slice(0, 24) || '新会话'
+        if (!conv.title || conv.title === '新会话') {
+          const draft = String(goal || '').trim().replace(/\s+/g, ' ')
+          conv.title = (draft ? `请处理任务：${draft.slice(0, 16)}` : '新会话').slice(0, 24)
+          emit('chat:event', { type: 'conversationRenamed', conversationId, title: conv.title })
+        }
         // 会话级权限记忆：与真实后端一致，运行权限同步回会话
         const mode = ['readonly', 'full'].includes(permission)
           ? permission
@@ -1017,6 +1029,27 @@ function install() {
         emit('app:notice', { level: 'info', message: '浏览器预览不支持截图' })
         return true
       }
+    },
+    // 浏览器预览：不联网，返回「有更新」的假态以便核对侧栏入口与弹窗样式。
+    // 真机由主进程 updater 推送真实结果。
+    updater: {
+      state: () => ({
+        available: true,
+        behind: 2,
+        reason: 'commit-ahead',
+        checkedAt: Date.now(),
+        error: null,
+        current: { version: '1.2.0-mock', commit: 'mock0000', shortCommit: 'mock000' },
+        latest: {
+          version: '1.2.0',
+          commit: 'mocked111',
+          shortCommit: 'mocked1',
+          message: '预览环境模拟提交：侧栏更新入口样式校验',
+          date: new Date().toISOString(),
+          compareUrl: 'https://github.com/'
+        }
+      }),
+      check: () => api.updater.state()
     },
     on
   }

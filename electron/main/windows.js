@@ -41,12 +41,17 @@ function createMainWindow() {
     minWidth: 980,
     minHeight: 640,
     show: false,
+    // 自绘标题栏：去掉系统边框，渲染层用 bg-chrome 顶栏提供拖拽/窗口控制
+    frame: false,
     backgroundColor: '#101014',
     icon: appIcon(),
     title: 'Mini Agent',
     webPreferences: webPrefs('index', 'main')
   })
   win.setMenuBarVisibility(false)
+  // 最大化状态变化推给渲染层，自绘标题栏按钮据此切换「最大化/还原」图标
+  win.on('maximize', () => broadcast('window:maximized', true))
+  win.on('unmaximize', () => broadcast('window:maximized', false))
   win.loadURL(rendererUrl('main-window'))
   win.once('ready-to-show', () => win.show())
   windows.set('main', win)

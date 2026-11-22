@@ -6,6 +6,7 @@ const { buildContext } = require('./context')
 const { decryptSecret } = require('../../store/keys')
 const { broadcast } = require('../notify')
 const { searchKb } = require('../rag/index')
+const title = require('./title')
 
 // assistantMsgId -> { ac: AbortController, conversationId }
 // 值里带上 conversationId，让「按会话中止」与前端事件归属判断有据可依。
@@ -342,6 +343,9 @@ async function sendChat({ conversationId, content, kbIds, attachments }) {
   if (!conv) throw new Error('会话不存在')
   // 后端闸门：同一会话同时只允许一条在途流（前端 hasStreaming 只是第一道拦截）
   abortStreamsOf(conversationId, 'new-send')
+  // 「第一轮」在插入本条消息前判定：会话此前的消息为空即第一轮
+  const isFirstRound =
+    repos.listMessages(db, conversationId).filter((m) => !m.deleted_at).length === 0
   const userMsg = repos.insertMessage(db, {
     conversationId,
     role: 'user',
@@ -361,6 +365,16 @@ async function sendChat({ conversationId, content, kbIds, attachments }) {
     conversationId,
     messages: [msgOut(repos.getMessage(db, userMsg.id)), msgOut(repos.getMessage(db, assistant.id))]
   })
+  // 会话标题 = 第一轮提示词优化后的结果（异步、不阻塞发送链路；
+  // 只在会话仍是默认标题时生效，模型服务不可用时回退原文截断）
+  if (isFirstRound) {
+    title
+      .titleConversation(
+        { dbm, repos, scheduler, chatOnce, resolveModel, decryptSecret, broadcast },
+        { conversationId, content }
+      )
+      .catch(() => {})
+  }
   startStream({
     conversationId,
     assistantMsgId: assistant.id,

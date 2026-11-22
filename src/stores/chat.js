@@ -161,6 +161,11 @@ export const useChatStore = defineStore('chat', {
         }
         return
       }
+      // 自动命名完成：标题来自主进程异步生成，这里刷新列表让新标题立即可见
+      if (ev.type === 'conversationRenamed') {
+        this.loadConversations()
+        return
+      }
       if (evConv && evConv !== this.activeId) return
       const m = this.messages.find((x) => x.id === ev.msgId)
       if (!m) {
