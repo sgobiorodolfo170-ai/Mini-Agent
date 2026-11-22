@@ -51,7 +51,7 @@
 - `src/components/composer/ComposerStatusPill.vue` — 单个状态胶囊
 - `src/components/composer/agent-composer.css` — 局部样式（`.agent-composer` / `.ac-*` 命名空间）
 - `e2e/composer.spec.js` — 两状态几何/交互/窄窗验收与截图
-- `docs/composer-2026-11-20/*.png` — 实际运行截图
+- `docs/composer-2026-11-20/*.png` — 实际运行截图（归档副本；测试运行时图片改写到 `.e2e-artifacts/`，不再覆盖归档目录）
 
 修改：
 
