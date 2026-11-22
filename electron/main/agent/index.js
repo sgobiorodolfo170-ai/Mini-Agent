@@ -12,8 +12,14 @@ const { escalateRisk } = require('./guard')
 const { runAgentLoop } = require('./loop')
 const { readMemoryFile } = require('./memory')
 const { parseMcpServers } = require('./mcp-client')
+const { getHub } = require('../events/hub')
+const { parseHooks, applyHooks } = require('../events/hooks')
+const { normalizeMandate, defaultSubMandate, authorizeToolCall } = require('./mandate')
 
 const active = new Map() // runId -> { ac, stopped, remember:Set, confirms:Map }
+
+// 确认请求的最长等待时间：超时按拒绝处理，避免隐藏窗口里的任务永久挂起
+const CONFIRM_TIMEOUT_MS = 5 * 60 * 1000
 
 function toolSchemas(tools) {
   return tools.map((t) => ({
@@ -47,6 +53,17 @@ function summarize(toolName, args) {
     if (toolName === 'update_todo') return `更新任务清单: ${args.action}`
     if (toolName === 'save_memory') return `保存记忆「${args.name}」`
     if (toolName === 'spawn_agent') return `派生子 Agent: ${String(args.goal || '').slice(0, 120)}`
+    if (toolName === 'session_create')
+      return `创建子会话「${String(args.title || '').slice(0, 60)}」`
+    if (toolName === 'session_send')
+      return `向会话 ${String(args.conversationId || '').slice(0, 8)} 发送提示词（${String(args.content || '').length} 字符）`
+    if (toolName === 'session_status')
+      return `查询会话状态 ${String(args.conversationId || '').slice(0, 8)}`
+    if (toolName === 'session_wait')
+      return `等待会话完成 ${String(args.conversationId || '').slice(0, 8)}`
+    if (toolName === 'session_result')
+      return `读取会话结果 ${String(args.conversationId || '').slice(0, 8)}`
+    if (toolName === 'session_list') return '列出子会话'
     if (toolName === 'browser_navigate') return `打开网页 ${args.url}`
     if (toolName === 'browser_click') return `点击 ${args.selector}`
     if (toolName === 'browser_type') return `输入到 ${args.selector}`
@@ -120,17 +137,117 @@ async function withKeyRetry(db, provider, fn) {
   throw new Error(lastErr || '无可用 Key')
 }
 
-async function startAgentRun({ conversationId, goal, permission, cluster }) {
+// 最大派生深度（方案四 §7.1）：沿 parent_run_id 链计算，默认只允许一层。
+// 集中在此处配置，禁止各模块硬编码不同值。
+const MAX_DELEGATION_DEPTH = 1
+
+function depthOfRun(db, runId) {
+  let depth = 0
+  let cur = runId
+  const seen = new Set()
+  while (cur && depth < 64) {
+    if (seen.has(cur)) break
+    seen.add(cur)
+    const row = db.prepare('SELECT parent_run_id FROM agent_runs WHERE id = ?').get(cur)
+    if (!row || !row.parent_run_id) break
+    cur = row.parent_run_id
+    depth++
+  }
+  return depth
+}
+
+// 校验能否把 childConversation 的任务挂到 parentRunId 之下
+function assertCanDelegate(db, parentRunId) {
+  const parent = repos.getRun(db, parentRunId)
+  if (!parent) throw new Error('父任务不存在')
+  if (!['running', 'waiting_child'].includes(parent.status)) {
+    throw new Error(`父任务状态 ${parent.status} 不允许派生`)
+  }
+  if (parent.controlMode === 'transferred') throw new Error('已移交的任务不可再派生')
+  if (parent.parentRunId && !parent.mandateJson) throw new Error('父任务缺少授权快照')
+  // 深度：沿 parent_run_id 链
+  if (depthOfRun(db, parentRunId) + 1 > MAX_DELEGATION_DEPTH) {
+    throw new Error(`派生深度已达上限(${MAX_DELEGATION_DEPTH} 层)`)
+  }
+  // 同一父 Run 同时只允许一个活动子 Run（方案四 §6.4）
+  const activeChildren = repos.listActiveChildRuns(db, parentRunId)
+  if (activeChildren.length) throw new Error('父任务已有进行中的子任务，暂不可再派生')
+  if (parent.mandateJson) {
+    let pm = null
+    try {
+      pm = JSON.parse(parent.mandateJson)
+    } catch {
+      pm = null
+    }
+    if (pm && pm.canDelegate !== true) throw new Error('父任务授权未包含派生权限')
+  }
+  return parent
+}
+
+async function startAgentRun({
+  conversationId,
+  goal,
+  permission,
+  cluster,
+  parentRunId,
+  controlMode,
+  mandate,
+  acceptancePolicy,
+  traceId,
+  idempotencyKey
+}) {
   const db = dbm.get()
   const { provider, model } = resolveModel(db, conversationId)
   if (!provider) throw new Error('未配置模型服务')
   if (!model) throw new Error('未配置模型')
   const settings = repos.getAllSettings(db)
+
+  // 子任务：先校验父任务与授权，再求交得到有效权限
+  let effectiveMandate = normalizeMandate(mandate)
+  let inheritedTrace = traceId || null
+  if (parentRunId) {
+    if (!controlMode || !['delegated', 'transferred'].includes(controlMode)) {
+      throw new Error('派生任务必须指定 controlMode: delegated 或 transferred')
+    }
+    const parent = assertCanDelegate(db, parentRunId)
+    let parentMandate = null
+    try {
+      parentMandate = parent.mandateJson ? JSON.parse(parent.mandateJson) : null
+    } catch {
+      parentMandate = null
+    }
+    // 无 mandate 时不得全继承：收敛到受限默认（方案四 §4.3）
+    effectiveMandate = effectiveMandate
+      ? require('./mandate').intersectMandate(parentMandate, effectiveMandate)
+      : defaultSubMandate(parentMandate)
+    inheritedTrace = parent.traceId || parent.id
+  } else if (!inheritedTrace) {
+    inheritedTrace = repos.uid()
+  }
+
   const runId = repos.createRun(db, {
     conversationId,
     goal,
-    maxSteps: Number(settings.agentMaxSteps) || 15
+    maxSteps: Number(settings.agentMaxSteps) || 15,
+    parentRunId: parentRunId || null,
+    controlMode: parentRunId ? controlMode : null,
+    mandate: effectiveMandate,
+    acceptancePolicy: acceptancePolicy || null,
+    traceId: inheritedTrace,
+    idempotencyKey: idempotencyKey || null
   })
+
+  // 委派：同一事务内把父 Run 置为 waiting_child；移交：父 Run 置终态。
+  // 先建子 Run 再改父状态，任一失败都不会造成任务丢失（方案四 §6.2）。
+  if (parentRunId) {
+    const parentTarget = controlMode === 'transferred' ? 'transferred' : 'waiting_child'
+    const upd = repos.updateRunStatus(db, parentRunId, { status: parentTarget })
+    if (!upd.ok) {
+      // 回滚子 Run，避免出现孤儿任务
+      db.prepare('DELETE FROM agent_runs WHERE id = ?').run(runId)
+      throw new Error(`父任务状态更新失败：${upd.reason}`)
+    }
+  }
   const userMsg = repos.insertMessage(db, {
     conversationId,
     role: 'user',
@@ -149,12 +266,29 @@ async function startAgentRun({ conversationId, goal, permission, cluster }) {
     stopped: false,
     remember: new Set(),
     confirms: new Map(),
+    // 父运行：子会话里的运行由此派生，用于会话管理与审计回溯
+    parentRunId: parentRunId || null,
+    controlMode: parentRunId ? controlMode : null,
+    // 本次 Run 的授权快照：运行期不可被模型扩大（方案四 §4.1）
+    mandate: effectiveMandate,
+    traceId: inheritedTrace,
     // 权限等级：full = 所有非只读调用直接放行（不再逐次确认）
     permission: permission === 'full' ? 'full' : 'autonomous',
     // Agent 集群：允许派生多个子 Agent 并行处理子任务
     cluster: !!cluster
   }
   active.set(runId, state)
+  const hub = getHub()
+  hub.emit('run.start', {
+    runId,
+    conversationId,
+    parentRunId: state.parentRunId,
+    controlMode: state.controlMode,
+    traceId: state.traceId,
+    goal: String(goal || '').slice(0, 200),
+    permission: state.permission,
+    cluster: state.cluster
+  })
   broadcast('chat:event', {
     type: 'snapshot',
     conversationId,
@@ -169,6 +303,7 @@ async function startAgentRun({ conversationId, goal, permission, cluster }) {
     model,
     goal,
     state,
+    acceptancePolicy,
     settings
   }).catch(() => {})
   return { runId, userMsgId: userMsg.id, assistantMsgId: assistant.id }
@@ -182,6 +317,7 @@ async function doAgentRun({
   model,
   goal,
   state,
+  acceptancePolicy,
   settings: inherited
 }) {
   const db = dbm.get()
@@ -199,7 +335,46 @@ async function doAgentRun({
     browserFactory: (opts) => new electron.BrowserWindow(opts),
     mcpServers: parseMcpServers(settings.agentMcpServers),
     tavilyKey: settings.tavilyApiKey || '',
-    webSearchProvider: settings.webSearchProvider || 'auto'
+    webSearchProvider: settings.webSearchProvider || 'auto',
+    // 会话管理：供 session_* 工具创建/驱动子会话
+    sessionRunId: runId,
+    sessionConversationId: conversationId,
+    sessionPermission: state.permission,
+    sessionCluster: state.cluster
+  }
+  // 会话管理：子会话继承本运行的权限等级，不擅自提权
+  const sessionApi = require('./sessions')
+  ctx.createSession = (opts) =>
+    sessionApi.createSession({
+      ...opts,
+      parentConversationId: conversationId,
+      runId
+    })
+  ctx.sendToSession = ({ conversationId: targetId, content, mode }) => {
+    // 只允许向「本运行派生的子会话」或本会话发送，避免跨会话乱发
+    const target = repos.getConversation(db, targetId)
+    if (!target) throw new Error('目标会话不存在')
+    const isChild = target.parentId === conversationId
+    const isSelf = target.id === conversationId
+    if (!isChild && !isSelf) throw new Error('只能向本会话或其派生的子会话发送提示词')
+    return sessionApi.sendToSession({
+      conversationId: targetId,
+      content,
+      permission: mode === 'agent' ? state.permission : 'default',
+      cluster: state.cluster,
+      runId
+    })
+  }
+  ctx.getSessionStatus = (opts) => sessionApi.getSessionStatus(opts)
+  ctx.waitForSession = (opts) => sessionApi.waitForSession(opts)
+  ctx.getSessionResult = (opts) => sessionApi.getSessionResult(opts)
+  ctx.listSessions = (opts) => sessionApi.listSessions({ ...opts, runId })
+
+  // 钩子规则来自用户设置，模型无法改动；此处解析一次，运行内复用
+  const hookRules = parseHooks(settings.agentHooks)
+  const hookSink = {
+    broadcast,
+    log: (entry) => getHub().emit('hook.fired', entry)
   }
   const tools = defineTools(ctx)
   const toolMap = Object.fromEntries(tools.map((t) => [t.name, t]))
@@ -222,11 +397,38 @@ async function doAgentRun({
     },
     { role: 'user', content: goal }
   ]
+  const startedAt = Date.now()
   let lastDecision = { allowed: true, confirmedBy: 'auto' }
   let callCount = 0
   let finalContent = ''
   let stepsUsed = 0
   let status = 'done'
+
+  // 旧流隔离：Run 仍是本进程内当前活动的那一个，且未被停止。
+  // 被 stopRun / 移交 / 替换后，任何迟到回调都不得写入或广播。
+  const isCurrentRun = () => {
+    if (state.stopped) return false
+    const cur = active.get(runId)
+    return !!cur && cur === state
+  }
+
+  // 迟到事件审计：只记一次每条 Run 的第一条，避免刷屏
+  let staleNoted = false
+  const noteStaleEvent = (kind) => {
+    if (staleNoted) return
+    staleNoted = true
+    try {
+      getHub().emit('stale_event_ignored', {
+        runId,
+        traceId: state.traceId,
+        conversationId,
+        kind,
+        reason: state.stopped ? 'stopped' : 'replaced'
+      })
+    } catch {
+      // 事件中枢不可用时不影响主流
+    }
+  }
 
   const modelCallWith = (apiKey) => async (msgs) => {
     const payload = { model, messages: msgs, stream: true, tools: toolSchemas(tools) }
@@ -237,7 +439,20 @@ async function doAgentRun({
       { baseUrl: provider.base_url, apiKey, payload },
       {
         signal: state.ac.signal,
-        onDelta: (d) => broadcast('chat:event', { type: 'delta', msgId: assistantMsgId, delta: d })
+        onDelta: (d) => {
+          // 旧流隔离（方案四 §5.3）：被取消/移交/替换的 Run 不得继续广播增量。
+          // 迟到的 token 一律丢弃并记审计，不依赖 Renderer 过滤。
+          if (!isCurrentRun()) {
+            noteStaleEvent('delta')
+            return
+          }
+          broadcast('chat:event', {
+            type: 'delta',
+            conversationId,
+            msgId: assistantMsgId,
+            delta: d
+          })
+        }
       }
     )
     return r
@@ -249,6 +464,21 @@ async function doAgentRun({
       lastDecision = { allowed: !!decision.allowed, confirmedBy: decision.confirmedBy }
       return decision
     }
+    // tool.before 钩子：只能更严格（把允许改成拒绝），不能把需要确认的调用放行
+    const gate = applyHooks(
+      hookRules,
+      'tool.before',
+      { tool: name, runId, conversationId, riskLevel: risk },
+      hookSink
+    )
+    getHub().emit('tool.before', {
+      runId,
+      conversationId,
+      tool: name,
+      riskLevel: risk,
+      blockedByHook: gate.blocked || null
+    })
+    if (gate.blocked) return settle({ allowed: false, confirmedBy: `hook:${gate.blockedBy}` })
     if (risk === 'readonly') return settle({ allowed: true, confirmedBy: 'auto' })
     if (state.stopped) return settle({ allowed: false, confirmedBy: 'stopped' })
     // 完整权限：用户已在输入区显式选择，不再逐次弹确认，但审计记录标记来源
@@ -258,7 +488,22 @@ async function doAgentRun({
       return settle({ allowed: true, confirmedBy: 'session' })
     const requestId = repos.uid()
     const decision = await new Promise((resolve) => {
-      state.confirms.set(requestId, resolve)
+      // 等待用户确认期间可能有超时/停止两条退出路径，用 settled 保证只 resolve 一次
+      let settled = false
+      const finish = (d) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        state.confirms.delete(requestId)
+        resolve(d)
+      }
+      // 主窗隐藏到托盘时确认卡不可见，任务会无限期挂起；超时按拒绝处理并告知前端
+      const timer = setTimeout(() => {
+        finish({ allow: false, remember: false, timedOut: true })
+        broadcast('agent:confirmTimeout', { requestId, runId, tool: name })
+      }, CONFIRM_TIMEOUT_MS)
+      if (timer.unref) timer.unref()
+      state.confirms.set(requestId, finish)
       broadcast('agent:confirm', {
         requestId,
         runId,
@@ -271,13 +516,52 @@ async function doAgentRun({
     if (decision.allow && decision.remember) state.remember.add(name)
     return settle({
       allowed: !!decision.allow,
-      confirmedBy: decision.allow ? 'user' : 'denied'
+      confirmedBy: decision.allow ? 'user' : decision.timedOut ? 'timeout' : 'denied'
     })
   }
   const execute = async (tool, args) => {
     const t0 = Date.now()
     let resultText = ''
     let error = null
+
+    // 旧流隔离（方案四 §5.3）：Run 已被取消或替换后，不得再执行任何工具。
+    // 必须在授权校验与 handler 调用之前拦截，否则旧流会产生真实副作用。
+    if (!isCurrentRun()) {
+      noteStaleEvent('tool-call')
+      throw new Error('任务已结束，工具调用被丢弃')
+    }
+
+    // 强制授权校验：发生在任何副作用之前（方案四 §4.4）。
+    // Hook 与提示词只作辅助，不能替代此处；所有工具路径（含子 Agent）都经过 execute。
+    const decision = authorizeToolCall({
+      toolName: tool.name,
+      args,
+      mandate: state.mandate,
+      riskLevel: tool.risk
+    })
+    if (!decision.allowed) {
+      getHub().emit('mandate.denied', {
+        runId,
+        traceId: state.traceId,
+        conversationId,
+        tool: tool.name,
+        reason: decision.reason,
+        detail: String(decision.detail || '').slice(0, 200)
+      })
+      repos.logToolCall(db, {
+        runId,
+        step: ++callCount,
+        tool: tool.name,
+        args,
+        riskLevel: tool.risk,
+        confirmedBy: `mandate:${decision.reason}`,
+        result: null,
+        error: `授权拒绝: ${decision.detail || decision.reason}`,
+        durationMs: Date.now() - t0
+      })
+      throw new Error(`授权拒绝：${decision.detail || decision.reason}`)
+    }
+
     try {
       const r = await tool.handler(args)
       resultText = typeof r === 'string' ? r : JSON.stringify(r)
@@ -297,13 +581,29 @@ async function doAgentRun({
       error,
       durationMs: Date.now() - t0
     })
+    const after = applyHooks(
+      hookRules,
+      'tool.after',
+      { tool: tool.name, runId, conversationId, ok: !error },
+      hookSink
+    )
+    getHub().emit('tool.after', {
+      runId,
+      conversationId,
+      tool: tool.name,
+      ok: !error,
+      error: error ? String(error).slice(0, 200) : null,
+      durationMs: Date.now() - t0,
+      notified: after.notifications.length
+    })
     if (error) throw new Error(error)
     return resultText
   }
   const onEvent = (type, payload) => broadcast('agent:event', { type, runId, ...payload })
 
   // 子 Agent：复用同一套确认/日志/广播管道，深度固定为 1（工具集去掉 spawn_agent）。
-  const subTools = tools.filter((t) => t.name !== 'spawn_agent')
+  // 子 Agent 不参与会话派生：去掉 spawn_agent 与 session_*，否则会绕过嵌套深度限制
+  const subTools = tools.filter((t) => t.name !== 'spawn_agent' && !t.name.startsWith('session_'))
   const subMap = Object.fromEntries(subTools.map((t) => [t.name, t]))
   const runSubAgent = async (subGoal) => {
     const sub = await withKeyRetry(db, provider, (apiKey) =>
@@ -367,11 +667,42 @@ async function doAgentRun({
     }
   }
 
-  repos.updateRun(db, runId, { status, stepsUsed, endedAt: Date.now() })
+  // 空输出不得算作成功（方案四 §5.5）：done 但无有效内容 → 判为 error。
+  // '(无输出)' 只是展示占位，不是交付物。
+  const hasDeliverable = String(finalContent || '').trim().length > 0
+  let finalStatus = status
+  if (status === 'done' && !hasDeliverable) {
+    finalStatus = 'error'
+    getHub().emit('run.empty_result', {
+      runId,
+      traceId: state.traceId,
+      conversationId,
+      stepsUsed
+    })
+  }
+
+  const runUpdate = repos.updateRunStatus(db, runId, {
+    status: finalStatus,
+    stepsUsed,
+    endedAt: Date.now(),
+    // 有验收策略时进入待验收；否则 not_required
+    acceptanceStatus: acceptancePolicy ? 'pending' : null
+  })
+  if (!runUpdate.ok) {
+    // 终态已被其它路径写入：不覆盖，仅记录
+    getHub().emit('run.stale_update_ignored', {
+      runId,
+      traceId: state.traceId,
+      conversationId,
+      attempted: finalStatus,
+      reason: runUpdate.reason
+    })
+  }
   repos.updateMessage(db, assistantMsgId, {
     content: finalContent || '(无输出)',
-    status: status === 'done' ? 'done' : status === 'error' ? 'error' : 'stopped'
+    status: finalStatus === 'done' ? 'done' : finalStatus === 'error' ? 'error' : 'stopped'
   })
+  if (finalStatus !== status) status = finalStatus
   repos.touchConversation(db, conversationId)
   if (ctx._browser) {
     try {
@@ -381,33 +712,75 @@ async function doAgentRun({
     }
   }
   active.delete(runId)
+  // run.end 钩子与事件：此时运行已落库，钩子可以安全地读结果
+  const ended = applyHooks(hookRules, 'run.end', { runId, conversationId, status }, hookSink)
+  getHub().emit('run.end', {
+    runId,
+    conversationId,
+    parentRunId: state.parentRunId,
+    status,
+    stepsUsed,
+    toolCalls: callCount,
+    durationMs: Date.now() - startedAt,
+    hookNotified: ended.notifications.length
+  })
   broadcast('chat:event', {
     type: status === 'error' ? 'error' : status === 'stopped' ? 'stopped' : 'done',
+    conversationId,
     msgId: assistantMsgId,
     content: finalContent || ''
   })
-  broadcast('agent:event', { type: 'done', runId, status, content: finalContent, assistantMsgId })
+  broadcast('agent:event', {
+    type: 'done',
+    runId,
+    status,
+    content: finalContent,
+    assistantMsgId
+  })
 }
 
 function respondConfirm({ requestId, allow, remember }) {
   for (const st of active.values()) {
     if (st.confirms.has(requestId)) {
-      const r = st.confirms.get(requestId)
-      st.confirms.delete(requestId)
-      r({ allow: !!allow, remember: !!remember })
+      const finish = st.confirms.get(requestId)
+      // finish 内部负责 delete + 清理超时定时器，避免重复 resolve
+      if (typeof finish === 'function') finish({ allow: !!allow, remember: !!remember })
       return true
     }
   }
   return false
 }
 
-function stopRun(runId) {
+function stopRun(runId, reason = 'user') {
   const st = active.get(runId)
   if (!st) return false
   st.stopped = true
+  st.stopReason = reason
   st.ac.abort()
-  for (const [, r] of st.confirms) r({ allow: false, remember: false })
+  // 内部中止不得静默（方案四 §5.4）：记录原因与发起者
+  try {
+    const db = dbm.get()
+    // 只有用户取消才直接落 stopped；其余由各自路径处理
+    if (reason === 'user') {
+      repos.updateRunStatus(db, runId, { status: 'stopped', endedAt: Date.now() })
+    }
+    getHub().emit('run.abort_requested', {
+      runId,
+      traceId: st.traceId || null,
+      reason
+    })
+  } catch {
+    // 数据库未就绪时忽略，不影响中止
+  }
+  // 先收集再 resolve：finish 会从 confirms 中删除自身
+  const pending = [...st.confirms.keys()]
+  for (const requestId of pending) {
+    const finish = st.confirms.get(requestId)
+    if (typeof finish === 'function') finish({ allow: false, remember: false })
+  }
   st.confirms.clear()
+  // 通知前端按 runId 清掉僵尸确认卡（含主窗隐藏时积压的请求）
+  if (pending.length) broadcast('agent:confirmCancel', { runId, requestIds: pending })
   return true
 }
 

@@ -140,10 +140,13 @@ function softDeleteKey(db, id) {
 }
 
 function updateKeyStatus(db, id, patch) {
-  const cur = db.prepare('SELECT status, rate_count FROM api_keys WHERE id=?').get(id)
+  const cur = db.prepare('SELECT status, rate_count, last_used_at FROM api_keys WHERE id=?').get(id)
   if (!cur) return
   const status = patch.status ?? cur.status
   const rateCount = patch.rateCount !== undefined ? patch.rateCount : cur.rate_count
+  // lastUsedAt 缺省时保留原值：失败分支不带该字段，若置 NULL 会让
+  // round_robin 的 LRU 排序把「刚失败的 Key」排到最前（(lastUsedAt||0) 最小）。
+  const lastUsedAt = patch.lastUsedAt !== undefined ? patch.lastUsedAt : cur.last_used_at
   db.prepare(
     `UPDATE api_keys SET status=?, cooldown_until=?, rate_count=?, last_used_at=?, last_error=?, updated_at=?
      WHERE id=?`
@@ -151,7 +154,7 @@ function updateKeyStatus(db, id, patch) {
     status,
     patch.cooldownUntil ?? null,
     rateCount,
-    patch.lastUsedAt ?? null,
+    lastUsedAt ?? null,
     patch.lastError ?? null,
     now(),
     id
@@ -240,6 +243,7 @@ function listConversations(db) {
     .prepare(
       `SELECT id, title, pinned, provider_id AS providerId, model, system_prompt AS systemPrompt,
        context_policy AS contextPolicy, project_id AS projectId,
+       origin, parent_id AS parentId, created_by_run AS createdByRun,
        created_at AS createdAt, updated_at AS updatedAt
        FROM conversations WHERE deleted_at IS NULL
        ORDER BY pinned DESC, updated_at DESC`
@@ -252,6 +256,7 @@ function getConversation(db, id) {
     .prepare(
       `SELECT id, title, pinned, provider_id AS providerId, model, system_prompt AS systemPrompt,
        context_policy AS contextPolicy, project_id AS projectId,
+       origin, parent_id AS parentId, created_by_run AS createdByRun,
        created_at AS createdAt, updated_at AS updatedAt
        FROM conversations WHERE id = ? AND deleted_at IS NULL`
     )
@@ -263,7 +268,8 @@ function createConversation(db, opts = {}) {
   const id = opts.id || uid()
   db.prepare(
     `INSERT INTO conversations(id, title, pinned, provider_id, model, system_prompt, context_policy,
-     project_id, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`
+     project_id, origin, parent_id, created_by_run, created_at, updated_at)
+     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     id,
     opts.title || '新会话',
@@ -273,6 +279,10 @@ function createConversation(db, opts = {}) {
     opts.systemPrompt || null,
     opts.contextPolicy ? JSON.stringify(opts.contextPolicy) : '{}',
     opts.projectId || null,
+    // 人工创建的会话 origin=user；Agent 通过 session_create 创建时传 origin=agent
+    opts.origin === 'agent' ? 'agent' : 'user',
+    opts.parentId || null,
+    opts.createdByRun || null,
     t,
     t
   )
@@ -297,6 +307,34 @@ function updateConversation(db, id, patch) {
     id
   )
   return getConversation(db, id)
+}
+
+// Agent 创建的子会话：按父会话或创建者运行回溯
+function listChildConversations(db, parentId) {
+  return db
+    .prepare(
+      `SELECT id, title, pinned, provider_id AS providerId, model, system_prompt AS systemPrompt,
+       context_policy AS contextPolicy, project_id AS projectId,
+       origin, parent_id AS parentId, created_by_run AS createdByRun,
+       created_at AS createdAt, updated_at AS updatedAt
+       FROM conversations WHERE deleted_at IS NULL AND parent_id = ?
+       ORDER BY created_at ASC`
+    )
+    .all(parentId)
+}
+
+function listAgentConversations(db, runId) {
+  const rows = db
+    .prepare(
+      `SELECT id, title, pinned, provider_id AS providerId, model, system_prompt AS systemPrompt,
+       context_policy AS contextPolicy, project_id AS projectId,
+       origin, parent_id AS parentId, created_by_run AS createdByRun,
+       created_at AS createdAt, updated_at AS updatedAt
+       FROM conversations WHERE deleted_at IS NULL AND origin = 'agent'
+       ORDER BY created_at DESC`
+    )
+    .all()
+  return runId ? rows.filter((r) => r.createdByRun === runId) : rows
 }
 
 function touchConversation(db, id) {
@@ -590,22 +628,164 @@ function getKbStats(db, kbId) {
 }
 
 // ---------- agent ----------
-function createRun(db, { conversationId, goal, maxSteps }) {
+// Run 状态机（方案四 §5.1）：终态不可逆；重试必须创建新 Run，不得原地重启。
+const RUN_TERMINAL = ['done', 'stopped', 'error', 'max_steps', 'transferred']
+const RUN_ACTIVE = ['queued', 'running', 'waiting_child']
+// 允许的来源状态；未列出的转换一律拒绝。只约束本产品写库，不假设任务必经每个中间态。
+const RUN_NEXT = {
+  queued: ['running', 'stopped', 'error'],
+  running: ['waiting_child', 'done', 'stopped', 'error', 'max_steps', 'transferred'],
+  waiting_child: ['running', 'stopped', 'error']
+}
+
+const RUN_COLUMNS = `id, conversation_id AS conversationId, goal, status,
+  max_steps AS maxSteps, steps_used AS stepsUsed, started_at AS startedAt, ended_at AS endedAt,
+  parent_run_id AS parentRunId, control_mode AS controlMode, mandate_json AS mandateJson,
+  acceptance_policy AS acceptancePolicy, acceptance_status AS acceptanceStatus,
+  acceptance_result AS acceptanceResult, trace_id AS traceId,
+  idempotency_key AS idempotencyKey, version`
+
+function isRunTerminal(status) {
+  return RUN_TERMINAL.includes(status)
+}
+
+function getRun(db, id) {
+  return db.prepare(`SELECT ${RUN_COLUMNS} FROM agent_runs WHERE id = ?`).get(id)
+}
+
+// 创建 Run。根 Run：parentRunId/controlMode 为空。子 Run：必须成对给出。
+// idempotencyKey 相同则返回既有 Run，不重复创建（方案四 §6.3）。
+function createRun(db, opts = {}) {
+  const {
+    conversationId,
+    goal,
+    maxSteps,
+    parentRunId = null,
+    controlMode = null,
+    mandate = null,
+    acceptancePolicy = null,
+    traceId = null,
+    idempotencyKey = null,
+    status = 'running'
+  } = opts
+
+  if (!!parentRunId !== !!controlMode) {
+    throw new Error('parentRunId 与 controlMode 必须同时提供或同时为空')
+  }
+  if (controlMode && !['delegated', 'transferred'].includes(controlMode)) {
+    throw new Error(`非法的 controlMode: ${controlMode}`)
+  }
+  if (idempotencyKey) {
+    const existing = db
+      .prepare('SELECT id FROM agent_runs WHERE idempotency_key = ?')
+      .get(idempotencyKey)
+    // 幂等命中：直接返回既有 Run id，调用方无需区分（方案四 §6.3）
+    if (existing) return existing.id
+  }
+
   const id = uid()
   db.prepare(
-    `INSERT INTO agent_runs(id, conversation_id, goal, status, max_steps, started_at)
-     VALUES(?,?,?, 'running', ?, ?)`
-  ).run(id, conversationId || null, goal, maxSteps || 15, now())
+    `INSERT INTO agent_runs(id, conversation_id, goal, status, max_steps, steps_used,
+      started_at, parent_run_id, control_mode, mandate_json, acceptance_policy,
+      trace_id, idempotency_key, version)
+     VALUES(?,?,?,?,?,0,?,?,?,?,?,?,?,1)`
+  ).run(
+    id,
+    conversationId || null,
+    goal,
+    status,
+    maxSteps || 15,
+    now(),
+    parentRunId,
+    controlMode,
+    mandate ? JSON.stringify(mandate) : null,
+    acceptancePolicy ? JSON.stringify(acceptancePolicy) : null,
+    traceId,
+    idempotencyKey
+  )
   return id
 }
 
+// 需要知道是否命中幂等的调用方使用此版本
+function createRunEx(db, opts = {}) {
+  const before = opts.idempotencyKey
+    ? db.prepare('SELECT id FROM agent_runs WHERE idempotency_key = ?').get(opts.idempotencyKey)
+    : null
+  const id = createRun(db, opts)
+  return { id, reused: !!(before && before.id === id) }
+}
+
+// 原子状态更新：带版本号 CAS + 来源状态白名单。
+// 返回 { ok, run } —— ok=false 表示版本冲突/状态不允许，调用方不得覆盖。
+function updateRunStatus(db, id, patch = {}) {
+  const cur = getRun(db, id)
+  if (!cur) return { ok: false, reason: 'not_found' }
+  const next = patch.status
+  if (!next) throw new Error('updateRunStatus 需要 status')
+
+  if (isRunTerminal(cur.status)) {
+    return { ok: false, reason: 'already_terminal', run: cur }
+  }
+  const allowed = RUN_NEXT[cur.status]
+  if (!allowed || !allowed.includes(next)) {
+    return { ok: false, reason: `illegal_transition:${cur.status}->${next}`, run: cur }
+  }
+
+  const expected = patch.expectedVersion ?? cur.version
+  const info = db
+    .prepare(
+      `UPDATE agent_runs SET status=?, steps_used=?, ended_at=?, acceptance_status=COALESCE(?, acceptance_status),
+       acceptance_result=COALESCE(?, acceptance_result), version=version+1
+       WHERE id=? AND version=? AND status=?`
+    )
+    .run(
+      next,
+      patch.stepsUsed ?? cur.stepsUsed ?? 0,
+      patch.endedAt ?? (isRunTerminal(next) ? now() : null),
+      patch.acceptanceStatus ?? null,
+      patch.acceptanceResult ? JSON.stringify(patch.acceptanceResult) : null,
+      id,
+      expected,
+      cur.status
+    )
+  if (!info.changes) return { ok: false, reason: 'version_conflict', run: getRun(db, id) }
+  return { ok: true, run: getRun(db, id) }
+}
+
+// 兼容旧调用点：终止类状态走 CAS，失败只记录不抛（旧代码期望 void）。
 function updateRun(db, id, patch) {
-  db.prepare('UPDATE agent_runs SET status=?, steps_used=?, ended_at=? WHERE id=?').run(
-    patch.status,
+  if (patch.status) {
+    const r = updateRunStatus(db, id, patch)
+    if (!r.ok) {
+      // 不静默：把被拒绝的写入打到 stderr，供审计排查
+      console.error('MINIAGENT_RUN_UPDATE_REJECTED', id, r.reason)
+    }
+    return r.ok
+  }
+  // 仅更新 stepsUsed 等非状态字段时保持原行为
+  db.prepare('UPDATE agent_runs SET steps_used=?, ended_at=?, version=version+1 WHERE id=?').run(
     patch.stepsUsed ?? 0,
     patch.endedAt ?? null,
     id
   )
+  return true
+}
+
+// 列出某父 Run 的活动子 Run（用于"同时最多一个活动子 Run"约束）
+function listActiveChildRuns(db, parentRunId) {
+  const marks = RUN_ACTIVE.map(() => '?').join(',')
+  return db
+    .prepare(
+      `SELECT ${RUN_COLUMNS} FROM agent_runs
+       WHERE parent_run_id = ? AND status IN (${marks})`
+    )
+    .all(parentRunId, ...RUN_ACTIVE)
+}
+
+function listChildRuns(db, parentRunId) {
+  return db
+    .prepare(`SELECT ${RUN_COLUMNS} FROM agent_runs WHERE parent_run_id = ? ORDER BY started_at`)
+    .all(parentRunId)
 }
 
 function logToolCall(
@@ -671,6 +851,8 @@ module.exports = {
   listConversations,
   getConversation,
   createConversation,
+  listChildConversations,
+  listAgentConversations,
   updateConversation,
   touchConversation,
   softDeleteConversation,
@@ -699,7 +881,15 @@ module.exports = {
   getChunkTexts,
   getKbStats,
   createRun,
+  createRunEx,
   updateRun,
+  updateRunStatus,
+  getRun,
+  listActiveChildRuns,
+  listChildRuns,
+  isRunTerminal,
+  RUN_TERMINAL,
+  RUN_ACTIVE,
   logToolCall,
   listRuns,
   getRunCalls

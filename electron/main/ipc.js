@@ -16,6 +16,9 @@ const exporter = require('./exporter')
 const windows = require('./windows')
 const { broadcast } = require('./notify')
 const scheduler = require('./gateway/scheduler')
+const sessionsApi = require('./agent/sessions')
+const { getHub } = require('./events/hub')
+const { parseHooks, runHooks, STAGES, ACTIONS } = require('./events/hooks')
 
 function safeParse(s, d) {
   try {
@@ -356,6 +359,36 @@ function registerIpc(ctx) {
   h('agent:respond', (o) => agent.respondConfirm(o))
   h('agent:runs', () => repos.listRuns(dbm.get(), 50))
   h('agent:calls', (runId) => repos.getRunCalls(dbm.get(), runId))
+
+  // 会话管理：Agent 创建的子会话（供界面查看与外部驱动）
+  h('sessions:status', (conversationId) => sessionsApi.getSessionStatus({ conversationId }))
+  h('sessions:list', (o) => sessionsApi.listSessions(o || {}))
+  h('sessions:result', (o) => sessionsApi.getSessionResult(o || {}))
+  h('sessions:send', (o) => sessionsApi.sendToSession(o || {}))
+  h('sessions:wait', (o) => sessionsApi.waitForSession(o || {}))
+
+  // 事件中枢：游标轮询（前端断线/切窗后按 seq 补齐）与近期回看
+  h('events:since', (o) => getHub().since((o && o.cursor) || 0, { limit: (o && o.limit) || 200 }))
+  h('events:recent', (o) => getHub().recent(o || {}))
+  h('events:stats', () => ({
+    seq: getHub().seq,
+    size: getHub().size,
+    listeners: getHub().listenerCount()
+  }))
+
+  // 生命周期钩子：读取元信息 + 保存（保存前做结构与阶段校验）
+  h('hooks:meta', () => ({ stages: STAGES, actions: ACTIONS }))
+  h('hooks:list', () => parseHooks(repos.getSetting(dbm.get(), 'agentHooks')))
+  h('hooks:save', (list) => {
+    const parsed = parseHooks(list)
+    repos.setSetting(dbm.get(), 'agentHooks', JSON.stringify(parsed))
+    return parsed
+  })
+  // 试运行：不产生副作用，只回报哪些规则会命中
+  h('hooks:dryRun', ({ stage, ctx }) => {
+    const rules = parseHooks(repos.getSetting(dbm.get(), 'agentHooks'))
+    return runHooks(rules, String(stage || ''), ctx || {})
+  })
 
   // sys
   h('sys:clipboardRead', () => clipboard.readText())

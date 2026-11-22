@@ -8,10 +8,10 @@ beforeEach(() => {
 })
 
 describe('schema + settings', () => {
-  it('migrates to v3 and roundtrips settings', () => {
+  it('migrates to v5 and roundtrips settings', () => {
     const row = dbm.get().prepare('PRAGMA user_version').get()
     expect(row.user_version).toBe(dbm.SCHEMA_VERSION)
-    expect(dbm.SCHEMA_VERSION).toBe(3)
+    expect(dbm.SCHEMA_VERSION).toBe(5)
     repos.setSetting(dbm.get(), 'theme', 'dark')
     repos.setSetting(dbm.get(), 'agentAuthorizedDirs', ['C:\\a', 'C:\\b'])
     expect(repos.getSetting(dbm.get(), 'theme')).toBe('dark')
@@ -47,9 +47,92 @@ describe('providers + keys', () => {
     expect(full.secret_enc).toBe('plain:abc')
     repos.logKeyEvent(db, { apiKeyId: kid, kind: 'probe', result: 'ok', detail: '120ms' })
     expect(repos.listKeyEvents(db)[0].result).toBe('ok')
+    expect(repos.listProviderKeys).toBeUndefined()
     repos.softDeleteProvider(db, pid)
     expect(repos.listProviders(db)).toHaveLength(0)
     expect(repos.listKeys(db, pid)).toHaveLength(0)
+  })
+
+  it('updateKeyStatus 缺省 lastUsedAt 时保留原值（round_robin 不被失败 Key 抢占）', () => {
+    const db = dbm.get()
+    const pid = repos.saveProvider(db, { name: 'P', baseUrl: 'https://x/v1' })
+    const kid = repos.addKey(db, { providerId: pid, label: 'k', secretEnc: 'plain:x' })
+    repos.updateKeyStatus(db, kid, { status: 'ok', lastUsedAt: 999 })
+    expect(repos.getKeyWithSecret(db, kid).last_used_at).toBe(999)
+    // 失败分支只带状态与错误，不带 lastUsedAt
+    repos.updateKeyStatus(db, kid, { status: 'cooldown', lastError: '429', cooldownUntil: 1 })
+    expect(repos.getKeyWithSecret(db, kid).last_used_at).toBe(999)
+    // 显式传值仍然生效
+    repos.updateKeyStatus(db, kid, { status: 'ok', lastUsedAt: 1234 })
+    expect(repos.getKeyWithSecret(db, kid).last_used_at).toBe(1234)
+  })
+})
+
+describe('会话来源（v4 迁移）', () => {
+  it('人工会话默认 origin=user，且不携带父会话', () => {
+    const db = dbm.get()
+    const c = repos.createConversation(db, { title: '人工' })
+    expect(c.origin).toBe('user')
+    expect(c.parentId).toBeNull()
+    expect(c.createdByRun).toBeNull()
+  })
+
+  it('Agent 创建的子会话记录 origin/parentId/createdByRun', () => {
+    const db = dbm.get()
+    const parent = repos.createConversation(db, { title: '父' })
+    const child = repos.createConversation(db, {
+      title: '子',
+      origin: 'agent',
+      parentId: parent.id,
+      createdByRun: 'run-9'
+    })
+    expect(child).toMatchObject({ origin: 'agent', parentId: parent.id, createdByRun: 'run-9' })
+    // 读回路径也要带上新字段（listConversations 与 getConversation）
+    const listed = repos.listConversations(db).find((c) => c.id === child.id)
+    expect(listed.origin).toBe('agent')
+    expect(listed.parentId).toBe(parent.id)
+  })
+
+  it('listChildConversations / listAgentConversations 按来源过滤', () => {
+    const db = dbm.get()
+    const parent = repos.createConversation(db, { title: '父' })
+    const a = repos.createConversation(db, {
+      title: 'A',
+      origin: 'agent',
+      parentId: parent.id,
+      createdByRun: 'r1'
+    })
+    const b = repos.createConversation(db, {
+      title: 'B',
+      origin: 'agent',
+      parentId: parent.id,
+      createdByRun: 'r2'
+    })
+    expect(
+      repos
+        .listChildConversations(db, parent.id)
+        .map((c) => c.id)
+        .sort()
+    ).toEqual([a.id, b.id].sort())
+    expect(repos.listAgentConversations(db, 'r1').map((c) => c.id)).toEqual([a.id])
+    expect(
+      repos
+        .listAgentConversations(db)
+        .map((c) => c.id)
+        .sort()
+    ).toEqual([a.id, b.id].sort())
+  })
+
+  it('软删的子会话不出现在子会话列表', () => {
+    const db = dbm.get()
+    const parent = repos.createConversation(db, { title: '父' })
+    const child = repos.createConversation(db, {
+      title: '子',
+      origin: 'agent',
+      parentId: parent.id
+    })
+    repos.softDeleteConversation(db, child.id)
+    expect(repos.listChildConversations(db, parent.id)).toHaveLength(0)
   })
 })
 
@@ -191,5 +274,26 @@ describe('agent runs', () => {
     const calls = repos.getRunCalls(db, runId)
     expect(calls).toHaveLength(1)
     expect(JSON.parse(calls[0].args).path).toBe('C:\\x')
+  })
+
+  it('启动时回收僵尸 running 运行记录', () => {
+    const os = require('os')
+    const fs = require('fs')
+    const path = require('path')
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'miniagent-'))
+    const file = path.join(dir, 'zombie.db')
+    dbm.close()
+    dbm.open(file)
+    const runId = repos.createRun(dbm.get(), { goal: '异常退出', maxSteps: 5 })
+    expect(repos.listRuns(dbm.get())[0].status).toBe('running')
+    // 模拟进程被强杀后重新启动：同一份文件重新打开应把 running 收敛为 stopped
+    dbm.close()
+    dbm.open(file)
+    const after = repos.listRuns(dbm.get()).find((r) => r.id === runId)
+    expect(after.status).toBe('stopped')
+    expect(after.ended_at).toBeGreaterThan(0)
+    dbm.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+    dbm.open(':memory:')
   })
 })

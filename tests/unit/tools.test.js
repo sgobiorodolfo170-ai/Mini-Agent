@@ -40,7 +40,23 @@ beforeAll(() => {
       dead: { command: 'definitely-not-exist-cmd-xyz', args: [] }
     },
     tavilyKey: '',
-    webSearchProvider: 'auto'
+    webSearchProvider: 'auto',
+    // 会话管理：这里用最小替身，验证工具层的参数归一与委派，真实行为由 agent-sessions 覆盖
+    createSession: async ({ title, goal }) => ({
+      id: 'c-new',
+      title: title || goal,
+      parentId: 'c-parent',
+      origin: 'agent'
+    }),
+    sendToSession: async ({ conversationId, content, mode }) => ({
+      conversationId,
+      mode,
+      msg: content
+    }),
+    getSessionStatus: ({ conversationId }) => ({ conversationId, status: 'done' }),
+    waitForSession: ({ conversationId }) => ({ conversationId, status: 'done', timedOut: false }),
+    getSessionResult: ({ conversationId }) => ({ conversationId, content: '结果正文' }),
+    listSessions: () => [{ conversationId: 'c1', status: 'running' }]
   }
   map = Object.fromEntries(defineTools(ctx).map((t) => [t.name, t]))
 })
@@ -357,4 +373,64 @@ else if(m.method==='tools/call')send(m.id,{content:[{type:'text',text:'pong'}]})
   it('surfaces spawn failures as tool errors', async () => {
     await expect(map.mcp_list_tools.handler({ server: 'dead' })).rejects.toThrow(/MCP/)
   }, 20000)
+})
+
+describe('会话管理工具（session_*）', () => {
+  it('session_create 创建子会话并回传 id', async () => {
+    const r = JSON.parse(await map.session_create.handler({ title: '子任务' }))
+    expect(r).toEqual({
+      conversationId: 'c-new',
+      title: '子任务',
+      parentId: 'c-parent',
+      origin: 'agent'
+    })
+  })
+
+  it('session_send 默认按 chat，显式 agent 时透传 mode', async () => {
+    const a = JSON.parse(await map.session_send.handler({ conversationId: 'c1', content: '你好' }))
+    expect(a.mode).toBe('chat')
+    const b = JSON.parse(
+      await map.session_send.handler({ conversationId: 'c1', content: '干活', mode: 'agent' })
+    )
+    expect(b.mode).toBe('agent')
+  })
+
+  it('session_status / session_wait / session_result / session_list 走只读路径', async () => {
+    expect(JSON.parse(await map.session_status.handler({ conversationId: 'c1' })).status).toBe(
+      'done'
+    )
+    expect(JSON.parse(await map.session_wait.handler({ conversationId: 'c1' })).timedOut).toBe(
+      false
+    )
+    expect(JSON.parse(await map.session_result.handler({ conversationId: 'c1' })).content).toBe(
+      '结果正文'
+    )
+    const list = JSON.parse(await map.session_list.handler({}))
+    expect(Array.isArray(list)).toBe(true)
+    expect(list[0].conversationId).toBe('c1')
+  })
+
+  it('会话管理未注入时给出明确错误，而不是静默失败', async () => {
+    const bare = Object.fromEntries(
+      defineTools({ todo: { seq: 0, items: [] } }).map((t) => [t.name, t])
+    )
+    await expect(bare.session_create.handler({ title: 'x' })).rejects.toThrow('会话管理未启用')
+    await expect(bare.session_send.handler({ conversationId: 'c', content: 'x' })).rejects.toThrow(
+      '会话管理未启用'
+    )
+    await expect(bare.session_status.handler({ conversationId: 'c' })).rejects.toThrow(
+      '会话管理未启用'
+    )
+  })
+
+  it('会话类工具不低于只读风险等级（写操作需确认）', () => {
+    const w = defineTools(ctx)
+    const byName = Object.fromEntries(w.map((t) => [t.name, t]))
+    expect(byName.session_create.risk).toBe('side_effect')
+    expect(byName.session_send.risk).toBe('side_effect')
+    expect(byName.session_status.risk).toBe('readonly')
+    expect(byName.session_result.risk).toBe('readonly')
+    expect(byName.session_list.risk).toBe('readonly')
+    expect(byName.session_wait.risk).toBe('readonly')
+  })
 })

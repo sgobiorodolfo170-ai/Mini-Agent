@@ -1,7 +1,7 @@
 const fs = require('fs')
 const path = require('path')
 
-const SCHEMA_VERSION = 3
+const SCHEMA_VERSION = 5
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS settings (
@@ -62,6 +62,9 @@ CREATE TABLE IF NOT EXISTS conversations (
   system_prompt TEXT,
   context_policy TEXT NOT NULL DEFAULT '{}',
   project_id TEXT,
+  origin TEXT NOT NULL DEFAULT 'user',
+  parent_id TEXT,
+  created_by_run TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   deleted_at INTEGER
@@ -173,6 +176,55 @@ function migrate(db) {
     if (!columnExists(db, 'conversations', 'project_id')) {
       db.exec('ALTER TABLE conversations ADD COLUMN project_id TEXT')
     }
+    // v3 → v4:Agent 会话管理。origin 区分人工会话(user)与 Agent 创建的子会话(agent)，
+    // parent_id / created_by_run 记录派生关系，便于按运行回溯与级联查看。
+    if (!columnExists(db, 'conversations', 'origin')) {
+      db.exec("ALTER TABLE conversations ADD COLUMN origin TEXT NOT NULL DEFAULT 'user'")
+    }
+    if (!columnExists(db, 'conversations', 'parent_id')) {
+      db.exec('ALTER TABLE conversations ADD COLUMN parent_id TEXT')
+    }
+    if (!columnExists(db, 'conversations', 'created_by_run')) {
+      db.exec('ALTER TABLE conversations ADD COLUMN created_by_run TEXT')
+    }
+    db.exec('CREATE INDEX IF NOT EXISTS idx_conv_parent ON conversations(parent_id)')
+    // v4 → v5:任务级关系模型（方案四）。关系/授权/验收/追踪归属于一次 Run，
+    // conversations 只保留上下文与展示用的 parent_id，不承担任务控制语义。
+    if (!columnExists(db, 'agent_runs', 'parent_run_id')) {
+      db.exec('ALTER TABLE agent_runs ADD COLUMN parent_run_id TEXT')
+    }
+    if (!columnExists(db, 'agent_runs', 'control_mode')) {
+      db.exec('ALTER TABLE agent_runs ADD COLUMN control_mode TEXT')
+    }
+    if (!columnExists(db, 'agent_runs', 'mandate_json')) {
+      db.exec('ALTER TABLE agent_runs ADD COLUMN mandate_json TEXT')
+    }
+    if (!columnExists(db, 'agent_runs', 'acceptance_policy')) {
+      db.exec('ALTER TABLE agent_runs ADD COLUMN acceptance_policy TEXT')
+    }
+    if (!columnExists(db, 'agent_runs', 'acceptance_status')) {
+      db.exec(
+        "ALTER TABLE agent_runs ADD COLUMN acceptance_status TEXT NOT NULL DEFAULT 'not_required'"
+      )
+    }
+    if (!columnExists(db, 'agent_runs', 'acceptance_result')) {
+      db.exec('ALTER TABLE agent_runs ADD COLUMN acceptance_result TEXT')
+    }
+    if (!columnExists(db, 'agent_runs', 'trace_id')) {
+      db.exec('ALTER TABLE agent_runs ADD COLUMN trace_id TEXT')
+    }
+    if (!columnExists(db, 'agent_runs', 'idempotency_key')) {
+      db.exec('ALTER TABLE agent_runs ADD COLUMN idempotency_key TEXT')
+    }
+    if (!columnExists(db, 'agent_runs', 'version')) {
+      db.exec('ALTER TABLE agent_runs ADD COLUMN version INTEGER NOT NULL DEFAULT 1')
+    }
+    db.exec('CREATE INDEX IF NOT EXISTS idx_agent_runs_parent_run_id ON agent_runs(parent_run_id)')
+    db.exec('CREATE INDEX IF NOT EXISTS idx_agent_runs_trace_id ON agent_runs(trace_id)')
+    // 幂等键唯一：同一 key 最多对应一个 Run（NULL 不受约束）
+    db.exec(
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_runs_idempotency_key ON agent_runs(idempotency_key) WHERE idempotency_key IS NOT NULL'
+    )
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
   }
 }
@@ -192,6 +244,11 @@ function open(dbPath) {
   // the app is starting fresh, no stream can still be attached to it (the
   // done update is lost when the process dies mid-stream). Mark them stopped.
   db.prepare("UPDATE messages SET status = 'stopped' WHERE status = 'streaming'").run()
+  // 同理回收运行记录：异常退出后 agent_runs 会永久停在 running，
+  // 列表会一直显示「执行中」而停止按钮实际无效。
+  db.prepare(
+    "UPDATE agent_runs SET status = 'stopped', ended_at = COALESCE(ended_at, ?) WHERE status = 'running'"
+  ).run(Date.now())
   globalThis.__miniagentDB = db
   globalThis.__miniagentDBInfo = { path: dbPath, driver: 'node:sqlite' }
   return db

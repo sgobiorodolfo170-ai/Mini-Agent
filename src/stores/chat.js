@@ -127,22 +127,27 @@ export const useChatStore = defineStore('chat', {
       else this.messages.push(m)
     },
     handleEvent(ev) {
+      // 事件按会话分流：broadcast 会推给所有窗口，非当前会话的高频事件
+      // （尤其逐 token 的 delta）必须在入口丢弃，否则每个 token 都要拉一次会话列表。
+      const evConv = ev.conversationId || null
       if (ev.type === 'snapshot') {
-        if (ev.conversationId === this.activeId) {
+        if (evConv === this.activeId) {
           for (const m of ev.messages || []) this.upsert(m)
         }
         this.loadConversations()
         return
       }
       if (ev.type === 'messageDeleted') {
-        if (!ev.conversationId || ev.conversationId === this.activeId) {
+        if (!evConv || evConv === this.activeId) {
           this.messages = this.messages.filter((m) => m.id !== ev.msgId)
         }
         return
       }
+      if (evConv && evConv !== this.activeId) return
       const m = this.messages.find((x) => x.id === ev.msgId)
       if (!m) {
-        this.loadConversations()
+        // 只对终态事件兜底刷新；delta 丢一条不值得触发整表查询
+        if (ev.type !== 'delta') this.loadConversations()
         return
       }
       if (ev.type === 'delta') {

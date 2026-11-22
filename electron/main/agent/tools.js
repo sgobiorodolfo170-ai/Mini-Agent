@@ -373,6 +373,141 @@ function defineTools(ctx) {
       }
     },
     {
+      name: 'session_create',
+      risk: 'side_effect',
+      description:
+        '创建一个新的子会话（独立上下文）。返回 conversationId，后续用 session_send 发送提示词、session_status/session_wait 查状态、session_result 取结果',
+      parameters: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', description: '会话标题（简短，便于识别）' },
+          goal: { type: 'string', description: '该会话要完成的目标（作为标题兜底）' },
+          projectId: { type: 'string', description: '可选：归入某个项目，继承其工作目录' }
+        },
+        required: ['title']
+      },
+      handler: async ({ title, goal, projectId }) => {
+        if (typeof ctx.createSession !== 'function') throw new Error('会话管理未启用')
+        const conv = await ctx.createSession({ title, goal, projectId })
+        return JSON.stringify({
+          conversationId: conv.id,
+          title: conv.title,
+          parentId: conv.parentId,
+          origin: conv.origin
+        })
+      }
+    },
+    {
+      name: 'session_send',
+      risk: 'side_effect',
+      description:
+        '向指定会话发送提示词。mode=chat 按普通对话回答，mode=agent 以任务模式执行（可再调用工具）。同一会话不允许并发发送。controlMode 仅任务模式有效：delegated=派活儿等结果（默认），transferred=把任务整个交出去、自己不再继续',
+      parameters: {
+        type: 'object',
+        properties: {
+          conversationId: { type: 'string', description: '目标会话 id' },
+          content: { type: 'string', description: '提示词/任务目标' },
+          mode: { type: 'string', enum: ['chat', 'agent'], description: '默认 chat' },
+          controlMode: {
+            type: 'string',
+            enum: ['delegated', 'transferred'],
+            description: '任务关系：delegated 委派（默认）/ transferred 移交'
+          },
+          acceptanceCriteria: {
+            type: 'string',
+            description: '可选：验收标准，写给不做这件事的人也能照着验'
+          }
+        },
+        required: ['conversationId', 'content']
+      },
+      handler: async ({ conversationId, content, mode, controlMode, acceptanceCriteria }) => {
+        if (typeof ctx.sendToSession !== 'function') throw new Error('会话管理未启用')
+        if (controlMode && !['delegated', 'transferred'].includes(controlMode)) {
+          throw new Error(`非法的 controlMode: ${controlMode}（仅支持 delegated / transferred）`)
+        }
+        const r = await ctx.sendToSession({
+          conversationId,
+          content,
+          mode: mode === 'agent' ? 'agent' : 'chat',
+          controlMode: controlMode || 'delegated',
+          acceptancePolicy: acceptanceCriteria
+            ? {
+                schemaVersion: 1,
+                criteria: String(acceptanceCriteria).slice(0, 1000),
+                judge: 'parent',
+                onTimeout: 'escalate'
+              }
+            : null
+        })
+        return JSON.stringify(r)
+      }
+    },
+    {
+      name: 'session_status',
+      risk: 'readonly',
+      description: '查看会话当前状态（run 状态、步数、消息数、最后一条回复摘要）',
+      parameters: {
+        type: 'object',
+        properties: { conversationId: { type: 'string', description: '目标会话 id' } },
+        required: ['conversationId']
+      },
+      handler: async ({ conversationId }) => {
+        if (typeof ctx.getSessionStatus !== 'function') throw new Error('会话管理未启用')
+        return JSON.stringify(ctx.getSessionStatus({ conversationId }))
+      }
+    },
+    {
+      name: 'session_wait',
+      risk: 'readonly',
+      description:
+        '轮询等待会话进入终态（done/stopped/error），默认最多等 60 秒，超时返回当前状态而不报错',
+      parameters: {
+        type: 'object',
+        properties: {
+          conversationId: { type: 'string', description: '目标会话 id' },
+          timeoutMs: { type: 'number', description: '最长等待毫秒数，上限 300000' }
+        },
+        required: ['conversationId']
+      },
+      handler: async ({ conversationId, timeoutMs }) => {
+        if (typeof ctx.waitForSession !== 'function') throw new Error('会话管理未启用')
+        return JSON.stringify(ctx.waitForSession({ conversationId, timeoutMs }))
+      }
+    },
+    {
+      name: 'session_result',
+      risk: 'readonly',
+      description: '取会话的最终结果：助手回答正文 + 最近的工具调用摘要',
+      parameters: {
+        type: 'object',
+        properties: {
+          conversationId: { type: 'string', description: '目标会话 id' },
+          maxChars: { type: 'number', description: '正文最大字符数，默认 8000' }
+        },
+        required: ['conversationId']
+      },
+      handler: async ({ conversationId, maxChars }) => {
+        if (typeof ctx.getSessionResult !== 'function') throw new Error('会话管理未启用')
+        return JSON.stringify(ctx.getSessionResult({ conversationId, maxChars }))
+      }
+    },
+    {
+      name: 'session_list',
+      risk: 'readonly',
+      description: '列出 Agent 创建的子会话（可按父会话或本运行过滤），用于总览并行任务进度',
+      parameters: {
+        type: 'object',
+        properties: {
+          parentId: { type: 'string', description: '可选：只看该父会话派生的子会话' },
+          limit: { type: 'number', description: '最多返回条数，默认 20' }
+        }
+      },
+      handler: async ({ parentId, limit }) => {
+        if (typeof ctx.listSessions !== 'function') throw new Error('会话管理未启用')
+        return JSON.stringify(ctx.listSessions({ parentId, limit }) || [])
+      }
+    },
+    {
       name: 'spawn_agent',
       risk: 'side_effect',
       description:

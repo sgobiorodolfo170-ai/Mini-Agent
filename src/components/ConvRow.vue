@@ -50,6 +50,15 @@ function onKeydown(e) {
     </template>
     <template v-else>
       <span class="flex-1 truncate" :title="conv.title">{{ conv.title }}</span>
+      <!-- Agent 创建的子会话：来源常驻可见，点击即可查看其消息与运行记录 -->
+      <span
+        v-if="conv.origin === 'agent'"
+        class="badge shrink-0 !px-1.5 !py-0 text-[10px]"
+        title="由 Agent 创建的子会话"
+        data-testid="conv-agent-badge"
+      >
+        子会话
+      </span>
       <span v-if="conv.pinned" title="已置顶" class="text-brand-ink shrink-0">
         <UiIcon name="pin" :size="14" />
       </span>

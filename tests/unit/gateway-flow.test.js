@@ -222,6 +222,110 @@ describe('sendChat 全链路', () => {
     expect(bodies[1].top_p).toBe(0.9)
   })
 
+  it('流式完成后 active 被清理，stopChat 不再误报成功', async () => {
+    const { convId } = seed()
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      sseRes(['data: {"choices":[{"delta":{"content":"完成"}}]}\n\n', 'data: [DONE]\n\n'])
+    )
+    const r = await gateway.sendChat({ conversationId: convId, content: '问题' })
+    expect(await waitFor(() => doneOf(r.assistantMsgId))).toBe(true)
+    expect(gateway.stopChat(r.assistantMsgId)).toBe(false)
+  })
+
+  it('流式期间写入检查点，重载后不会丢失已生成内容', async () => {
+    const { convId } = seed()
+    let release
+    const gate = new Promise((r) => (release = r))
+    // 增量长度超过 CHECKPOINT_CHARS(2048)，触发一次强制检查点，无需等待节流窗口
+    const big = 'x'.repeat(3000)
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => ({
+      ok: true,
+      status: 200,
+      body: (async function* () {
+        yield Buffer.from(`data: {"choices":[{"delta":{"content":"${big}"}}]}\n\n`)
+        await gate
+        yield Buffer.from('data: [DONE]\n\n')
+      })()
+    }))
+    const r = await gateway.sendChat({ conversationId: convId, content: '问题' })
+    expect(await waitFor(() => events.some((e) => e.p.type === 'delta'))).toBe(true)
+    // 流尚未结束时，DB 里已能看到检查点内容
+    const mid = repos.getMessage(dbm.get(), r.assistantMsgId)
+    expect(mid.status).toBe('streaming')
+    expect(mid.content.length).toBe(3000)
+    release()
+    expect(await waitFor(() => doneOf(r.assistantMsgId))).toBe(true)
+  })
+
+  it('regenerate 会中止旧流，旧流不再广播过期 done', async () => {
+    const { convId } = seed()
+    let calls = 0
+    let releaseFirst
+    const firstGate = new Promise((r) => (releaseFirst = r))
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      calls++
+      if (calls === 1) {
+        return {
+          ok: true,
+          status: 200,
+          body: (async function* () {
+            yield Buffer.from('data: {"choices":[{"delta":{"content":"旧"}}]}\n\n')
+            await firstGate
+            yield Buffer.from('data: [DONE]\n\n')
+          })()
+        }
+      }
+      return sseRes(['data: {"choices":[{"delta":{"content":"新"}}]}\n\n', 'data: [DONE]\n\n'])
+    })
+    const r1 = await gateway.sendChat({ conversationId: convId, content: '问题' })
+    await waitFor(() => events.some((e) => e.p.type === 'delta' && e.p.msgId === r1.assistantMsgId))
+    const r2 = await gateway.regenerate(convId)
+    expect(await waitFor(() => doneOf(r2.assistantMsgId))).toBe(true)
+    releaseFirst()
+    await new Promise((r) => setTimeout(r, 100))
+    // 旧消息既不产生 done，也不会把软删的行写成 done
+    expect(doneOf(r1.assistantMsgId)).toBe(false)
+    const msgs = repos.listMessages(dbm.get(), convId)
+    expect(msgs.filter((m) => m.role === 'assistant')).toHaveLength(1)
+    expect(msgs.find((m) => m.role === 'assistant').content).toBe('新')
+  })
+
+  it('被取代的流在 Key 重试时不复活，也不会写入过期结果', async () => {
+    const { convId, pid } = seed()
+    let calls = 0
+    let releaseFirst
+    const firstGate = new Promise((r) => (releaseFirst = r))
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      calls++
+      if (calls === 1) {
+        // 第一个流：返回首段后被挂起，随后由外部 abort
+        return {
+          ok: true,
+          status: 200,
+          body: (async function* () {
+            yield Buffer.from('data: {"choices":[{"delta":{"content":"旧"}}]}\n\n')
+            await firstGate
+            throw Object.assign(new Error('aborted'), { name: 'AbortError' })
+          })()
+        }
+      }
+      return sseRes(['data: {"choices":[{"delta":{"content":"新"}}]}\n\n', 'data: [DONE]\n\n'])
+    })
+    const r1 = await gateway.sendChat({ conversationId: convId, content: '问题一' })
+    await waitFor(() => events.some((e) => e.p.type === 'delta' && e.p.msgId === r1.assistantMsgId))
+    // 用户直接再发一条：旧流被判为取代
+    const r2 = await gateway.sendChat({ conversationId: convId, content: '问题二' })
+    releaseFirst()
+    expect(await waitFor(() => doneOf(r2.assistantMsgId))).toBe(true)
+    expect(doneOf(r1.assistantMsgId)).toBe(false)
+    // 旧消息只可能是 streaming/stopped，绝不能被写成 done
+    const old = repos.getMessage(dbm.get(), r1.assistantMsgId)
+    expect(old && old.status).not.toBe('done')
+    // 被取代的流不应把 Key 标记为失败（没有真的请求失败）
+    const keyStates = repos.listKeys(dbm.get(), pid).map((k) => k.status)
+    expect(keyStates.some((s) => s === 'cooldown' || s === 'invalid')).toBe(false)
+  })
+
   // 最大输出长度改为提供商模型参数：会话 policy 中的 maxTokens 不再透传
   it('max_tokens 取自模型参数而非会话 policy', async () => {
     const { convId, pid } = seed()

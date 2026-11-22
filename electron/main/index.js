@@ -8,6 +8,7 @@ const tray = require('./tray')
 const shortcutsMod = require('./shortcuts')
 const { registerIpc, probeAllForProvider } = require('./ipc')
 const { initProbeScheduler, stopProbeScheduler } = require('./probe-scheduler')
+const { getHub } = require('./events/hub')
 
 let forceQuit = false
 
@@ -86,7 +87,12 @@ if (!gotLock) {
 
   app.whenReady().then(() => {
     dbm.open(path.join(app.getPath('userData'), 'miniagent.db'))
-    notify.setBroadcaster((ch, payload) => windows.broadcast(ch, payload))
+    // 所有推送同时进入事件中枢：界面可见即历史可见，前端可按 seq 游标补齐漏收
+    const hub = getHub()
+    notify.setBroadcaster((ch, payload) => {
+      hub.emit(ch, payload || {})
+      windows.broadcast(ch, payload)
+    })
 
     const main = windows.createMainWindow()
     main.on('close', (e) => {

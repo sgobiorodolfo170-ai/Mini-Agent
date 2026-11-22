@@ -70,4 +70,31 @@ describe('agent store', () => {
     s.handleEvent({ type: 'tool_call', runId: 'r1' })
     expect(window.api.agent.runs).toHaveBeenCalledTimes(2)
   })
+
+  it('stopRun 立即清掉该运行的本地确认卡', async () => {
+    const s = useAgentStore()
+    s.pushConfirm({ requestId: 'q1', runId: 'r1', tool: 'write_file' })
+    s.pushConfirm({ requestId: 'q2', runId: 'r2', tool: 'run_command' })
+    // stop 的返回值不应影响本地清理（后端可能已无该运行）
+    window.api.agent.stop.mockResolvedValueOnce(false)
+    s.stopRun('r1')
+    expect(s.confirms.map((c) => c.requestId)).toEqual(['q2'])
+  })
+
+  it('done 事件清掉该运行遗留的确认卡（含停止/出错路径）', () => {
+    const s = useAgentStore()
+    s.pushConfirm({ requestId: 'q1', runId: 'r1' })
+    s.pushConfirm({ requestId: 'q2', runId: 'r2' })
+    s.handleEvent({ type: 'done', runId: 'r1', status: 'stopped' })
+    expect(s.confirms.map((c) => c.requestId)).toEqual(['q2'])
+  })
+
+  it('clearConfirms 支持按 requestIds 批量清理', () => {
+    const s = useAgentStore()
+    s.pushConfirm({ requestId: 'q1', runId: 'r1' })
+    s.pushConfirm({ requestId: 'q2', runId: 'r1' })
+    s.pushConfirm({ requestId: 'q3', runId: 'r2' })
+    s.clearConfirms({ requestIds: ['q1', 'q2'] })
+    expect(s.confirms.map((c) => c.requestId)).toEqual(['q3'])
+  })
 })

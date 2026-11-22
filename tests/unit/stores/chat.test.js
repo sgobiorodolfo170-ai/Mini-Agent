@@ -269,10 +269,33 @@ describe('chat store 消息事件流', () => {
     expect(s.messages[0].status).toBe('error')
   })
 
-  it('未知 msgId 的事件触发会话列表刷新兜底', () => {
+  it('未知 msgId 的 delta 不触发整表刷新（避免每 token 一次查询）', () => {
     const s = useChatStore()
     s.handleEvent({ type: 'delta', msgId: 'ghost', delta: 'x' })
+    expect(window.api.conversations.list).not.toHaveBeenCalled()
+  })
+
+  it('未知 msgId 的终态事件仍刷新会话列表兜底', () => {
+    const s = useChatStore()
+    s.handleEvent({ type: 'done', msgId: 'ghost', content: 'x' })
     expect(window.api.conversations.list).toHaveBeenCalled()
+  })
+
+  it('非当前会话的 delta 直接丢弃，不触发列表刷新', () => {
+    const s = useChatStore()
+    s.activeId = 'c1'
+    s.messages = [{ id: 'm9', role: 'assistant', content: '旧回复', status: 'done' }]
+    s.handleEvent({ type: 'delta', conversationId: 'c2', msgId: 'm9', delta: '别人的' })
+    expect(s.messages[0].content).toBe('旧回复')
+    expect(window.api.conversations.list).not.toHaveBeenCalled()
+  })
+
+  it('当前会话带 conversationId 的 delta 正常追加', () => {
+    const s = useChatStore()
+    s.activeId = 'c1'
+    s.messages = [{ id: 'm9', role: 'assistant', content: '旧回复', status: 'done' }]
+    s.handleEvent({ type: 'delta', conversationId: 'c1', msgId: 'm9', delta: '追加' })
+    expect(s.messages[0]).toMatchObject({ content: '旧回复追加', status: 'streaming' })
   })
 
   it('snapshot 对当前会话做全量 upsert 并刷新列表', () => {

@@ -6,6 +6,7 @@ import { useSettingsStore } from '../../stores/settings'
 import { useKbStore } from '../../stores/kb'
 import { useAgentStore } from '../../stores/agent'
 import { useProjectsStore } from '../../stores/projects'
+import { useSessionsStore } from '../../stores/sessions'
 import ChatView from '../../views/ChatView.vue'
 import KbView from '../../views/KbView.vue'
 import AgentView from '../../views/AgentView.vue'
@@ -20,6 +21,7 @@ const settings = useSettingsStore()
 const kb = useKbStore()
 const agent = useAgentStore()
 const projects = useProjectsStore()
+const sessions = useSessionsStore()
 
 const navs = [
   { key: 'chat', icon: 'chat', label: '会话' },
@@ -52,6 +54,11 @@ onMounted(async () => {
   if (window.api.models) window.api.on('models:progress', (p) => settings.handleModelsProgress(p))
   window.api.on('agent:event', (ev) => agent.handleEvent(ev))
   window.api.on('agent:confirm', (c) => agent.pushConfirm(c))
+  window.api.on('agent:confirmCancel', (c) => agent.clearConfirms(c || {}))
+  window.api.on('agent:confirmTimeout', (c) => {
+    agent.clearConfirms({ requestId: c && c.requestId })
+    ui.toast('确认请求超时已自动拒绝', 'warn')
+  })
   window.api.on('app:notice', (n) => ui.toast(n.message, n.level || 'info'))
   window.api.on('app:route', (r) => ui.goChat(r.conversationId))
   window.api.on('chat:attachment', (a) => {
@@ -64,8 +71,13 @@ onMounted(async () => {
       kb.load(),
       settings.reloadProviders(),
       agent.loadRuns(),
-      projects.load()
+      projects.load(),
+      sessions.load()
     ])
+  })
+  // 子会话看板：运行开始/结束与会话创建都刷新，保证「Agent 派生的会话」即时可见
+  window.api.on('agent:event', (ev) => {
+    if (ev && (ev.type === 'started' || ev.type === 'done')) sessions.load()
   })
   window.api.on('hotkeys:report', (rep) => {
     const bad = Object.entries(rep || {}).filter(([_k, v]) => !v.ok)
@@ -78,6 +90,10 @@ onMounted(async () => {
   await kb.load()
   await agent.loadRuns()
   await projects.load()
+  await sessions.load()
+  // 主窗启动后按 3s 轮询子会话状态：事件在窗口隐藏/重载期间不可见，
+  // 轮询保证恢复后状态仍与主进程一致（仅内存查询，不触网）
+  sessions.startPolling(3000)
   await settings.loadModels()
   if (chat.conversations.length) chat.select(chat.conversations[0].id)
 })

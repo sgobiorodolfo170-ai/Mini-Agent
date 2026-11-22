@@ -80,6 +80,24 @@ function buildMain() {
       runs: () => inv('agent:runs'),
       calls: (runId) => inv('agent:calls', runId)
     },
+    sessions: {
+      status: (id) => inv('sessions:status', id),
+      list: (o) => inv('sessions:list', o),
+      result: (o) => inv('sessions:result', o),
+      send: (o) => inv('sessions:send', o),
+      wait: (o) => inv('sessions:wait', o)
+    },
+    events: {
+      since: (o) => inv('events:since', o),
+      recent: (o) => inv('events:recent', o),
+      stats: () => inv('events:stats')
+    },
+    hooks: {
+      meta: () => inv('hooks:meta'),
+      list: () => inv('hooks:list'),
+      save: (list) => inv('hooks:save', list),
+      dryRun: (o) => inv('hooks:dryRun', o)
+    },
     sys: {
       clipboardRead: () => inv('sys:clipboardRead'),
       clipboardWrite: (t) => inv('sys:clipboardWrite', t),

@@ -31,6 +31,10 @@ const maxSteps = ref(15)
 const webSearchProvider = ref('auto')
 const tavilyApiKey = ref('')
 const mcpServersJson = ref('')
+const hooksJson = ref('[]')
+const hookStages = ref(['session.send', 'run.start', 'run.end', 'tool.before', 'tool.after'])
+const hookActions = ref(['notify', 'log', 'block'])
+const hooksError = ref('')
 const includeKeys = ref(false)
 
 function syncFromStore() {
@@ -40,6 +44,37 @@ function syncFromStore() {
   webSearchProvider.value = settings.settings.webSearchProvider || 'auto'
   tavilyApiKey.value = settings.settings.tavilyApiKey || ''
   mcpServersJson.value = settings.settings.agentMcpServers || ''
+  syncHooks()
+}
+
+// 钩子配置以 JSON 数组存于 settings.agentHooks；界面只做格式化展示与校验
+async function syncHooks() {
+  try {
+    const list = window.api.hooks ? await window.api.hooks.list() : []
+    hooksJson.value = JSON.stringify(list, null, 2)
+    hooksError.value = ''
+    if (window.api.hooks && window.api.hooks.meta) {
+      const meta = await window.api.hooks.meta()
+      if (meta && meta.stages) hookStages.value = meta.stages
+      if (meta && meta.actions) hookActions.value = meta.actions
+    }
+  } catch {
+    hooksJson.value = '[]'
+  }
+}
+
+async function saveHooks() {
+  try {
+    const parsed = JSON.parse(hooksJson.value || '[]')
+    if (!Array.isArray(parsed)) throw new Error('钩子配置必须是 JSON 数组')
+    const saved = window.api.hooks ? await window.api.hooks.save(parsed) : parsed
+    hooksJson.value = JSON.stringify(saved, null, 2)
+    hooksError.value = ''
+    ui.toast(`钩子已保存（${saved.length} 条）`, 'success')
+  } catch (e) {
+    hooksError.value = String((e && e.message) || e)
+    ui.toast('钩子保存失败：' + hooksError.value, 'error')
+  }
 }
 onMounted(() => {
   if (settings.initialized) syncFromStore()
@@ -972,6 +1007,29 @@ function setModelParam(m, field, value) {
                 class="field-input font-mono text-xs"
               ></textarea>
             </label>
+            <label class="block max-w-2xl">
+              <span class="field-label">生命周期钩子（JSON 数组，可选）</span>
+              <textarea
+                v-model="hooksJson"
+                rows="6"
+                data-testid="hooks-json"
+                :placeholder="`例如: [{&quot;stage&quot;:&quot;run.end&quot;,&quot;action&quot;:&quot;notify&quot;,&quot;message&quot;:&quot;任务完成&quot;},{&quot;stage&quot;:&quot;tool.before&quot;,&quot;action&quot;:&quot;block&quot;,&quot;match&quot;:{&quot;tool&quot;:&quot;run_command&quot;},&quot;reason&quot;:&quot;本机禁止执行命令&quot;}]`"
+                class="field-input font-mono text-xs"
+              ></textarea>
+              <span class="field-help mt-1 block">
+                可用阶段：{{ hookStages.join(' / ') }}；可用动作：{{ hookActions.join(' / ') }}。
+                block 仅能让操作更严格（无法放行需要确认的调用），notify 会在界面弹一条提示。
+              </span>
+              <span v-if="hooksError" class="field-help mt-1 block text-bad-ink">{{
+                hooksError
+              }}</span>
+            </label>
+            <div class="flex items-center gap-2">
+              <button class="btn-secondary !h-9" data-testid="hooks-save" @click="saveHooks">
+                保存钩子
+              </button>
+              <button class="btn-secondary !h-9" @click="syncHooks">重新载入</button>
+            </div>
             <button
               class="btn-primary !h-9"
               data-testid="agent-save"
