@@ -1,6 +1,6 @@
 {
   "name": "miniagent",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Windows 桌面个人 AI 助理（自用）",
   "main": "out/main/index.js",
   "author": "miniagent",

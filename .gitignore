@@ -5,9 +5,12 @@ node_modules/
 dist/
 out/
 dist-app/
+dist-app-new/
 release/
 coverage/
 .tmp-spike-models/
+# e2e 运行产生的截图等产物（不覆盖 docs/ 下已归档的验收图）
+.e2e-artifacts/
 
 # logs
 *.log
@@ -31,3 +34,6 @@ Thumbs.db
 NVIDIA Corporation/
 .box-agent/
 .box-agent-scratch/
+# 本地调试截图（工具/会话产物，不属于交付物）
+.tmp-*.png
+2026*.png

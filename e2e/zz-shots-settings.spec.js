@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { closeApp, launchApp, setupProviderAndKey, unexpectedErrors } from './helpers'
 
-const OUT = path.join(process.cwd(), 'docs', 'settings-2026-11-20')
+const OUT = path.join(process.cwd(), '.e2e-artifacts', 'settings-2026-11-20')
 
 let ctx
 

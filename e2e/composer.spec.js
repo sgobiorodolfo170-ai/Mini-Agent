@@ -4,7 +4,9 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { closeApp, launchApp, setupProviderAndKey, unexpectedErrors } from './helpers'
 
-const OUT = path.join(process.cwd(), 'docs', 'composer-2026-11-20')
+// 截图输出到被 .gitignore 忽略的目录：测试运行不再改写 docs/ 下已归档的验收截图
+// （需要归档某次结果时，手动把需要的图拷到 docs/<批次>/ 再提交）
+const OUT = path.join(process.cwd(), '.e2e-artifacts', 'composer-2026-11-20')
 
 let ctx
 

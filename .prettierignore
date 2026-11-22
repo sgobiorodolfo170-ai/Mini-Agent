@@ -1,9 +1,11 @@
 node_modules
 out
 dist-app
+dist-app-new
 build
 assets
 coverage
 package-lock.json
 *.md
 docs/架构总览.html
+docs/项目框架总览.html
