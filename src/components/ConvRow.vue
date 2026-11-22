@@ -43,7 +43,7 @@ function onKeydown(e) {
     tabindex="0"
     data-testid="conv-item"
     class="list-row group !min-h-[44px]"
-    :class="active ? 'bg-brand-soft text-brand-ink' : 'hover:bg-surface'"
+    :class="active ? 'bg-panel text-brand-ink' : 'hover:bg-surface'"
     role="button"
     :aria-current="active ? 'true' : undefined"
     @click="emit('select')"

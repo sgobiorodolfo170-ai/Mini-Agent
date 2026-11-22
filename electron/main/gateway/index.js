@@ -337,8 +337,17 @@ async function startStream({ conversationId, assistantMsgId, kbIds, attachments 
   }
 }
 
-async function sendChat({ conversationId, content, kbIds, attachments }) {
+async function sendChat({ conversationId, content, kbIds, attachments, originMessageId }) {
   const db = dbm.get()
+  if (originMessageId) {
+    const existing = repos.getMessage(db, originMessageId)
+    if (existing) {
+      const messages = repos.listMessages(db, conversationId)
+      const userIndex = messages.findIndex((m) => m.id === originMessageId)
+      const assistant = messages.slice(userIndex + 1).find((m) => m.role === 'assistant')
+      return { assistantMsgId: assistant && assistant.id, reused: true }
+    }
+  }
   const conv = repos.getConversation(db, conversationId)
   if (!conv) throw new Error('会话不存在')
   // 后端闸门：同一会话同时只允许一条在途流（前端 hasStreaming 只是第一道拦截）
@@ -347,6 +356,7 @@ async function sendChat({ conversationId, content, kbIds, attachments }) {
   const isFirstRound =
     repos.listMessages(db, conversationId).filter((m) => !m.deleted_at).length === 0
   const userMsg = repos.insertMessage(db, {
+    id: originMessageId || undefined,
     conversationId,
     role: 'user',
     content,

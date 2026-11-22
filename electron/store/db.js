@@ -1,7 +1,7 @@
 const fs = require('fs')
 const path = require('path')
 
-const SCHEMA_VERSION = 7
+const SCHEMA_VERSION = 8
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS settings (
@@ -235,6 +235,9 @@ function migrate(db) {
     if (!columnExists(db, 'conversations', 'permission')) {
       db.exec("ALTER TABLE conversations ADD COLUMN permission TEXT NOT NULL DEFAULT 'default'")
     }
+    // v7 → v8：局域网远程控制、持久审批与事件恢复。先完成旧列迁移再建远程索引。
+    require('../main/remote/schema').REMOTE_SCHEMA_SQL
+    db.exec(require('../main/remote/schema').REMOTE_SCHEMA_SQL)
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
   }
 }
@@ -257,8 +260,9 @@ function open(dbPath) {
   // 同理回收运行记录：异常退出后 agent_runs 会永久停在 running，
   // 列表会一直显示「执行中」而停止按钮实际无效。
   db.prepare(
-    "UPDATE agent_runs SET status = 'stopped', ended_at = COALESCE(ended_at, ?) WHERE status = 'running'"
+    "UPDATE agent_runs SET status = 'stopped', ended_at = COALESCE(ended_at, ?) WHERE status IN ('running','waiting_child')"
   ).run(Date.now())
+  db.prepare("UPDATE agent_approvals SET status='cancelled', decision_reason='app_restarted' WHERE status='pending'").run()
   globalThis.__miniagentDB = db
   globalThis.__miniagentDBInfo = { path: dbPath, driver: 'node:sqlite' }
   return db

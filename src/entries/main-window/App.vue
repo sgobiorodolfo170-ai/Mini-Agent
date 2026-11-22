@@ -16,6 +16,8 @@ import ConfirmCard from '../../components/ConfirmCard.vue'
 import ConfirmDialog from '../../components/ConfirmDialog.vue'
 import UpdateDialog from '../../components/UpdateDialog.vue'
 import UiIcon from '../../components/UiIcon.vue'
+import RemotePanel from '../../components/remote/RemotePanel.vue'
+import { useRemoteStore } from '../../stores/remote'
 
 const ui = useUiStore()
 const chat = useChatStore()
@@ -25,12 +27,14 @@ const agent = useAgentStore()
 const projects = useProjectsStore()
 const sessions = useSessionsStore()
 const updater = useUpdaterStore()
+const remote = useRemoteStore()
 const updateOpen = ref(false)
 
 const navs = [
   { key: 'chat', icon: 'chat', label: '会话' },
   { key: 'kb', icon: 'kb', label: '知识库' },
   { key: 'agent', icon: 'terminal', label: '执行' },
+  { key: 'remote', icon: 'monitor', label: '远程' },
   { key: 'settings', icon: 'settings', label: '设置' }
 ]
 
@@ -58,6 +62,7 @@ onMounted(async () => {
   if (window.api.models) window.api.on('models:progress', (p) => settings.handleModelsProgress(p))
   window.api.on('agent:event', (ev) => agent.handleEvent(ev))
   window.api.on('updater:changed', (s) => updater.apply(s))
+  if (window.api.remote) window.api.on('remote:changed', (s) => remote.apply(s))
   window.api.on('agent:confirm', (c) => agent.pushConfirm(c))
   window.api.on('agent:confirmCancel', (c) => agent.clearConfirms(c || {}))
   window.api.on('agent:confirmTimeout', (c) => {
@@ -169,11 +174,11 @@ async function closeWindowToTray() {
 
 <template>
   <div class="h-full flex flex-col">
-    <!-- 自绘标题栏：背景同左侧栏（bg-chrome 灰白色），可拖拽移动窗口；
+    <!-- 自绘标题栏：背景同左侧栏（bg-panel 浅灰白），可拖拽移动窗口；
          右侧最小化/最大化/关闭均为 no-drag，关闭=隐藏到托盘（与系统关闭行为一致） -->
     <div
       data-testid="title-bar"
-      class="h-10 shrink-0 flex items-center bg-chrome select-none"
+      class="h-10 shrink-0 flex items-center bg-panel select-none"
       style="-webkit-app-region: drag"
       @dblclick="toggleMaximize"
     >
@@ -214,7 +219,7 @@ async function closeWindowToTray() {
     <div class="flex-1 min-h-0 flex">
     <!-- 全局导航：64px，图标 + 12px 文字（F21），当前项有语义标记（F20） -->
     <nav
-      class="w-16 shrink-0 flex flex-col items-center pt-4 pb-3 border-r border-line-subtle bg-chrome"
+      class="w-16 shrink-0 flex flex-col items-center pt-4 pb-3 border-r border-line-subtle bg-panel"
       aria-label="主导航"
     >
       <button
@@ -224,7 +229,7 @@ async function closeWindowToTray() {
         class="w-12 h-[52px] rounded-xl flex flex-col items-center justify-center gap-0.5 text-xs font-medium leading-none"
         :class="
           ui.view === n.key
-            ? 'bg-brand-soft text-brand-ink shadow-none'
+            ? 'bg-panel text-brand-ink shadow-none'
             : 'text-ink-muted hover:bg-surface hover:text-ink-primary'
         "
         :aria-current="ui.view === n.key ? 'page' : undefined"
@@ -268,6 +273,7 @@ async function closeWindowToTray() {
       <KbView v-show="ui.view === 'kb'" />
       <AgentView v-show="ui.view === 'agent'" />
       <SettingsView v-show="ui.view === 'settings'" />
+      <RemotePanel v-if="ui.view === 'remote'" />
     </main>
 
     <ConfirmCard />

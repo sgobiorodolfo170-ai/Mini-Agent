@@ -8,6 +8,7 @@ module.exports = {
         // 语义色统一映射到 tokens.css 变量；透明度工具类对 var() 颜色不可用，需要透明色时显式加 token
         canvas: 'var(--bg-canvas)',
         chrome: 'var(--bg-chrome)',
+        panel: 'var(--bg-panel)',
         surface: 'var(--bg-surface)',
         subtle: 'var(--bg-subtle)',
         elevated: 'var(--bg-elevated)',

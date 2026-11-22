@@ -23,6 +23,27 @@ const buildInfo = {
   __BUILD_TIME__: JSON.stringify(new Date().toISOString())
 }
 
+// 开发预览用：TRAE 内置浏览器的「选择元素」由外部脚本 previewer-tools.umd.js
+// （lf3-static.bytednsdoc.com）注入实现，页面的严格 CSP 会把它拦在 script-src，
+// 且脚本内部通过 fetch 上报选中元素需要 connect-src。仅在 dev server 下放开
+// 该来源与内联/求值能力，并只作用于主窗口入口；生产构建保持原 CSP 不变。
+const PREVIEWER_ORIGIN = 'https://lf3-static.bytednsdoc.com'
+function devRelaxedCsp() {
+  return {
+    name: 'dev-relaxed-csp',
+    apply: 'serve',
+    transformIndexHtml(html, ctx) {
+      if (!/main-window/.test(ctx.filename || ctx.path || '')) return html
+      return html
+        .replace(
+          "script-src 'self'",
+          `script-src 'self' 'unsafe-inline' 'unsafe-eval' ${PREVIEWER_ORIGIN}`
+        )
+        .replace("default-src 'self'", `default-src 'self'; connect-src 'self' https: ws: wss:`)
+    }
+  }
+}
+
 export default defineConfig({
   main: {
     plugins: [externalizeDepsPlugin()],
@@ -48,7 +69,7 @@ export default defineConfig({
   },
   renderer: {
     root: r('src'),
-    plugins: [vue()],
+    plugins: [vue(), devRelaxedCsp()],
     css: {
       postcss: { plugins: [tailwindcss, autoprefixer] }
     },
@@ -58,7 +79,8 @@ export default defineConfig({
           main: r('src/entries/main-window/index.html'),
           quick: r('src/entries/quick-panel/index.html'),
           ball: r('src/entries/floating-ball/index.html'),
-          capture: r('src/entries/screen-capture/index.html')
+          capture: r('src/entries/screen-capture/index.html'),
+          'remote-mobile': r('src/entries/remote-mobile/index.html')
         }
       }
     }

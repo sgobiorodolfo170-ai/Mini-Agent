@@ -16,11 +16,24 @@ const { parseMcpServers } = require('./mcp-client')
 const { getHub } = require('../events/hub')
 const { parseHooks, applyHooks } = require('../events/hooks')
 const { normalizeMandate, defaultSubMandate, authorizeToolCall } = require('./mandate')
+const { createApprovalService } = require('../remote/approval-service')
+const { createRunControl } = require('../remote/run-control-service')
+
+let controlRuntime = null
+function getControlRuntime(db) {
+  if (!controlRuntime || controlRuntime.db !== db) {
+    controlRuntime = {
+      db,
+      approvals: createApprovalService({ db, events: globalThis.__miniagentRemoteEvents || null })
+    }
+    controlRuntime.runs = createRunControl({ db, agent: { stopRun }, events: globalThis.__miniagentRemoteEvents || null })
+  }
+  return controlRuntime
+}
 
 const active = new Map() // runId -> { ac, stopped, remember:Set, confirms:Map }
 
 // 确认请求的最长等待时间：超时按拒绝处理，避免隐藏窗口里的任务永久挂起
-const CONFIRM_TIMEOUT_MS = 5 * 60 * 1000
 
 function toolSchemas(tools) {
   return tools.map((t) => ({
@@ -198,6 +211,10 @@ async function startAgentRun({
   idempotencyKey
 }) {
   const db = dbm.get()
+  if (idempotencyKey) {
+    const existing = db.prepare('SELECT id FROM agent_runs WHERE idempotency_key=?').get(idempotencyKey)
+    if (existing) return { runId: existing.id, reused: true }
+  }
   const { provider, model } = resolveModel(db, conversationId)
   if (!provider) throw new Error('未配置模型服务')
   if (!model) throw new Error('未配置模型')
@@ -282,6 +299,7 @@ async function startAgentRun({
     // 父运行：子会话里的运行由此派生，用于会话管理与审计回溯
     parentRunId: parentRunId || null,
     controlMode: parentRunId ? controlMode : null,
+    pauseNotified: false,
     // 本次 Run 的授权快照：运行期不可被模型扩大（方案四 §4.1）
     mandate: effectiveMandate,
     traceId: inheritedTrace,
@@ -446,6 +464,7 @@ async function doAgentRun({
   }
 
   const modelCallWith = (apiKey) => async (msgs) => {
+    if (!(await getControlRuntime(db).runs.checkpoint(runId, state))) return { content: '', toolCalls: [], stopped: true }
     const payload = { model, messages: msgs, stream: true, tools: toolSchemas(tools) }
     if (Number(params.maxTokens)) payload.max_tokens = Number(params.maxTokens)
     if (Number(params.temperature) >= 0) payload.temperature = Number(params.temperature)
@@ -518,48 +537,23 @@ async function doAgentRun({
       })
     }
     if (state.stopped) return settle({ allowed: false, confirmedBy: 'stopped' })
+    if (!(await getControlRuntime(db).runs.checkpoint(runId, state))) return settle({ allowed: false, confirmedBy: 'stopped' })
     // 完整权限：用户已在输入区显式选择，不再逐次弹确认，但审计记录标记来源
     if (state.permission === 'full')
       return settle({ allowed: true, confirmedBy: 'permission:full' })
     if (risk === 'side_effect' && state.remember.has(name))
       return settle({ allowed: true, confirmedBy: 'session' })
-    const requestId = repos.uid()
-    const decision = await new Promise((resolve) => {
-      // 等待用户确认期间可能有超时/停止两条退出路径，用 settled 保证只 resolve 一次
-      let settled = false
-      const finish = (d) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        state.confirms.delete(requestId)
-        resolve(d)
-      }
-      // 主窗隐藏到托盘时确认卡不可见，任务会无限期挂起；超时按拒绝处理并告知前端
-      const timer = setTimeout(() => {
-        finish({ allow: false, remember: false, timedOut: true })
-        broadcast('agent:confirmTimeout', { requestId, runId, tool: name })
-      }, CONFIRM_TIMEOUT_MS)
-      if (timer.unref) timer.unref()
-      state.confirms.set(requestId, finish)
-      broadcast('agent:confirm', {
-        requestId,
-        runId,
-        tool: name,
-        args,
-        riskLevel: risk,
-        summary: summarize(name, args)
-      })
-    })
-    if (decision.allow && decision.remember) state.remember.add(name)
+    const decision = await getControlRuntime(db).approvals.decide({ runId, conversationId, name, args, riskLevel: risk })
     return settle({
-      allowed: !!decision.allow,
-      confirmedBy: decision.allow ? 'user' : decision.timedOut ? 'timeout' : 'denied'
+      allowed: !!decision.allowed,
+      confirmedBy: decision.confirmedBy || (decision.allow ? 'user' : decision.timedOut ? 'timeout' : 'denied')
     })
   }
   const execute = async (tool, args) => {
     const t0 = Date.now()
     let resultText = ''
     let error = null
+    if (!(await getControlRuntime(db).runs.checkpoint(runId, state))) throw new Error('任务已停止')
 
     // 旧流隔离（方案四 §5.3）：Run 已被取消或替换后，不得再执行任何工具。
     // 必须在授权校验与 handler 调用之前拦截，否则旧流会产生真实副作用。
@@ -777,23 +771,18 @@ async function doAgentRun({
 }
 
 function respondConfirm({ requestId, allow, remember }) {
-  for (const st of active.values()) {
-    if (st.confirms.has(requestId)) {
-      const finish = st.confirms.get(requestId)
-      // finish 内部负责 delete + 清理超时定时器，避免重复 resolve
-      if (typeof finish === 'function') finish({ allow: !!allow, remember: !!remember })
-      return true
-    }
-  }
-  return false
+  return getControlRuntime(dbm.get()).approvals.respond({
+    approvalId: requestId, decision: allow ? 'approved' : 'rejected', actor: 'desktop', reason: remember ? 'remember_not_supported' : ''
+  }).ok
 }
 
-function stopRun(runId, reason = 'user') {
+function stopRun(runId, reason = 'user', context = {}) {
   const st = active.get(runId)
   if (!st) return false
   st.stopped = true
   st.stopReason = reason
   st.ac.abort()
+  getControlRuntime(dbm.get()).approvals.cancelRun(runId, reason)
   // 内部中止不得静默（方案四 §5.4）：记录原因与发起者
   try {
     const db = dbm.get()
@@ -804,17 +793,13 @@ function stopRun(runId, reason = 'user') {
     getHub().emit('run.abort_requested', {
       runId,
       traceId: st.traceId || null,
-      reason
+      reason,
+      actor: context.actor || 'desktop'
     })
   } catch {
     // 数据库未就绪时忽略，不影响中止
   }
-  // 先收集再 resolve：finish 会从 confirms 中删除自身
   const pending = [...st.confirms.keys()]
-  for (const requestId of pending) {
-    const finish = st.confirms.get(requestId)
-    if (typeof finish === 'function') finish({ allow: false, remember: false })
-  }
   st.confirms.clear()
   // 通知前端按 runId 清掉僵尸确认卡（含主窗隐藏时积压的请求）
   if (pending.length) broadcast('agent:confirmCancel', { runId, requestIds: pending })
@@ -825,9 +810,18 @@ function listActiveRuns() {
   return [...active.keys()]
 }
 
+function getApprovalService() {
+  return getControlRuntime(dbm.get()).approvals
+}
+function pauseRun(runId, actor = 'desktop') { return getControlRuntime(dbm.get()).runs.request(runId, 'pause', actor) }
+function resumeRun(runId, actor = 'desktop') { return getControlRuntime(dbm.get()).runs.request(runId, 'resume', actor) }
+
 module.exports = {
   startAgentRun,
   respondConfirm,
+  getApprovalService,
+  pauseRun,
+  resumeRun,
   stopRun,
   listActiveRuns,
   summarize,

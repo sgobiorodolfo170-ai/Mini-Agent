@@ -38,17 +38,17 @@ async function copyResult(c) {
 </script>
 
 <template>
-  <div class="h-full flex min-w-0 bg-chrome">
+  <div class="h-full flex min-w-0 bg-panel">
     <!-- 左栏：记录列表（两行：目标摘要 + 状态/时间） -->
     <aside
-      class="shrink-0 flex flex-col bg-chrome"
+      class="shrink-0 flex flex-col bg-panel"
       :style="{ width: ui.chatListWidth + 'px' }"
       aria-label="执行记录"
     >
-      <div class="px-3 py-3 text-base font-semibold text-ink-primary border-b border-line-subtle">
+      <div class="px-3 py-3 text-base font-semibold text-ink-primary border-b border-line-subtle bg-panel">
         执行记录
       </div>
-      <div class="scroll-region flex-1 p-2 space-y-1">
+      <div class="scroll-region flex-1 p-2 space-y-1 bg-panel">
         <div
           v-for="r in agent.runs"
           :key="r.id"
@@ -162,7 +162,7 @@ async function copyResult(c) {
       </template>
 
       <!-- 空态 -->
-      <div v-else class="h-full flex items-center justify-center text-ink-muted text-center">
+      <div v-else class="h-full flex items-center justify-center text-ink-muted text-center bg-surface">
         <div>
           <div class="text-base text-ink-secondary mb-2">在会话中开启「任务模式」发起智能任务</div>
           <div class="text-xs">只读工具自动执行；写文件 / 执行命令需逐次确认</div>

@@ -3,6 +3,8 @@
   color-scheme: light;
   --bg-canvas: #f5f7fb;
   --bg-chrome: #f0f1f3;
+  /* 会话区/导航/标题栏统一底色（由选择元素调色得出，比 chrome 更浅） */
+  --bg-panel: #f5f5f5;
   --bg-surface: #ffffff;
   --bg-subtle: #f1f5f9;
   --bg-elevated: #ffffff;
@@ -51,6 +53,7 @@ html.dark {
   color-scheme: dark;
   --bg-canvas: #0f1117;
   --bg-chrome: #151821;
+  --bg-panel: #1a1e28;
   --bg-surface: #171b24;
   --bg-subtle: #1e2430;
   --bg-elevated: #222938;

@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' wss: ws:; form-action 'none'; base-uri 'none'; frame-ancestors 'none'"
+    />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#0f172a" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="format-detection" content="telephone=no" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Mini Agent 远程控制</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <noscript>此页面需要启用 JavaScript 才能与桌面端 Mini Agent 通信。</noscript>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

@@ -77,9 +77,21 @@ function buildMain() {
     agent: {
       run: (o) => inv('agent:run', o),
       stop: (runId) => inv('agent:stop', runId),
+      pause: (runId) => inv('agent:pause', runId),
+      resume: (runId) => inv('agent:resume', runId),
       respond: (o) => inv('agent:respond', o),
       runs: () => inv('agent:runs'),
       calls: (runId) => inv('agent:calls', runId)
+    },
+    remote: {
+      state: () => inv('remote:state'),
+      start: (o) => inv('remote:start', o),
+      stop: () => inv('remote:stop'),
+      qrcode: () => inv('remote:qrcode'),
+      updateDevice: (o) => inv('remote:devices:update', o),
+      revokeDevice: (id) => inv('remote:devices:revoke', id),
+      audit: () => inv('remote:audit:list'),
+      exportCertificate: () => inv('remote:certificate:export')
     },
     sessions: {
       status: (id) => inv('sessions:status', id),

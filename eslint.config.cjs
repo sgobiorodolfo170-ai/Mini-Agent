@@ -1,6 +1,8 @@
 const js = require('@eslint/js')
 const pluginVue = require('eslint-plugin-vue')
 const globals = require('globals')
+const tsParser = require('@typescript-eslint/parser')
+const vueParser = require('vue-eslint-parser')
 
 module.exports = [
   { ignores: ['out/**', 'dist-app/**', 'node_modules/**', 'build/**', 'assets/**'] },
@@ -18,6 +20,22 @@ module.exports = [
   {
     files: ['src/**/*.{vue,js}', 'src/**/*.js'],
     languageOptions: { globals: { ...globals.browser } }
+  },
+  {
+    files: ['src/**/*.vue'],
+    languageOptions: {
+      globals: { ...globals.browser },
+      parser: vueParser,
+      parserOptions: { parser: tsParser, extraFileExtensions: ['.vue'], ecmaVersion: 'latest', sourceType: 'module' }
+    }
+  },
+  {
+    files: ['src/**/*.ts'],
+    languageOptions: {
+      globals: { ...globals.browser },
+      parser: tsParser,
+      parserOptions: { ecmaVersion: 'latest', sourceType: 'module' }
+    }
   },
   {
     rules: {

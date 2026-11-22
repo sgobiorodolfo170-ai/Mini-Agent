@@ -502,10 +502,10 @@ function setModelParam(m, field, value) {
 </script>
 
 <template>
-  <div class="h-full flex min-w-0 bg-chrome">
+  <div class="h-full flex min-w-0 bg-panel">
     <!-- 分组导航（F10）：任一分组一次点击可达 -->
     <nav
-      class="shrink-0 bg-chrome p-3 space-y-1"
+      class="shrink-0 bg-panel p-3 space-y-1"
       :style="{ width: ui.chatListWidth + 'px' }"
       aria-label="设置分组"
     >
@@ -517,7 +517,7 @@ function setModelParam(m, field, value) {
         class="w-full h-10 rounded-lg px-3 text-left text-sm flex items-center"
         :class="
           section === s.key
-            ? 'bg-brand-soft text-brand-ink font-medium'
+            ? 'bg-panel text-brand-ink font-medium'
             : 'text-ink-secondary hover:bg-surface'
         "
         :aria-current="section === s.key ? 'true' : undefined"

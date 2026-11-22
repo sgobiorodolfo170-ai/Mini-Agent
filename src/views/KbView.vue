@@ -146,17 +146,17 @@ const hasSearched = computed(() => !!kb.lastSearch && kb.lastSearch.kbId === kb.
 </script>
 
 <template>
-  <div class="h-full flex min-w-0 bg-chrome">
+  <div class="h-full flex min-w-0 bg-panel">
     <!-- 侧栏只保留列表与入口，创建放入对话框（F15） -->
     <aside
-      class="shrink-0 flex flex-col bg-chrome"
+      class="shrink-0 flex flex-col bg-panel"
       :style="{ width: ui.chatListWidth + 'px' }"
       aria-label="知识库列表"
     >
-      <div class="px-3 pt-3 pb-2 flex items-center gap-2">
+      <div class="px-3 pt-3 pb-2 flex items-center gap-2 bg-panel">
         <span class="text-base font-semibold text-ink-primary flex-1">知识库</span>
         <button
-          class="icon-btn !h-8 !w-8 border border-line-subtle bg-chrome"
+          class="icon-btn !h-8 !w-8 border border-line-subtle bg-panel"
           data-testid="kb-create-open"
           title="新建知识库"
           aria-label="新建知识库"
@@ -165,7 +165,7 @@ const hasSearched = computed(() => !!kb.lastSearch && kb.lastSearch.kbId === kb.
           <UiIcon name="plus" :size="16" />
         </button>
       </div>
-      <div class="px-2.5 pb-2">
+      <div class="px-2.5 pb-2 bg-panel">
         <div class="relative">
           <UiIcon
             name="search"
@@ -176,11 +176,11 @@ const hasSearched = computed(() => !!kb.lastSearch && kb.lastSearch.kbId === kb.
             v-model="kb.filterText"
             placeholder="筛选知识库…"
             aria-label="筛选知识库"
-            class="field-input !h-8 pl-8 text-xs"
+            class="field-input !bg-panel !h-8 pl-8 text-xs"
           />
         </div>
       </div>
-      <div class="scroll-region flex-1 px-2 pb-2 space-y-1">
+      <div class="scroll-region flex-1 px-2 pb-2 space-y-1 bg-panel">
         <div
           v-for="k in kb.visibleKbs"
           :key="k.id"
@@ -377,7 +377,7 @@ const hasSearched = computed(() => !!kb.lastSearch && kb.lastSearch.kbId === kb.
       <div v-else class="h-full flex items-center justify-center text-ink-muted">
         <div class="text-center">
           <div class="text-base text-ink-secondary mb-3">选择左侧知识库，或创建一个新的</div>
-          <button class="btn-secondary !bg-chrome" @click="openCreate">新建知识库</button>
+          <button class="btn-secondary !bg-panel" @click="openCreate">新建知识库</button>
         </div>
       </div>
     </section>

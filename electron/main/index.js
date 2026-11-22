@@ -14,6 +14,8 @@ const { getHub } = require('./events/hub')
 const { initUpdater, getUpdater, stopUpdater } = updaterMod
 
 let forceQuit = false
+let remoteManager = null
+let remoteCleanup = null
 
 // E2E test mode: isolated userData dir also acts as the test-mode switch
 // (skips single-instance lock and global hotkey registration).
@@ -108,6 +110,7 @@ if (!gotLock) {
     const hub = getHub()
     notify.setBroadcaster((ch, payload) => {
       hub.emit(ch, payload || {})
+      if (remoteManager) remoteManager.events.bridge(ch, payload || {})
       windows.broadcast(ch, payload)
     })
 
@@ -120,6 +123,13 @@ if (!gotLock) {
     })
 
     const db = dbm.get()
+    const { RemoteControlManager } = require('./remote')
+    remoteManager = new RemoteControlManager({
+      db,
+      userData: app.getPath('userData'),
+      notify: (state) => notify.broadcast('remote:changed', state),
+      mobileRoot: isTestMode ? null : undefined
+    })
     if (repos.getSetting(db, 'showBall') !== false) windows.createBallWindow()
 
     tray.createTray({
@@ -135,6 +145,7 @@ if (!gotLock) {
       requestQuit,
       applyHotkeysNow,
       version: app.getVersion(),
+      remote: () => remoteManager,
       buildInfo: buildInfo.getBuildInfo()
     })
 
@@ -165,8 +176,17 @@ if (!gotLock) {
     }
   })
 
-  app.on('before-quit', () => {
+  app.on('before-quit', (event) => {
+    if (remoteManager && !remoteCleanup) {
+      event.preventDefault()
+      remoteCleanup = remoteManager.stop().catch(() => {}).finally(() => app.quit())
+      return
+    }
     forceQuit = true
+    finalizeQuit()
+  })
+
+  function finalizeQuit() {
     shortcutsMod.unregisterAll()
     stopProbeScheduler()
     stopUpdater()
@@ -175,7 +195,7 @@ if (!gotLock) {
     } catch {
       /* ignore */
     }
-  })
+  }
 
   app.on('window-all-closed', () => {
     // Tray keeps the app alive; only a real quit request exits.

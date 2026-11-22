@@ -541,19 +541,19 @@ function startResize(e) {
 </script>
 
 <template>
-  <div class="h-full flex min-w-0 bg-chrome">
+  <div class="h-full flex min-w-0 bg-panel">
     <!-- 会话列表：可收起、可拖宽（F01） -->
     <aside
       v-show="ui.chatListVisible"
-      class="shrink-0 flex flex-col bg-chrome"
+      class="shrink-0 flex flex-col bg-panel"
       :style="{ width: ui.chatListWidth + 'px' }"
       aria-label="会话列表"
     >
-      <div class="px-3 pt-3 pb-2">
+      <div class="px-3 pt-3 pb-2 bg-panel">
         <div class="flex items-center gap-2 mb-2">
           <span class="text-base font-semibold flex-1">会话</span>
           <button
-            class="icon-btn !h-8 !w-8 border border-line-subtle bg-chrome"
+            class="icon-btn !h-8 !w-8 border border-line-subtle bg-panel"
             data-testid="new-conv"
             title="新建会话"
             aria-label="新建会话"
@@ -572,7 +572,7 @@ function startResize(e) {
             v-model="search"
             placeholder="搜索标题或内容…"
             aria-label="搜索会话"
-            class="field-input !h-8 pl-8 pr-7 text-xs"
+            class="field-input !bg-panel !h-8 pl-8 pr-7 text-xs"
             data-testid="conv-search"
             @keydown.enter="searchNow"
           />
@@ -590,7 +590,7 @@ function startResize(e) {
           <template v-if="!chat.visibleConversations.length">· 无匹配会话</template>
         </div>
       </div>
-      <div class="scroll-region flex-1 px-2 pb-2">
+      <div class="scroll-region flex-1 px-2 pb-2 bg-panel">
         <template v-if="pinnedConvs.length || !chat.filtering">
           <div class="px-1.5 pt-1 pb-1 flex items-center gap-1">
             <span class="text-xs font-semibold text-ink-primary">置顶</span>

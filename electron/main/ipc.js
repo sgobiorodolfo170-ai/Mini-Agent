@@ -358,11 +358,29 @@ function registerIpc(ctx) {
   // agent
   h('agent:run', (o) => agent.startAgentRun(o))
   h('agent:stop', (runId) => agent.stopRun(runId))
+  h('agent:pause', (runId) => agent.pauseRun(runId))
+  h('agent:resume', (runId) => agent.resumeRun(runId))
   h('agent:respond', (o) => agent.respondConfirm(o))
   h('agent:runs', () => repos.listRuns(dbm.get(), 50))
   h('agent:calls', (runId) => repos.getRunCalls(dbm.get(), runId))
 
-  // 会话管理：Agent 创建的子会话（供界面查看与外部驱动）
+  // 局域网远程控制：管理接口仅暴露给主窗口，手机只能走受限网络协议。
+  const remoteManager = () => ctx.remote && ctx.remote()
+  const requireRemote = () => {
+    const remote = remoteManager()
+    if (!remote) throw new Error('远程服务尚未初始化')
+    return remote
+  }
+  h('remote:state', () => remoteManager() ? remoteManager().getState() : { status: 'stopped' })
+  h('remote:start', (o) => requireRemote().start(o || {}))
+  h('remote:stop', () => requireRemote().stop())
+  h('remote:qrcode', () => requireRemote().qrCode())
+  h('remote:devices:update', (o) => requireRemote().updateDevice(o.deviceId, o))
+  h('remote:devices:revoke', (id) => requireRemote().revokeDevice(id))
+  h('remote:audit:list', () => requireRemote().auditList())
+  h('remote:certificate:export', () => requireRemote().exportCertificate())
+
+  // sessions: 子会话状态
   h('sessions:status', (conversationId) => sessionsApi.getSessionStatus({ conversationId }))
   h('sessions:list', (o) => sessionsApi.listSessions(o || {}))
   h('sessions:result', (o) => sessionsApi.getSessionResult(o || {}))
