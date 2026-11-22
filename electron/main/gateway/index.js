@@ -7,7 +7,17 @@ const { decryptSecret } = require('../../store/keys')
 const { broadcast } = require('../notify')
 const { searchKb } = require('../rag/index')
 
-const active = new Map() // assistantMsgId -> AbortController
+// assistantMsgId -> { ac: AbortController, conversationId }
+// 值里带上 conversationId，让「按会话中止」与前端事件归属判断有据可依。
+const active = new Map()
+
+// 已被取代（regenerate / editResend / 新发送）的消息 id：
+// 仅存在 Map 里不够，重试循环会在下一轮重新 set 让旧流复活，故单独记录。
+const superseded = new Set()
+
+// 流式检查点：受时间与增量长度双重节流，避免每个 token 都写库。
+const CHECKPOINT_MS = 500
+const CHECKPOINT_CHARS = 2048
 
 const DEFAULT_CONTEXT_CHARS = 12000
 const DEFAULT_KEEP_TURNS = 20
@@ -147,6 +157,19 @@ async function startStream({ conversationId, assistantMsgId, kbIds, attachments 
   const db = dbm.get()
   const { provider, model, conv } = resolveModel(db, conversationId)
   let acc = ''
+  // 检查点节流状态（每次 startStream 独立）：首跳从当下起算，避免第一个 token 就写库
+  let lastCheckpointAt = Date.now()
+  let pendingCheckpoint = ''
+  const checkpoint = (force = false) => {
+    if (!pendingCheckpoint && !force) return
+    const nowMs = Date.now()
+    const big = pendingCheckpoint.length >= CHECKPOINT_CHARS
+    if (!force && !big && nowMs - lastCheckpointAt < CHECKPOINT_MS) return
+    lastCheckpointAt = nowMs
+    pendingCheckpoint = ''
+    // 只更新内容，状态仍为 streaming：进程崩溃时启动钩子会将其标记为 stopped
+    repos.updateMessage(db, assistantMsgId, { content: acc })
+  }
   try {
     if (!provider) throw new Error('未配置模型服务，请先在设置中添加供应商')
     if (!model) throw new Error('未配置模型，请在「设置 → 会话」中选择')
@@ -201,11 +224,17 @@ async function startStream({ conversationId, assistantMsgId, kbIds, attachments 
     const maxAttempts = Math.max(1, Math.min(3, keyRows.length))
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      // 本轮已被 regenerate / editResend / 新发送取代：立即收尾，不重试、不写库
+      if (superseded.has(assistantMsgId)) {
+        superseded.delete(assistantMsgId)
+        return
+      }
       const key = scheduler.pickKey(keyRows, provider.rotation_strategy, exclude, Date.now())
       if (!key) break
       exclude.push(key.id)
       const ac = new AbortController()
-      active.set(assistantMsgId, ac)
+      const entry = { ac, conversationId }
+      active.set(assistantMsgId, entry)
       try {
         const r = await chatStream(
           { baseUrl: provider.base_url, apiKey: await decryptSecret(key.secretEnc), payload },
@@ -213,7 +242,14 @@ async function startStream({ conversationId, assistantMsgId, kbIds, attachments 
             signal: ac.signal,
             onDelta: (d) => {
               acc += d
-              broadcast('chat:event', { type: 'delta', msgId: assistantMsgId, delta: d })
+              pendingCheckpoint += d
+              checkpoint()
+              broadcast('chat:event', {
+                type: 'delta',
+                conversationId,
+                msgId: assistantMsgId,
+                delta: d
+              })
             }
           }
         )
@@ -225,6 +261,12 @@ async function startStream({ conversationId, assistantMsgId, kbIds, attachments 
         const meta = {}
         if (kbRefs.length) meta.kbRefs = kbRefs
         if (warnings.length) meta.warnings = warnings
+        // 成功路径同样要释放控制器，否则 active 会随消息数无限增长。
+        // 若本条已被 regenerate/editResend/新发送取代，则不再写入与广播（避免脏写过期消息）。
+        const replaced = superseded.delete(assistantMsgId)
+        const stillCurrent = active.has(assistantMsgId)
+        active.delete(assistantMsgId)
+        if (replaced || !stillCurrent) return
         repos.updateMessage(db, assistantMsgId, {
           content: r.content || acc,
           status: 'done',
@@ -233,6 +275,7 @@ async function startStream({ conversationId, assistantMsgId, kbIds, attachments 
         repos.touchConversation(db, conversationId)
         broadcast('chat:event', {
           type: 'done',
+          conversationId,
           msgId: assistantMsgId,
           content: r.content || acc,
           meta: Object.keys(meta).length ? meta : null
@@ -241,8 +284,17 @@ async function startStream({ conversationId, assistantMsgId, kbIds, attachments 
       } catch (e) {
         active.delete(assistantMsgId)
         if (e && e.name === 'AbortError') {
+          // 被 regenerate / editResend / 新发送取代：静默退出，不写库也不广播
+          if (superseded.delete(assistantMsgId)) return
+          // 中止时强制落一次检查点，保证已生成内容与停止状态一致
+          checkpoint(true)
           repos.updateMessage(db, assistantMsgId, { content: acc, status: 'stopped' })
-          broadcast('chat:event', { type: 'stopped', msgId: assistantMsgId, content: acc })
+          broadcast('chat:event', {
+            type: 'stopped',
+            conversationId,
+            msgId: assistantMsgId,
+            content: acc
+          })
           return
         }
         const kind = e instanceof GatewayError ? e.kind : 'network_error'
@@ -255,25 +307,32 @@ async function startStream({ conversationId, assistantMsgId, kbIds, attachments 
         repos.logKeyEvent(db, { apiKeyId: key.id, kind: 'request', result: kind, detail: lastErr })
         broadcast('chat:event', {
           type: 'notice',
+          conversationId,
           msgId: assistantMsgId,
           message: `Key「${key.label || key.id.slice(0, 6)}」失败(${kind})，尝试切换…`
         })
       }
     }
+    // 重试用尽仍需清理取代标记，避免 Set 长期残留
+    superseded.delete(assistantMsgId)
     repos.updateMessage(db, assistantMsgId, {
       status: 'error',
       content: acc,
       meta: { error: lastErr || '无可用 Key' }
     })
+    active.delete(assistantMsgId)
     broadcast('chat:event', {
       type: 'error',
+      conversationId,
       msgId: assistantMsgId,
       message: lastErr || '无可用 Key'
     })
   } catch (e) {
     const msg = String((e && e.message) || e)
+    superseded.delete(assistantMsgId)
     repos.updateMessage(db, assistantMsgId, { status: 'error', content: acc, meta: { error: msg } })
-    broadcast('chat:event', { type: 'error', msgId: assistantMsgId, message: msg })
+    active.delete(assistantMsgId)
+    broadcast('chat:event', { type: 'error', conversationId, msgId: assistantMsgId, message: msg })
   }
 }
 
@@ -281,6 +340,8 @@ async function sendChat({ conversationId, content, kbIds, attachments }) {
   const db = dbm.get()
   const conv = repos.getConversation(db, conversationId)
   if (!conv) throw new Error('会话不存在')
+  // 后端闸门：同一会话同时只允许一条在途流（前端 hasStreaming 只是第一道拦截）
+  abortStreamsOf(conversationId, 'new-send')
   const userMsg = repos.insertMessage(db, {
     conversationId,
     role: 'user',
@@ -309,11 +370,36 @@ async function sendChat({ conversationId, content, kbIds, attachments }) {
   return { userMsgId: userMsg.id, assistantMsgId: assistant.id }
 }
 
+// 中止某会话所有在途流（regenerate / editResend / 重复发送前调用），
+// 避免旧流跑完后写入已软删的消息并广播过期的 done。
+function abortStreamsOf(conversationId, by = 'unknown') {
+  const recalled = []
+  for (const [msgId, entry] of active) {
+    if (entry && entry.conversationId === conversationId) {
+      // 标记为「被取代」：中止后不再写库、不再广播，且重试循环不得复活它
+      superseded.add(msgId)
+      try {
+        entry.ac.abort()
+      } catch {
+        // 已结束的控制器 abort 是空操作
+      }
+      active.delete(msgId)
+      recalled.push(msgId)
+    }
+  }
+  // 内部召回不得静默（方案四 §5.4）：记录发起方与被召回的消息
+  if (recalled.length) {
+    broadcast('stream.recalled', { conversationId, by, msgIds: recalled })
+  }
+  return recalled
+}
+
 async function regenerate(conversationId) {
   const db = dbm.get()
   const rows = repos.listMessages(db, conversationId)
   const lastAssistant = [...rows].reverse().find((m) => m.role === 'assistant')
   if (!lastAssistant) throw new Error('没有可重新生成的回复')
+  abortStreamsOf(conversationId, 'regenerate')
   repos.softDeleteMessagesFrom(db, conversationId, lastAssistant.seq)
   const remaining = repos.listMessages(db, conversationId)
   const lastUser = [...remaining].reverse().find((m) => m.role === 'user')
@@ -343,6 +429,7 @@ async function editResend({ msgId, content }) {
   const db = dbm.get()
   const msg = repos.getMessage(db, msgId)
   if (!msg) throw new Error('消息不存在')
+  abortStreamsOf(msg.conversationId, 'edit-resend')
   repos.updateMessage(db, msgId, { content })
   repos.softDeleteMessagesFrom(db, msg.conversationId, msg.seq + 1)
   const meta = safeJson(msg.meta, {}) || {}
@@ -368,9 +455,9 @@ async function editResend({ msgId, content }) {
 }
 
 function stopChat(msgId) {
-  const ac = active.get(msgId)
-  if (ac) {
-    ac.abort()
+  const entry = active.get(msgId)
+  if (entry && entry.ac) {
+    entry.ac.abort()
     return true
   }
   return false
