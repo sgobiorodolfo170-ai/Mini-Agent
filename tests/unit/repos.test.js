@@ -8,15 +8,40 @@ beforeEach(() => {
 })
 
 describe('schema + settings', () => {
-  it('migrates to v5 and roundtrips settings', () => {
+  it('migrates to v7 and roundtrips settings', () => {
     const row = dbm.get().prepare('PRAGMA user_version').get()
     expect(row.user_version).toBe(dbm.SCHEMA_VERSION)
-    expect(dbm.SCHEMA_VERSION).toBe(5)
+    expect(dbm.SCHEMA_VERSION).toBe(7)
     repos.setSetting(dbm.get(), 'theme', 'dark')
     repos.setSetting(dbm.get(), 'agentAuthorizedDirs', ['C:\\a', 'C:\\b'])
     expect(repos.getSetting(dbm.get(), 'theme')).toBe('dark')
     expect(repos.getSetting(dbm.get(), 'agentAuthorizedDirs')).toEqual(['C:\\a', 'C:\\b'])
     expect(repos.getAllSettings(dbm.get()).theme).toBe('dark')
+  })
+})
+
+describe('conversations permission（会话级权限记忆）', () => {
+  it('create 默认 default，update 往返四级，非法值不写入', () => {
+    const db = dbm.get()
+    const cid = repos.createConversation(db, { title: '权限会话' }).id
+    expect(repos.getConversation(db, cid).permission).toBe('default')
+
+    for (const p of ['readonly', 'autonomous', 'full', 'default']) {
+      repos.updateConversation(db, cid, { permission: p })
+      expect(repos.getConversation(db, cid).permission).toBe(p)
+    }
+    // 非法权限值保持原值（收敛不放大）
+    repos.updateConversation(db, cid, { permission: 'readonly' })
+    repos.updateConversation(db, cid, { permission: 'superuser' })
+    expect(repos.getConversation(db, cid).permission).toBe('readonly')
+
+    // create 时非法值同样收敛 default
+    const c2 = repos.createConversation(db, { title: '非法', permission: 'hacker' })
+    expect(c2.permission).toBe('default')
+
+    // 列表查询携带 permission 字段
+    const list = repos.listConversations(db)
+    expect(list.find((c) => c.id === cid).permission).toBe('readonly')
   })
 })
 

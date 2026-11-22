@@ -101,6 +101,16 @@ textarea {
     @apply rounded-xl border border-line-subtle bg-surface;
   }
 
+  /* 对话区悬浮卡片：圆角与阴影对齐输入卡片 */
+  .chat-surface {
+    border-radius: 22px;
+    background: var(--bg-surface);
+    box-shadow: 0 6px 22px rgba(15, 23, 42, 0.055);
+  }
+  html.dark .chat-surface {
+    box-shadow: 0 6px 22px rgba(0, 0, 0, 0.32);
+  }
+
   /* 列表行：44px 起，选中品牌浅底 */
   .list-row {
     @apply flex min-h-[44px] w-full cursor-pointer items-center gap-1.5 rounded-lg px-3 text-left text-sm text-ink-primary;
@@ -156,7 +166,72 @@ textarea {
   @apply rounded border border-line-subtle bg-subtle px-1 py-0.5 font-code text-[13px] text-brand-ink;
 }
 .md-body pre {
-  @apply code-scroll my-2 rounded-lg bg-zinc-900 p-3 font-code text-[13px] leading-[21px] text-zinc-100 dark:bg-black/60;
+  @apply code-scroll my-2 rounded-lg p-3 font-code text-[13px] leading-[21px];
+  background: var(--code-bg);
+  color: var(--code-fg);
+}
+.md-body pre code.hljs {
+  display: block;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+}
+/* highlight.js 语法色（浅/深主题由 tokens.css 提供） */
+.hljs-doctag,
+.hljs-keyword,
+.hljs-template-tag,
+.hljs-template-variable,
+.hljs-type,
+.hljs-variable.language_ {
+  color: var(--code-keyword);
+}
+.hljs-title,
+.hljs-title.class_,
+.hljs-title.function_ {
+  color: var(--code-entity);
+}
+.hljs-attr,
+.hljs-attribute,
+.hljs-literal,
+.hljs-meta,
+.hljs-number,
+.hljs-operator,
+.hljs-variable,
+.hljs-selector-attr,
+.hljs-selector-class,
+.hljs-selector-id {
+  color: var(--code-constant);
+}
+.hljs-regexp,
+.hljs-string,
+.hljs-meta .hljs-string {
+  color: var(--code-string);
+}
+.hljs-built_in,
+.hljs-symbol {
+  color: var(--code-builtin);
+}
+.hljs-comment,
+.hljs-quote {
+  color: var(--code-comment);
+}
+.hljs-name,
+.hljs-section,
+.hljs-selector-tag,
+.hljs-tag {
+  color: var(--code-tag);
+}
+.hljs-addition {
+  color: var(--code-tag);
+}
+.hljs-deletion {
+  color: var(--code-deletion);
+}
+.hljs-emphasis {
+  font-style: italic;
+}
+.hljs-strong {
+  font-weight: 600;
 }
 .md-body table {
   @apply my-2 border-collapse text-sm;
@@ -174,9 +249,25 @@ textarea {
 
 .code-block {
   @apply code-scroll my-2 overflow-hidden rounded-lg border border-line-subtle;
+  background: var(--code-bg);
 }
 .code-head {
   @apply flex justify-between items-center px-3 py-1.5 bg-subtle text-xs text-ink-muted;
+}
+.code-copy {
+  @apply inline-flex h-6 w-6 items-center justify-center rounded text-ink-muted hover:bg-surface hover:text-ink-primary;
+}
+.code-copy__done {
+  display: none;
+}
+.code-copy.is-copied {
+  @apply text-ok-ink;
+}
+.code-copy.is-copied .code-copy__copy {
+  display: none;
+}
+.code-copy.is-copied .code-copy__done {
+  display: inline;
 }
 .cursor-blink {
   @apply animate-pulse text-brand;

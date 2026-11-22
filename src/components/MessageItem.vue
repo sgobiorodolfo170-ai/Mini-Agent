@@ -71,7 +71,11 @@ function onEditKeydown(e) {
 </script>
 
 <template>
-  <div class="flex flex-col w-full" :class="isUser ? 'items-end' : 'items-start'">
+  <div
+    class="flex flex-col w-full"
+    :class="isUser ? 'items-end' : 'items-start'"
+    :data-msg-id="msg.id"
+  >
     <div class="max-w-[85%] min-w-0 group" :class="isUser ? '' : 'max-w-full w-full'">
       <!-- attachments -->
       <div
@@ -154,33 +158,42 @@ function onEditKeydown(e) {
           >
             {{ statusLabel }}
           </span>
-          <button v-if="copied" class="text-ok-ink" aria-live="polite">{{ copied }}</button>
-          <button v-else class="hover:text-brand-ink" aria-label="复制消息" @click="copy">
-            复制
+          <button
+            v-if="!streaming"
+            class="hover:text-bad-ink"
+            aria-label="删除消息"
+            title="删除"
+            @click="removeMsg"
+          >
+            <UiIcon name="trash" :size="14" />
           </button>
           <button
             v-if="isUser"
             class="hover:text-brand-ink"
             aria-label="编辑消息"
+            title="编辑"
             @click="startEdit"
           >
-            编辑
+            <UiIcon name="edit" :size="14" />
           </button>
           <button
             v-if="!isUser && isLast && !streaming"
             class="hover:text-brand-ink"
             aria-label="重新生成回答"
+            title="重新生成"
             @click="regenerate"
           >
-            重新生成
+            <UiIcon name="refresh" :size="14" />
           </button>
+          <button v-if="copied" class="text-ok-ink" aria-live="polite">{{ copied }}</button>
           <button
-            v-if="!streaming"
-            class="hover:text-bad-ink"
-            aria-label="删除消息"
-            @click="removeMsg"
+            v-else
+            class="hover:text-brand-ink"
+            aria-label="复制消息"
+            title="复制"
+            @click="copy"
           >
-            删除
+            <UiIcon name="copy" :size="14" />
           </button>
         </template>
       </div>

@@ -3,6 +3,7 @@ import { computed, ref } from 'vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import UiDialog from '../components/UiDialog.vue'
 import UiIcon from '../components/UiIcon.vue'
+import RowMenu from '../components/RowMenu.vue'
 import { useKbStore } from '../stores/kb'
 import { useSettingsStore } from '../stores/settings'
 import { useUiStore } from '../stores/ui'
@@ -103,6 +104,10 @@ async function removeKb(k) {
   })
   if (ok) await kb.remove(k.id)
 }
+// 知识库行「…」菜单
+function kbMenuItems(k) {
+  return [{ id: 'remove', label: '删除', icon: 'trash', danger: true, onSelect: () => removeKb(k) }]
+}
 
 async function removeDoc(d) {
   const ok = await ui.confirm({
@@ -141,21 +146,23 @@ const hasSearched = computed(() => !!kb.lastSearch && kb.lastSearch.kbId === kb.
 </script>
 
 <template>
-  <div class="h-full flex min-w-0">
+  <div class="h-full flex min-w-0 bg-chrome">
     <!-- 侧栏只保留列表与入口，创建放入对话框（F15） -->
     <aside
-      class="w-64 shrink-0 flex flex-col border-r border-line-subtle bg-subtle"
+      class="shrink-0 flex flex-col bg-chrome"
+      :style="{ width: ui.chatListWidth + 'px' }"
       aria-label="知识库列表"
     >
       <div class="px-3 pt-3 pb-2 flex items-center gap-2">
-        <span class="text-sm font-semibold flex-1">知识库</span>
+        <span class="text-base font-semibold text-ink-primary flex-1">知识库</span>
         <button
-          class="btn-primary !h-8 !px-2.5 text-xs"
+          class="icon-btn !h-8 !w-8 border border-line-subtle bg-chrome"
           data-testid="kb-create-open"
+          title="新建知识库"
+          aria-label="新建知识库"
           @click="openCreate"
         >
-          <UiIcon name="plus" :size="14" />
-          新建
+          <UiIcon name="plus" :size="16" />
         </button>
       </div>
       <div class="px-2.5 pb-2">
@@ -189,18 +196,7 @@ const hasSearched = computed(() => !!kb.lastSearch && kb.lastSearch.kbId === kb.
           <span class="text-xs text-ink-muted shrink-0">
             {{ k.stats ? `${k.stats.docs} 文档` : '' }}
           </span>
-          <span
-            class="shrink-0 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity"
-          >
-            <button
-              class="icon-btn-sm !w-6 !h-6 hover:!text-red-500"
-              title="删除"
-              :aria-label="'删除知识库 ' + k.name"
-              @click.stop="removeKb(k)"
-            >
-              <UiIcon name="trash" :size="14" />
-            </button>
-          </span>
+          <RowMenu :items="kbMenuItems(k)" label="知识库操作" />
         </div>
         <div v-if="!kb.visibleKbs.length" class="px-3 py-6 text-center text-xs text-ink-muted">
           还没有知识库，点击「新建」创建
@@ -208,12 +204,10 @@ const hasSearched = computed(() => !!kb.lastSearch && kb.lastSearch.kbId === kb.
       </div>
     </aside>
 
-    <section class="flex-1 min-w-0 flex flex-col">
+    <section class="flex-1 min-w-0 flex flex-col m-3 chat-surface overflow-hidden">
       <template v-if="kb.activeKb">
         <!-- 页头 -->
-        <header
-          class="shrink-0 px-5 py-3.5 border-b border-line-subtle flex items-center gap-3 flex-wrap"
-        >
+        <header class="shrink-0 px-5 py-3.5 bg-surface flex items-center gap-3 flex-wrap">
           <div class="min-w-0">
             <h2 class="text-lg font-semibold truncate">{{ kb.activeKb.name }}</h2>
             <div class="text-xs text-ink-muted">
@@ -231,7 +225,7 @@ const hasSearched = computed(() => !!kb.lastSearch && kb.lastSearch.kbId === kb.
           </button>
         </header>
 
-        <div class="scroll-region flex-1 px-5 py-4 space-y-4">
+        <div class="scroll-region flex-1 px-5 py-4 space-y-4 bg-surface">
           <!-- 导入进度 -->
           <div v-if="kb.progress && !kb.progress.done" class="text-xs">
             <div class="flex justify-between mb-1 text-ink-secondary">
@@ -383,7 +377,7 @@ const hasSearched = computed(() => !!kb.lastSearch && kb.lastSearch.kbId === kb.
       <div v-else class="h-full flex items-center justify-center text-ink-muted">
         <div class="text-center">
           <div class="text-base text-ink-secondary mb-3">选择左侧知识库，或创建一个新的</div>
-          <button class="btn-primary" @click="openCreate">新建知识库</button>
+          <button class="btn-secondary !bg-chrome" @click="openCreate">新建知识库</button>
         </div>
       </div>
     </section>

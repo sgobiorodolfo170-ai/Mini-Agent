@@ -169,9 +169,13 @@ async function sendToSession({
     length: text.length
   })
 
-  // permission 缺省按普通对话处理；只有显式要求任务模式才起 Agent 运行
-  const mode =
-    permission === 'full' ? 'full' : permission === 'autonomous' ? 'autonomous' : 'default'
+  // permission 缺省按普通对话处理；只有显式要求任务模式才起 Agent 运行。
+  // readonly/full 原样透传：readonly 子会话继承只读不提权（index.js 会话管理同口径）
+  const mode = ['readonly', 'full'].includes(permission)
+    ? permission
+    : permission === 'autonomous'
+      ? 'autonomous'
+      : 'default'
   if (mode === 'default') {
     const r = await deps.gateway.sendChat({ conversationId, content: text })
     emit('session.sent', {

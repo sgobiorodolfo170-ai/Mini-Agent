@@ -34,6 +34,8 @@ Thumbs.db
 NVIDIA Corporation/
 .box-agent/
 .box-agent-scratch/
+.trae/
+.trae-html-share-packages/
 # 本地调试截图（工具/会话产物，不属于交付物）
 .tmp-*.png
 2026*.png

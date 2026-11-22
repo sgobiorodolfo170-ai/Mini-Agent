@@ -37,6 +37,10 @@ describe('mandate 规范化（§4.2）', () => {
   it('未知 permissionMode 收敛到 autonomous，不放大权限', () => {
     expect(normalizeMandate({ permissionMode: 'godmode' }).permissionMode).toBe('autonomous')
   })
+
+  it('readonly 权限模式归一化时保留', () => {
+    expect(normalizeMandate({ permissionMode: 'readonly' }).permissionMode).toBe('readonly')
+  })
 })
 
 describe('父子权限求交（§4.1）', () => {
@@ -63,6 +67,22 @@ describe('父子权限求交（§4.1）', () => {
       baseMandate({ permissionMode: 'default' })
     )
     expect(merged.permissionMode).toBe('default')
+  })
+
+  it('readonly 父 ∩ full 子 = readonly：子任务无法借求交提权获得写能力', () => {
+    const merged = intersectMandate(
+      baseMandate({ permissionMode: 'readonly' }),
+      baseMandate({ permissionMode: 'full' })
+    )
+    expect(merged.permissionMode).toBe('readonly')
+  })
+
+  it('full 父 ∩ readonly 子 = readonly：子主动收敛到只读', () => {
+    const merged = intersectMandate(
+      baseMandate({ permissionMode: 'full' }),
+      baseMandate({ permissionMode: 'readonly' })
+    )
+    expect(merged.permissionMode).toBe('readonly')
   })
 
   it('目录：子必须是父的子集', () => {
@@ -114,6 +134,27 @@ describe('工具授权校验（§4.4）', () => {
     const r = authorizeToolCall({ toolName: 'run_command', args: { command: 'dir' }, mandate: m })
     expect(r.allowed).toBe(false)
     expect(r.reason).toBe('high_risk_requires_explicit')
+  })
+
+  it('readonly 模式下写类工具被拒绝，只读工具放行', () => {
+    const m = baseMandate({ permissionMode: 'readonly' })
+    // write_file 在 tools.js 中标注为 side_effect 风险
+    const deny = authorizeToolCall({
+      toolName: 'write_file',
+      args: { path: 'C:\\proj\\a.txt', content: 'x' },
+      mandate: m,
+      riskLevel: 'side_effect'
+    })
+    expect(deny.allowed).toBe(false)
+    expect(deny.reason).toBe('risk_exceeds_mode')
+
+    const allow = authorizeToolCall({
+      toolName: 'read_file',
+      args: { path: 'C:\\proj\\a.txt' },
+      mandate: m,
+      riskLevel: 'readonly'
+    })
+    expect(allow.allowed).toBe(true)
   })
 })
 

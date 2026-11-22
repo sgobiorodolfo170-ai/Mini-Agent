@@ -7,7 +7,8 @@ export const useChatStore = defineStore('chat', {
     activeId: null,
     messages: [],
     selectedKbIds: [],
-    // 权限等级：default（普通对话）/ autonomous（自主模式，逐次确认）/ full（完整权限，不再逐次确认）
+    // 权限四级：default（普通对话）/ readonly（只读任务，写入类直接拒绝）/
+    // autonomous（自主模式，逐次确认）/ full（完整权限，不再逐次确认）
     permission: 'default',
     // Agent 集群：允许一次派发多个子 Agent 并行处理
     agentCluster: false,
@@ -58,6 +59,12 @@ export const useChatStore = defineStore('chat', {
     async select(id) {
       this.activeId = id
       this.messages = await window.api.conversations.messages(id)
+      // 会话级权限记忆：切回会话恢复上次的权限级别
+      const conv = this.conversations.find((c) => c.id === id)
+      const p = conv && conv.permission
+      this.permission = ['default', 'readonly', 'autonomous', 'full'].includes(p) ? p : 'default'
+      // 恢复的权限不支持集群（无工具或 spawn_agent 必被拒），清掉无效开关
+      if (this.permission === 'default' || this.permission === 'readonly') this.agentCluster = false
     },
     async create(opts = {}) {
       const c = await window.api.conversations.create(plain(opts))
@@ -69,6 +76,17 @@ export const useChatStore = defineStore('chat', {
       const c = await window.api.conversations.update({ id, patch: plain(patch) })
       const i = this.conversations.findIndex((x) => x.id === id)
       if (i >= 0 && c) this.conversations[i] = c
+    },
+    // 切换权限级别并按会话持久化（乐观更新；持久化失败静默，切回会话自然回滚）
+    async setPermission(id) {
+      if (!['default', 'readonly', 'autonomous', 'full'].includes(id)) return
+      this.permission = id
+      if (!this.activeId) return
+      try {
+        await this.updateConv(this.activeId, { permission: id })
+      } catch {
+        // 持久化失败不阻断 UI
+      }
     },
     async removeConv(id) {
       await window.api.conversations.remove(id)

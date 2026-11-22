@@ -68,7 +68,7 @@ function normalizeMandate(raw) {
     // 空数组 = 不允许任何工具；未提供 = 继承上一级（由上层求交决定）
     allowedTools: Array.isArray(raw.allowedTools) ? raw.allowedTools.slice() : null,
     deniedTools: Array.isArray(raw.deniedTools) ? raw.deniedTools.slice() : [],
-    permissionMode: ['default', 'autonomous', 'full'].includes(raw.permissionMode)
+    permissionMode: ['default', 'readonly', 'autonomous', 'full'].includes(raw.permissionMode)
       ? raw.permissionMode
       : 'autonomous',
     authorizedDirs: {
@@ -118,7 +118,10 @@ function intersectMandate(parent, child) {
   const deniedTools = [...new Set([...(p.deniedTools || []), ...((c && c.deniedTools) || [])])]
 
   // 风险上限：取更严格的一方
-  const modeRank = { default: 0, autonomous: 1, full: 2 }
+  // 排序依据是 authorizeToolCall 的实际拦截强度（readonly 拦截全部非只读 → default 拦 destructive
+  // → autonomous 全走应用确认 → full 全放行），而非业务四级顺序：
+  // readonly 父 ∩ 任意子 必为 readonly，子任务无法借求交提权获得写能力。
+  const modeRank = { readonly: 0, default: 1, autonomous: 2, full: 3 }
   const pMode = p.permissionMode || 'autonomous'
   const cMode = (c && c.permissionMode) || pMode
   const permissionMode = modeRank[cMode] <= modeRank[pMode] ? cMode : pMode
@@ -229,6 +232,11 @@ function authorizeToolCall({ toolName, args, mandate, riskLevel = 'readonly' }) 
   // 风险等级上限：permissionMode=default 时不允许 destructive
   if (m.permissionMode === 'default' && RISK_ORDER[riskLevel] >= RISK_ORDER.destructive) {
     return { allowed: false, reason: 'risk_exceeds_mode', detail: '当前模式不允许破坏性操作' }
+  }
+
+  // 只读模式：仅放行 readonly 风险，side_effect/destructive 一律拒绝
+  if (m.permissionMode === 'readonly' && RISK_ORDER[riskLevel] > RISK_ORDER.readonly) {
+    return { allowed: false, reason: 'risk_exceeds_mode', detail: '只读模式不允许非只读工具' }
   }
 
   // 命令类工具无参数级授权能力：非 full 模式下需经过确认流程（此处放行但标记）

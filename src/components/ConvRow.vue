@@ -1,6 +1,6 @@
 <script setup>
-import { ref, watch } from 'vue'
-import UiIcon from './UiIcon.vue'
+import { computed, ref, watch } from 'vue'
+import RowMenu from './RowMenu.vue'
 
 // 会话列表行（置顶 / 项目分组 / 最近三处复用）；重命名草稿由行内部管理
 const props = defineProps({
@@ -9,6 +9,17 @@ const props = defineProps({
   editing: { type: Boolean, default: false }
 })
 const emit = defineEmits(['select', 'rename', 'rename-submit', 'pin', 'remove'])
+
+const menuItems = computed(() => [
+  { id: 'rename', label: '重命名', icon: 'edit', onSelect: () => emit('rename') },
+  {
+    id: 'pin',
+    label: props.conv.pinned ? '取消置顶' : '置顶',
+    icon: 'pin',
+    onSelect: () => emit('pin')
+  },
+  { id: 'remove', label: '删除', icon: 'trash', danger: true, onSelect: () => emit('remove') }
+])
 
 const draft = ref('')
 watch(
@@ -37,7 +48,6 @@ function onKeydown(e) {
     :aria-current="active ? 'true' : undefined"
     @click="emit('select')"
     @keydown.enter.prevent="emit('select')"
-    @dblclick="emit('rename')"
   >
     <template v-if="editing">
       <input
@@ -59,37 +69,7 @@ function onKeydown(e) {
       >
         子会话
       </span>
-      <span v-if="conv.pinned" title="已置顶" class="text-brand-ink shrink-0">
-        <UiIcon name="pin" :size="14" />
-      </span>
-      <span
-        class="flex gap-0.5 shrink-0 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity"
-      >
-        <button
-          class="icon-btn-sm !w-6 !h-6"
-          title="重命名"
-          aria-label="重命名会话"
-          @click.stop="emit('rename')"
-        >
-          <UiIcon name="edit" :size="14" />
-        </button>
-        <button
-          class="icon-btn-sm !w-6 !h-6"
-          title="置顶/取消置顶"
-          aria-label="置顶或取消置顶"
-          @click.stop="emit('pin')"
-        >
-          <UiIcon name="pin" :size="14" />
-        </button>
-        <button
-          class="icon-btn-sm !w-6 !h-6 hover:!text-red-500"
-          title="删除"
-          aria-label="删除会话"
-          @click.stop="emit('remove')"
-        >
-          <UiIcon name="trash" :size="14" />
-        </button>
-      </span>
+      <RowMenu :items="menuItems" label="会话操作" />
     </template>
   </div>
 </template>

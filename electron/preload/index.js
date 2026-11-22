@@ -55,6 +55,7 @@ function buildMain() {
       regenerate: (cid) => inv('chat:regenerate', cid),
       editResend: (o) => inv('chat:editResend', o),
       export: (o) => inv('chat:export', o),
+      optimizePrompt: (o) => inv('chat:optimizePrompt', o),
       deleteMessage: (msgId) => inv('chat:messageDelete', msgId)
     },
     kb: {

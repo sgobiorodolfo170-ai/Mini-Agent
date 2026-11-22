@@ -4,8 +4,8 @@ import { createPinia, setActivePinia } from 'pinia'
 
 import { useChatStore } from '../../../src/stores/chat'
 
-const c1 = { id: 'c1', title: '会话一', pinned: 0, updated_at: 2 }
-const c2 = { id: 'c2', title: '会话二', pinned: 0, updated_at: 1 }
+const c1 = { id: 'c1', title: '会话一', pinned: 0, updated_at: 2, permission: 'default' }
+const c2 = { id: 'c2', title: '会话二', pinned: 0, updated_at: 1, permission: 'readonly' }
 const m1 = { id: 'm1', role: 'user', content: '你好', status: 'done' }
 const m2 = { id: 'm2', role: 'assistant', content: '旧回复', status: 'done' }
 
@@ -57,6 +57,45 @@ describe('chat store 会话操作', () => {
     expect(s.activeId).toBe('c1')
     expect(s.messages).toEqual([m1, m2])
     expect(s.activeConv.title).toBe('会话一')
+  })
+
+  it('select 恢复会话级权限记忆（含非法值回退 default）', async () => {
+    const s = useChatStore()
+    await s.loadConversations()
+    // c2 带 readonly：切回恢复为只读任务
+    await s.select('c2')
+    expect(s.permission).toBe('readonly')
+    // 非法权限值收敛 default
+    s.conversations[1].permission = 'hacker'
+    await s.select('c2')
+    expect(s.permission).toBe('default')
+    // c1 显式 default
+    await s.select('c1')
+    expect(s.permission).toBe('default')
+  })
+
+  it('setPermission 乐观更新并按会话持久化，readonly 时 agentMode 走 agent.run', async () => {
+    const s = useChatStore()
+    await s.loadConversations()
+    await s.select('c1')
+    await s.setPermission('full')
+    expect(s.permission).toBe('full')
+    expect(window.api.conversations.update).toHaveBeenCalledWith({
+      id: 'c1',
+      patch: { permission: 'full' }
+    })
+    // 非法值被拒绝
+    await s.setPermission('godmode')
+    expect(s.permission).toBe('full')
+
+    // readonly 属任务模式：send 走 agent.run 并透传权限
+    await s.setPermission('readonly')
+    expect(s.agentMode).toBe(true)
+    await s.send('只读任务')
+    expect(window.api.agent.run).toHaveBeenCalledWith(
+      expect.objectContaining({ permission: 'readonly' })
+    )
+    expect(window.api.chat.send).not.toHaveBeenCalled()
   })
 
   it('create 新建会话后自动加载列表并选中', async () => {

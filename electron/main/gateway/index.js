@@ -1,6 +1,6 @@
 const repos = require('../../store/repos')
 const dbm = require('../../store/db')
-const { chatStream, GatewayError } = require('./client')
+const { chatStream, chatOnce, GatewayError } = require('./client')
 const scheduler = require('./scheduler')
 const { buildContext } = require('./context')
 const { decryptSecret } = require('../../store/keys')
@@ -463,11 +463,82 @@ function stopChat(msgId) {
   return false
 }
 
+// 提示词优化：结合当前会话最近几轮上下文，把输入框草稿改写为更明确的提示词。
+// 与主对话共用供应商/模型/密钥调度，但不写入消息记录。
+async function optimizePrompt({ conversationId, content } = {}) {
+  const draft = String(content || '').trim()
+  if (!draft) throw new Error('请先输入提示词')
+  const db = dbm.get()
+  const { provider, model } = resolveModel(db, conversationId)
+  if (!provider) throw new Error('未配置模型服务，请先在设置中添加供应商')
+  if (!model) throw new Error('未配置模型，请先在「设置 → 会话」中选择')
+  const keyRows = repos.listAllKeysWithSecret(db).filter((x) => x.providerId === provider.id)
+  if (!keyRows.length) throw new Error(`供应商「${provider.name}」没有可用的 Key`)
+
+  const rows = conversationId ? repos.listMessages(db, conversationId) : []
+  const history = rows
+    .filter(
+      (m) =>
+        m.status !== 'error' &&
+        (m.role === 'user' || m.role === 'assistant') &&
+        typeof m.content === 'string' &&
+        m.content.trim()
+    )
+    .slice(-8)
+    .map((m) => `${m.role === 'user' ? '用户' : '助手'}：${m.content.slice(0, 400)}`)
+    .join('\n')
+
+  const system = [
+    '你是提示词优化助手。',
+    '请结合对话上下文，把用户当前的草稿改写成更清晰、具体、可执行的提示词。',
+    '保留原意，不编造事实；只输出优化后的提示词，不要解释或添加前后缀。'
+  ].join('\n')
+  const user = [history ? `对话上下文：\n${history}` : '', `当前草稿：\n${draft}`]
+    .filter(Boolean)
+    .join('\n\n')
+
+  const payload = {
+    model,
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: user }
+    ],
+    stream: false
+  }
+
+  const exclude = []
+  let lastErr = null
+  const maxAttempts = Math.max(1, Math.min(3, keyRows.length))
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const key = scheduler.pickKey(keyRows, provider.rotation_strategy, exclude, Date.now())
+    if (!key) break
+    exclude.push(key.id)
+    try {
+      const r = await chatOnce({
+        baseUrl: provider.base_url,
+        apiKey: await decryptSecret(key.secretEnc),
+        payload
+      })
+      repos.updateKeyStatus(db, key.id, {
+        ...scheduler.applyKeyResult(key, 'ok', Date.now()),
+        lastUsedAt: Date.now()
+      })
+      const prompt = String((r && r.content) || '').trim()
+      if (!prompt) throw new Error('模型未返回优化结果')
+      return { prompt }
+    } catch (e) {
+      lastErr = e
+    }
+  }
+  throw lastErr || new Error('提示词优化失败')
+}
+
 module.exports = {
   sendChat,
   regenerate,
   editResend,
   stopChat,
+  optimizePrompt,
   resolveModel,
   modelParams,
   effectiveParams,

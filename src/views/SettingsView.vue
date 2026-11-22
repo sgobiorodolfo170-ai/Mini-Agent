@@ -12,7 +12,7 @@ const ui = useUiStore()
 const sections = [
   { key: 'model', label: '模型服务' },
   { key: 'chat', label: '会话' },
-  { key: 'models', label: '本地嵌入模型' },
+  { key: 'models', label: '本地向量模型' },
   { key: 'hotkeys', label: '快捷键' },
   { key: 'agent', label: '智能任务' },
   { key: 'appearance', label: '外观' },
@@ -70,7 +70,6 @@ async function saveHooks() {
     const saved = window.api.hooks ? await window.api.hooks.save(parsed) : parsed
     hooksJson.value = JSON.stringify(saved, null, 2)
     hooksError.value = ''
-    ui.toast(`钩子已保存（${saved.length} 条）`, 'success')
   } catch (e) {
     hooksError.value = String((e && e.message) || e)
     ui.toast('钩子保存失败：' + hooksError.value, 'error')
@@ -106,6 +105,14 @@ const keyTarget = ref(null)
 const newModel = ref('')
 const pulled = ref([]) // 拉取到的候选模型 [{id, vision, checked}]，勾选后手动添加
 const pickModel = ref('')
+// API Keys 显示/隐藏：按供应商记忆，默认展示
+const keysHidden = ref({})
+function keysVisible(pid) {
+  return !keysHidden.value[pid]
+}
+function toggleKeys(pid) {
+  keysHidden.value = { ...keysHidden.value, [pid]: !keysHidden.value[pid] }
+}
 
 // 新建供应商：先进入未保存编辑态，取消不落库（F11，不再生成 https:// 占位记录）
 const creating = ref(false)
@@ -341,7 +348,6 @@ async function saveHotkeys() {
     const bad = Object.entries(rep || {}).filter(([_k, v]) => !v.ok)
     if (bad.length)
       ui.toast('部分快捷键注册失败：' + bad.map(([k, v]) => `${k}(${v.reason})`).join('、'), 'warn')
-    else ui.toast('快捷键已更新', 'success')
   } catch (e) {
     ui.toast('保存失败：' + String((e && e.message) || e), 'error')
   }
@@ -358,14 +364,17 @@ function removeDir(d) {
   agentDirs.value = agentDirs.value.filter((x) => x !== d)
   settings.set('agentAuthorizedDirs', [...agentDirs.value])
 }
+// 编辑即保存：普通字段直接落库
 function saveAgent() {
+  settings.set('agentMaxSteps', Number(maxSteps.value) || 15)
+  settings.set('webSearchProvider', webSearchProvider.value || 'auto')
+  settings.set('tavilyApiKey', tavilyApiKey.value.trim() || null)
+}
+// MCP JSON 需先校验再落库，避免把非法 JSON 写入设置
+function saveMcpServers() {
   try {
-    if (mcpServersJson.value.trim()) JSON.parse(mcpServersJson.value) // 格式校验
-    settings.set('agentMaxSteps', Number(maxSteps.value) || 15)
-    settings.set('webSearchProvider', webSearchProvider.value || 'auto')
-    settings.set('tavilyApiKey', tavilyApiKey.value.trim() || null)
+    if (mcpServersJson.value.trim()) JSON.parse(mcpServersJson.value)
     settings.set('agentMcpServers', mcpServersJson.value.trim() || null)
-    ui.toast('智能任务设置已保存', 'success')
   } catch (e) {
     ui.toast(
       '保存失败：' +
@@ -493,13 +502,14 @@ function setModelParam(m, field, value) {
 </script>
 
 <template>
-  <div class="h-full flex min-w-0">
+  <div class="h-full flex min-w-0 bg-chrome">
     <!-- 分组导航（F10）：任一分组一次点击可达 -->
     <nav
-      class="w-[200px] shrink-0 border-r border-line-subtle bg-subtle p-3 space-y-1"
+      class="shrink-0 bg-chrome p-3 space-y-1"
+      :style="{ width: ui.chatListWidth + 'px' }"
       aria-label="设置分组"
     >
-      <div class="px-2 pb-2 text-sm font-semibold">设置</div>
+      <div class="px-2 pb-2 text-base font-semibold text-ink-primary">设置</div>
       <button
         v-for="s in sections"
         :key="s.key"
@@ -517,661 +527,670 @@ function setModelParam(m, field, value) {
       </button>
     </nav>
 
-    <div class="scroll-region flex-1 min-w-0">
-      <div class="max-w-[960px] px-6 py-5 space-y-5">
-        <div v-if="!settings.initialized" class="text-xs text-ink-muted" role="status">
-          正在加载配置…
-        </div>
-
-        <!-- 会话：全局采样参数，对所有会话生效（不再按单个会话设置） -->
-        <section v-show="section === 'chat'" class="space-y-4">
-          <div>
-            <h2 class="text-base font-semibold">会话</h2>
-            <p class="text-xs text-ink-muted mt-1">
-              以下参数对所有会话生效。留空表示不设置，回退到该模型自身的参数或服务端默认。
-            </p>
+    <div class="flex-1 min-w-0 m-3 chat-surface overflow-hidden flex flex-col">
+      <div class="scroll-region flex-1 min-w-0 bg-surface">
+        <div class="max-w-[960px] px-6 py-5 space-y-5">
+          <div v-if="!settings.initialized" class="text-xs text-ink-muted" role="status">
+            正在加载配置…
           </div>
 
-          <div class="card p-4 max-w-[760px] space-y-4">
-            <div
-              v-for="f in SAMPLING_FIELDS"
-              :key="f.key"
-              :data-testid="'chat-field-' + f.key"
-              class="space-y-1"
-            >
-              <div class="flex items-center gap-2 flex-wrap">
-                <span class="field-label !mb-0 shrink-0 w-[68px]">{{ f.label }}</span>
-                <span class="text-xs text-ink-muted w-[72px] shrink-0">{{ f.api }}</span>
-                <input
-                  type="number"
-                  class="field-input !h-8 !w-20 shrink-0"
-                  :data-testid="'chat-input-' + f.key"
-                  :value="samplingValue(f.key)"
-                  :placeholder="f.key === 'keepTurns' ? '20' : '默认'"
-                  :step="f.key === 'keepTurns' ? 1 : 0.1"
-                  :min="f.key === 'keepTurns' ? 1 : 0"
-                  :max="f.key === 'temperature' ? 2 : f.key === 'topP' ? 1 : 100"
-                  :aria-label="f.label"
-                  @change="onSamplingInput(f.key, $event)"
-                />
+          <!-- 会话：全局采样参数，对所有会话生效（不再按单个会话设置） -->
+          <section v-show="section === 'chat'" class="space-y-4">
+            <div>
+              <h2 class="text-base font-semibold">会话</h2>
+              <p class="text-xs text-ink-muted mt-1">
+                以下参数对所有会话生效。留空表示不设置，回退到该模型自身的参数或服务端默认。
+              </p>
+            </div>
+
+            <div class="card p-4 max-w-[760px] space-y-4">
+              <div
+                v-for="f in SAMPLING_FIELDS"
+                :key="f.key"
+                :data-testid="'chat-field-' + f.key"
+                class="space-y-1"
+              >
+                <div class="flex items-center gap-2 flex-wrap">
+                  <span class="field-label !mb-0 shrink-0 w-[68px]">{{ f.label }}</span>
+                  <span class="text-xs text-ink-muted w-[72px] shrink-0">{{ f.api }}</span>
+                  <input
+                    type="number"
+                    class="field-input !h-8 !w-20 shrink-0"
+                    :data-testid="'chat-input-' + f.key"
+                    :value="samplingValue(f.key)"
+                    :placeholder="f.key === 'keepTurns' ? '20' : '默认'"
+                    :step="f.key === 'keepTurns' ? 1 : 0.1"
+                    :min="f.key === 'keepTurns' ? 1 : 0"
+                    :max="f.key === 'temperature' ? 2 : f.key === 'topP' ? 1 : 100"
+                    :aria-label="f.label"
+                    @change="onSamplingInput(f.key, $event)"
+                  />
+                  <button
+                    v-for="p in PRESETS[f.key]"
+                    :key="p.label"
+                    type="button"
+                    class="btn-compact !h-8 !px-2 !text-[11px] border shrink-0"
+                    :class="
+                      isPreset(f.key, p.value)
+                        ? 'bg-brand-soft text-brand-ink border-brand/40'
+                        : 'border-line-control text-ink-secondary hover:bg-subtle'
+                    "
+                    :title="p.hint"
+                    :data-testid="'chat-preset-' + f.key + '-' + p.value"
+                    @click="setSampling(f.key, p.value)"
+                  >
+                    {{ p.label }}
+                    <span class="text-ink-muted">{{ p.value }}</span>
+                  </button>
+                </div>
+                <span class="field-help">{{ f.help }}</span>
+              </div>
+
+              <div class="flex items-center justify-between gap-3 border-t border-line-subtle pt-3">
+                <p class="text-xs text-ink-muted">
+                  最大输出长度与上下文上限属于模型自身参数，请到「模型服务 → 编辑供应商 →
+                  模型参数」中按模型配置。
+                </p>
                 <button
-                  v-for="p in PRESETS[f.key]"
-                  :key="p.label"
-                  type="button"
-                  class="btn-compact !h-8 !px-2 !text-[11px] border shrink-0"
-                  :class="
-                    isPreset(f.key, p.value)
-                      ? 'bg-brand-soft text-brand-ink border-brand/40'
-                      : 'border-line-control text-ink-secondary hover:bg-subtle'
-                  "
-                  :title="p.hint"
-                  :data-testid="'chat-preset-' + f.key + '-' + p.value"
-                  @click="setSampling(f.key, p.value)"
+                  class="btn-secondary !h-8 shrink-0 text-xs"
+                  data-testid="chat-sampling-reset"
+                  @click="resetSampling"
                 >
-                  {{ p.label }}
-                  <span class="text-ink-muted">{{ p.value }}</span>
+                  恢复默认
                 </button>
               </div>
-              <span class="field-help">{{ f.help }}</span>
             </div>
+          </section>
 
-            <div class="flex items-center justify-between gap-3 border-t border-line-subtle pt-3">
-              <p class="text-xs text-ink-muted">
-                最大输出长度与上下文上限属于模型自身参数，请到「模型服务 → 编辑供应商 →
-                模型参数」中按模型配置。
-              </p>
-              <button
-                class="btn-secondary !h-8 shrink-0 text-xs"
-                data-testid="chat-sampling-reset"
-                @click="resetSampling"
-              >
-                恢复默认
-              </button>
-            </div>
-          </div>
-        </section>
-
-        <!-- 模型服务 -->
-        <section v-show="section === 'model'" class="space-y-4">
-          <h2 class="text-base font-semibold">模型服务</h2>
-          <p class="text-xs text-ink-muted">
-            先添加供应商并保存，再添加
-            Key、拉取模型；每个模型的输出长度与上下文上限在该卡片的「模型参数」中配置。会话使用哪个服务与模型，在「会话」选项卡中按会话选择。
-          </p>
-
-          <div
-            v-for="p in settings.providers"
-            :key="p.id"
-            class="card overflow-hidden"
-            data-testid="provider-card"
-          >
-            <div class="px-4 py-3 flex items-center gap-3">
-              <span class="font-medium text-sm shrink-0" data-testid="provider-name">{{
-                p.name
-              }}</span>
-              <StatusBadge :status="p.enabled ? 'ok' : 'unknown'" />
-              <span class="text-xs text-ink-muted truncate flex-1" :title="p.baseUrl">{{
-                p.baseUrl
-              }}</span>
-              <span class="text-xs text-ink-muted shrink-0"
-                >{{ p.keys.length }} 把 Key · {{ (p.models || []).length }} 个模型</span
-              >
-              <button
-                class="text-sm text-link hover:underline shrink-0 px-2 py-1"
-                title="配置供应商"
-                @click="editingId === p.id ? closeEdit() : startEdit(p)"
-              >
-                编辑
-              </button>
-              <button
-                class="text-sm text-red-600 hover:underline shrink-0 px-2 py-1"
-                @click="removeProvider(p)"
-              >
-                删除
-              </button>
-            </div>
+          <!-- 模型服务 -->
+          <section v-show="section === 'model'" class="space-y-4">
+            <h2 class="text-base font-semibold">模型服务</h2>
+            <p class="text-xs text-ink-muted">
+              先添加供应商并保存，再添加
+              Key、拉取模型；每个模型的输出长度与上下文上限在该卡片的「模型参数」中配置。会话使用哪个服务与模型，在「会话」选项卡中按会话选择。
+            </p>
 
             <div
-              v-if="editingId === p.id && draft"
-              class="px-4 pb-4 space-y-3 border-t border-line-subtle pt-3"
+              v-for="p in settings.providers"
+              :key="p.id"
+              class="card overflow-hidden"
+              data-testid="provider-card"
             >
-              <div class="grid grid-cols-2 gap-3">
-                <label>
-                  <span class="field-label">名称</span>
-                  <input v-model="draft.name" data-testid="p-name" class="field-input" />
-                </label>
-                <label>
-                  <span class="field-label">服务地址</span>
-                  <input
-                    v-model="draft.baseUrl"
-                    data-testid="p-url"
-                    placeholder="https://api.example.com/v1"
-                    class="field-input"
-                    :aria-invalid="!!urlError"
-                  />
-                  <span v-if="urlError" class="field-error">
-                    <UiIcon name="warn" :size="12" />
-                    {{ urlError }}
-                  </span>
-                </label>
+              <div class="px-4 py-3 flex items-center gap-3">
+                <span class="font-medium text-sm shrink-0" data-testid="provider-name">{{
+                  p.name
+                }}</span>
+                <StatusBadge :status="p.enabled ? 'ok' : 'unknown'" />
+                <span class="text-xs text-ink-muted truncate flex-1" :title="p.baseUrl">{{
+                  p.baseUrl
+                }}</span>
+                <span class="text-xs text-ink-muted shrink-0"
+                  >{{ p.keys.length }} 把 Key · {{ (p.models || []).length }} 个模型</span
+                >
+                <button
+                  class="text-sm text-link hover:underline shrink-0 px-2 py-1"
+                  title="配置供应商"
+                  @click="editingId === p.id ? closeEdit() : startEdit(p)"
+                >
+                  编辑
+                </button>
+                <button
+                  class="text-sm text-red-600 hover:underline shrink-0 px-2 py-1"
+                  @click="removeProvider(p)"
+                >
+                  删除
+                </button>
               </div>
 
-              <details
-                :open="showAdvanced"
-                class="text-sm"
-                @toggle="showAdvanced = $event.target.open"
+              <div
+                v-if="editingId === p.id && draft"
+                class="px-4 pb-4 space-y-3 border-t border-line-subtle pt-3"
               >
-                <summary class="cursor-pointer select-none text-ink-secondary">
-                  高级参数（调度策略、探测）
-                </summary>
-                <div class="grid grid-cols-3 gap-3 mt-2">
+                <div class="grid grid-cols-2 gap-3">
                   <label>
-                    <span class="field-label">调度策略</span>
-                    <select v-model="draft.rotationStrategy" class="field-input">
-                      <option value="failover">故障转移</option>
-                      <option value="round_robin">轮询</option>
-                    </select>
+                    <span class="field-label">名称</span>
+                    <input v-model="draft.name" data-testid="p-name" class="field-input" />
                   </label>
                   <label>
-                    <span class="field-label">探测间隔（分钟）</span>
-                    <input v-model="draft.probeIntervalMin" type="number" class="field-input" />
-                  </label>
-                  <label>
-                    <span class="field-label">探测用模型</span>
+                    <span class="field-label">服务地址</span>
                     <input
-                      v-model="draft.probeModel"
-                      placeholder="默认用第一个模型"
+                      v-model="draft.baseUrl"
+                      data-testid="p-url"
+                      placeholder="https://api.example.com/v1"
                       class="field-input"
+                      :aria-invalid="!!urlError"
                     />
+                    <span v-if="urlError" class="field-error">
+                      <UiIcon name="warn" :size="12" />
+                      {{ urlError }}
+                    </span>
                   </label>
                 </div>
-              </details>
 
-              <label class="flex items-center gap-2 text-sm">
-                <input v-model="draft.enabled" type="checkbox" />
-                <span>启用该供应商（停用后调度不再使用它）</span>
-              </label>
+                <details
+                  :open="showAdvanced"
+                  class="text-sm"
+                  @toggle="showAdvanced = $event.target.open"
+                >
+                  <summary class="cursor-pointer select-none text-ink-secondary">
+                    高级参数（调度策略、探测）
+                  </summary>
+                  <div class="grid grid-cols-3 gap-3 mt-2">
+                    <label>
+                      <span class="field-label">调度策略</span>
+                      <select v-model="draft.rotationStrategy" class="field-input">
+                        <option value="failover">故障转移</option>
+                        <option value="round_robin">轮询</option>
+                      </select>
+                    </label>
+                    <label>
+                      <span class="field-label">探测间隔（分钟）</span>
+                      <input v-model="draft.probeIntervalMin" type="number" class="field-input" />
+                    </label>
+                    <label>
+                      <span class="field-label">探测用模型</span>
+                      <input
+                        v-model="draft.probeModel"
+                        placeholder="默认用第一个模型"
+                        class="field-input"
+                      />
+                    </label>
+                  </div>
+                </details>
 
-              <div>
-                <span class="field-label">模型列表（勾选＝支持视觉）</span>
-                <div class="flex flex-wrap gap-1.5 mt-1.5">
-                  <span
-                    v-for="(m, i) in draft.models"
-                    :key="m.id"
-                    data-testid="model-chip"
-                    class="inline-flex items-center gap-1 px-2 h-8 rounded-lg bg-subtle text-xs"
-                  >
-                    <input v-model="m.vision" type="checkbox" title="支持视觉" />
-                    <span>{{ m.id }}</span>
-                    <button
-                      class="icon-btn-sm !w-5 !h-5"
-                      :title="'模型参数：' + m.id"
-                      :aria-label="'配置模型参数 ' + m.id"
-                      :aria-expanded="paramTarget === paramKey(p, m.id) ? 'true' : 'false'"
-                      @click="openParamEditor(p, m.id)"
+                <label class="flex items-center gap-2 text-sm">
+                  <input v-model="draft.enabled" type="checkbox" />
+                  <span>启用该供应商（停用后调度不再使用它）</span>
+                </label>
+
+                <div>
+                  <span class="field-label">模型列表（勾选＝支持视觉）</span>
+                  <div class="flex flex-wrap gap-1.5 mt-1.5">
+                    <span
+                      v-for="(m, i) in draft.models"
+                      :key="m.id"
+                      data-testid="model-chip"
+                      class="inline-flex items-center gap-1 px-2 h-8 rounded-lg bg-subtle text-xs"
                     >
-                      <UiIcon name="settings" :size="12" />
+                      <input v-model="m.vision" type="checkbox" title="支持视觉" />
+                      <span>{{ m.id }}</span>
+                      <button
+                        class="icon-btn-sm !w-5 !h-5"
+                        :title="'模型参数：' + m.id"
+                        :aria-label="'配置模型参数 ' + m.id"
+                        :aria-expanded="paramTarget === paramKey(p, m.id) ? 'true' : 'false'"
+                        @click="openParamEditor(p, m.id)"
+                      >
+                        <UiIcon name="settings" :size="12" />
+                      </button>
+                      <button
+                        class="icon-btn-sm !w-5 !h-5"
+                        :aria-label="'移除模型 ' + m.id"
+                        @click="draft.models.splice(i, 1)"
+                      >
+                        <UiIcon name="close" :size="12" />
+                      </button>
+                    </span>
+                    <span v-if="!draft.models.length" class="text-xs text-ink-muted"
+                      >还没有模型，拉取或手动添加</span
+                    >
+                  </div>
+
+                  <!-- 模型参数：最大输出长度与上下文上限（按模型保存） -->
+                  <div
+                    v-for="m in draft.models.filter((x) => paramTarget === paramKey(p, x.id))"
+                    :key="'param-' + m.id"
+                    class="mt-2 rounded-lg border border-line-subtle bg-subtle p-3 space-y-2"
+                    data-testid="model-params"
+                  >
+                    <div class="text-xs text-ink-secondary">模型参数 · {{ m.id }}</div>
+                    <div class="grid grid-cols-2 gap-3">
+                      <label>
+                        <span class="field-label !text-xs">最大输出长度</span>
+                        <input
+                          :value="modelParam(m, 'maxTokens')"
+                          type="number"
+                          min="1"
+                          placeholder="默认"
+                          data-testid="model-max-tokens"
+                          class="field-input !h-8 text-xs"
+                          @input="setModelParam(m, 'maxTokens', $event.target.value)"
+                        />
+                        <span class="field-help !mt-0.5">max_tokens，留空用服务端默认</span>
+                      </label>
+                      <label>
+                        <span class="field-label !text-xs">上下文上限（字符）</span>
+                        <input
+                          :value="modelParam(m, 'maxChars')"
+                          type="number"
+                          min="1"
+                          placeholder="默认 12000"
+                          data-testid="model-max-chars"
+                          class="field-input !h-8 text-xs"
+                          @input="setModelParam(m, 'maxChars', $event.target.value)"
+                        />
+                        <span class="field-help !mt-0.5">历史消息进入请求的字符预算</span>
+                      </label>
+                    </div>
+                    <div class="flex justify-end">
+                      <button class="btn-secondary !h-7 !px-2 text-xs" @click="paramTarget = ''">
+                        收起
+                      </button>
+                    </div>
+                  </div>
+
+                  <div class="flex gap-2 mt-2">
+                    <select
+                      v-if="pulled.length"
+                      v-model="pickModel"
+                      data-testid="model-pick"
+                      class="field-input flex-1"
+                    >
+                      <option value="">从拉取的模型中选择…</option>
+                      <option v-for="m in pulled" :key="m.id" :value="m.id">{{ m.id }}</option>
+                    </select>
+                    <input
+                      v-else
+                      v-model="newModel"
+                      placeholder="模型 ID"
+                      data-testid="model-input"
+                      class="field-input flex-1"
+                      @keydown.enter="addSelected"
+                    />
+                    <button class="btn-secondary" data-testid="model-add" @click="addSelected">
+                      添加
+                    </button>
+                    <button class="btn-secondary" data-testid="model-pull" @click="pullModels">
+                      拉取模型
+                    </button>
+                  </div>
+                  <div
+                    v-if="pulled.length"
+                    class="mt-2 max-h-40 overflow-y-auto rounded-lg border border-line-subtle divide-y divide-line-subtle"
+                  >
+                    <label
+                      v-for="m in pulled"
+                      :key="m.id"
+                      data-testid="pulled-item"
+                      class="flex items-center gap-2 px-2 py-1.5 cursor-pointer hover:bg-subtle text-xs"
+                    >
+                      <input v-model="m.checked" type="checkbox" />
+                      <span class="truncate" :title="m.id">{{ m.id }}</span>
+                      <span v-if="m.vision" class="text-ink-muted">已在列表</span>
+                    </label>
+                  </div>
+                </div>
+
+                <div class="space-y-2">
+                  <div class="flex items-center gap-2">
+                    <span class="field-label !mb-0 flex-1"
+                      >API Keys（DPAPI 加密存储，添加后立即生效）</span
+                    >
+                    <button
+                      class="btn-compact btn-secondary"
+                      data-testid="k-toggle-visible"
+                      :title="keysVisible(p.id) ? '隐藏 API Keys' : '显示 API Keys'"
+                      :aria-label="keysVisible(p.id) ? '隐藏 API Keys' : '显示 API Keys'"
+                      :aria-pressed="keysVisible(p.id) ? 'false' : 'true'"
+                      @click="toggleKeys(p.id)"
+                    >
+                      <UiIcon :name="keysVisible(p.id) ? 'eye' : 'eyeOff'" :size="14" />
                     </button>
                     <button
+                      class="btn-compact btn-secondary"
+                      data-testid="k-probe-all"
+                      @click="probeAll(p)"
+                    >
+                      一键探测
+                    </button>
+                    <button
+                      class="btn-compact btn-secondary"
+                      data-testid="k-add-toggle"
+                      @click="keyTarget = keyTarget === p.id ? null : p.id"
+                    >
+                      {{ keyTarget === p.id ? '收起' : '添加 Key' }}
+                    </button>
+                  </div>
+                  <div v-if="keyTarget === p.id" class="flex gap-2">
+                    <input
+                      v-model="keyForm.label"
+                      data-testid="k-label"
+                      placeholder="备注（可选）"
+                      aria-label="Key 备注"
+                      class="field-input !w-36"
+                    />
+                    <input
+                      v-model="keyForm.secret"
+                      data-testid="k-secret"
+                      placeholder="sk-..."
+                      type="password"
+                      aria-label="Key 密钥"
+                      class="field-input flex-1"
+                      @keydown.enter="addKeyTo(p.id)"
+                    />
+                    <button class="btn-primary !h-9" data-testid="k-save" @click="addKeyTo(p.id)">
+                      保存
+                    </button>
+                  </div>
+                  <template v-if="keysVisible(p.id)">
+                    <div
+                      v-for="k in p.keys"
+                      :key="k.id"
+                      class="flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-subtle text-sm"
+                    >
+                      <StatusBadge :status="k.status" data-testid="key-status" />
+                      <span class="flex-1 truncate">{{ k.label || k.id.slice(0, 8) }}</span>
+                      <span
+                        v-if="k.lastError"
+                        class="text-ink-muted truncate max-w-[180px]"
+                        :title="k.lastError"
+                      >
+                        {{ k.lastError }}
+                      </span>
+                      <button
+                        class="text-sm text-link hover:underline"
+                        @click="settings.probeKey(k.id)"
+                      >
+                        探测
+                      </button>
+                      <button class="text-sm text-red-600 hover:underline" @click="removeKey(k, p)">
+                        删除
+                      </button>
+                    </div>
+                  </template>
+                  <div v-else class="px-2.5 py-1.5 text-xs text-ink-muted">
+                    API Keys 已隐藏（{{ p.keys.length }} 把）
+                  </div>
+                </div>
+
+                <div class="flex justify-end gap-2 pt-1">
+                  <button class="btn-secondary" data-testid="p-cancel" @click="closeEdit">
+                    取消
+                  </button>
+                  <button
+                    class="btn-secondary !h-9"
+                    :disabled="!!urlError"
+                    data-testid="p-save"
+                    @click="saveEdit"
+                  >
+                    保存供应商
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <button
+              class="w-full py-2.5 rounded-xl text-sm border border-dashed border-line-control text-ink-secondary hover:border-brand hover:text-brand-ink"
+              data-testid="provider-add"
+              @click="openCreate"
+            >
+              + 添加供应商
+            </button>
+          </section>
+
+          <!-- 快捷键 -->
+          <section v-show="section === 'hotkeys'" class="space-y-4">
+            <h2 class="text-base font-semibold">全局快捷键</h2>
+            <div class="space-y-3 max-w-md">
+              <div class="flex items-center gap-3">
+                <span class="text-sm flex-1">快速输入窗</span>
+                <input
+                  v-model="hotkeys.quick"
+                  aria-label="快速输入窗快捷键"
+                  class="field-input !w-40"
+                  @change="saveHotkeys"
+                />
+              </div>
+              <div class="flex items-center gap-3">
+                <span class="text-sm flex-1">划词问 AI</span>
+                <input
+                  v-model="hotkeys.selection"
+                  aria-label="划词问 AI 快捷键"
+                  class="field-input !w-40"
+                  @change="saveHotkeys"
+                />
+              </div>
+              <div class="flex items-center gap-3">
+                <span class="text-sm flex-1">截屏问 AI</span>
+                <input
+                  v-model="hotkeys.capture"
+                  aria-label="截屏问 AI 快捷键"
+                  class="field-input !w-40"
+                  @change="saveHotkeys"
+                />
+              </div>
+            </div>
+          </section>
+
+          <!-- 智能任务 -->
+          <section v-show="section === 'agent'" class="space-y-4">
+            <h2 class="text-base font-semibold">智能任务安全</h2>
+            <div class="space-y-3 max-w-2xl">
+              <div>
+                <span class="field-label">授权目录（智能任务文件工具的读写范围）</span>
+                <div class="flex flex-wrap gap-1.5 mt-1.5">
+                  <span
+                    v-for="d in agentDirs"
+                    :key="d"
+                    class="inline-flex items-center gap-1 px-2 h-8 rounded-lg bg-subtle text-xs"
+                  >
+                    <span class="truncate max-w-[300px]" :title="d">{{ d }}</span>
+                    <button
                       class="icon-btn-sm !w-5 !h-5"
-                      :aria-label="'移除模型 ' + m.id"
-                      @click="draft.models.splice(i, 1)"
+                      :aria-label="'移除目录 ' + d"
+                      @click="removeDir(d)"
                     >
                       <UiIcon name="close" :size="12" />
                     </button>
                   </span>
-                  <span v-if="!draft.models.length" class="text-xs text-ink-muted"
-                    >还没有模型，拉取或手动添加</span
+                  <button
+                    class="btn-compact border border-dashed border-line-control"
+                    @click="addDir"
                   >
+                    + 添加目录
+                  </button>
                 </div>
-
-                <!-- 模型参数：最大输出长度与上下文上限（按模型保存） -->
-                <div
-                  v-for="m in draft.models.filter((x) => paramTarget === paramKey(p, x.id))"
-                  :key="'param-' + m.id"
-                  class="mt-2 rounded-lg border border-line-subtle bg-subtle p-3 space-y-2"
-                  data-testid="model-params"
-                >
-                  <div class="text-xs text-ink-secondary">模型参数 · {{ m.id }}</div>
-                  <div class="grid grid-cols-2 gap-3">
-                    <label>
-                      <span class="field-label !text-xs">最大输出长度</span>
-                      <input
-                        :value="modelParam(m, 'maxTokens')"
-                        type="number"
-                        min="1"
-                        placeholder="默认"
-                        data-testid="model-max-tokens"
-                        class="field-input !h-8 text-xs"
-                        @input="setModelParam(m, 'maxTokens', $event.target.value)"
-                      />
-                      <span class="field-help !mt-0.5">max_tokens，留空用服务端默认</span>
-                    </label>
-                    <label>
-                      <span class="field-label !text-xs">上下文上限（字符）</span>
-                      <input
-                        :value="modelParam(m, 'maxChars')"
-                        type="number"
-                        min="1"
-                        placeholder="默认 12000"
-                        data-testid="model-max-chars"
-                        class="field-input !h-8 text-xs"
-                        @input="setModelParam(m, 'maxChars', $event.target.value)"
-                      />
-                      <span class="field-help !mt-0.5">历史消息进入请求的字符预算</span>
-                    </label>
-                  </div>
-                  <div class="flex justify-end">
-                    <button class="btn-secondary !h-7 !px-2 text-xs" @click="paramTarget = ''">
-                      收起
-                    </button>
-                  </div>
-                </div>
-
-                <div class="flex gap-2 mt-2">
-                  <select
-                    v-if="pulled.length"
-                    v-model="pickModel"
-                    data-testid="model-pick"
-                    class="field-input flex-1"
-                  >
-                    <option value="">从拉取的模型中选择…</option>
-                    <option v-for="m in pulled" :key="m.id" :value="m.id">{{ m.id }}</option>
+              </div>
+              <div class="max-w-md">
+                <label class="block">
+                  <span class="field-label">最大步数</span>
+                  <input
+                    v-model="maxSteps"
+                    type="number"
+                    min="1"
+                    max="50"
+                    class="field-input"
+                    @change="saveAgent"
+                  />
+                </label>
+                <p class="field-help mt-1">
+                  命令工作目录已移至会话页「项目」分组：每个项目可绑定独立目录，任务模式按会话所属项目执行命令。
+                </p>
+              </div>
+              <div class="grid grid-cols-2 gap-3 max-w-md">
+                <label>
+                  <span class="field-label">联网搜索通道</span>
+                  <select v-model="webSearchProvider" class="field-input" @change="saveAgent">
+                    <option value="auto">自动（有 Tavily Key 则优先）</option>
+                    <option value="tavily">Tavily（需 Key）</option>
+                    <option value="ddg">DuckDuckGo（免 Key）</option>
                   </select>
+                </label>
+                <label>
+                  <span class="field-label">Tavily API Key（可选）</span>
                   <input
-                    v-else
-                    v-model="newModel"
-                    placeholder="模型 ID"
-                    data-testid="model-input"
-                    class="field-input flex-1"
-                    @keydown.enter="addSelected"
-                  />
-                  <button class="btn-secondary" data-testid="model-add" @click="addSelected">
-                    添加
-                  </button>
-                  <button class="btn-secondary" data-testid="model-pull" @click="pullModels">
-                    拉取模型
-                  </button>
-                </div>
-                <div
-                  v-if="pulled.length"
-                  class="mt-2 max-h-40 overflow-y-auto rounded-lg border border-line-subtle divide-y divide-line-subtle"
-                >
-                  <label
-                    v-for="m in pulled"
-                    :key="m.id"
-                    data-testid="pulled-item"
-                    class="flex items-center gap-2 px-2 py-1.5 cursor-pointer hover:bg-subtle text-xs"
-                  >
-                    <input v-model="m.checked" type="checkbox" />
-                    <span class="truncate" :title="m.id">{{ m.id }}</span>
-                    <span v-if="m.vision" class="text-ink-muted">已在列表</span>
-                  </label>
-                </div>
-              </div>
-
-              <div class="space-y-2">
-                <div class="flex items-center gap-2">
-                  <span class="field-label !mb-0 flex-1"
-                    >API Keys（DPAPI 加密存储，添加后立即生效）</span
-                  >
-                  <button
-                    class="btn-compact btn-secondary"
-                    data-testid="k-probe-all"
-                    @click="probeAll(p)"
-                  >
-                    一键探测
-                  </button>
-                  <button
-                    class="btn-compact btn-secondary"
-                    data-testid="k-add-toggle"
-                    @click="keyTarget = keyTarget === p.id ? null : p.id"
-                  >
-                    {{ keyTarget === p.id ? '收起' : '添加 Key' }}
-                  </button>
-                </div>
-                <div v-if="keyTarget === p.id" class="flex gap-2">
-                  <input
-                    v-model="keyForm.label"
-                    data-testid="k-label"
-                    placeholder="备注（可选）"
-                    aria-label="Key 备注"
-                    class="field-input !w-36"
-                  />
-                  <input
-                    v-model="keyForm.secret"
-                    data-testid="k-secret"
-                    placeholder="sk-..."
+                    v-model="tavilyApiKey"
                     type="password"
-                    aria-label="Key 密钥"
-                    class="field-input flex-1"
-                    @keydown.enter="addKeyTo(p.id)"
+                    placeholder="留空则用 DuckDuckGo"
+                    class="field-input"
+                    @change="saveAgent"
                   />
-                  <button class="btn-primary !h-9" data-testid="k-save" @click="addKeyTo(p.id)">
-                    保存
-                  </button>
-                </div>
-                <div
-                  v-for="k in p.keys"
-                  :key="k.id"
-                  class="flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-subtle text-sm"
-                >
-                  <StatusBadge :status="k.status" data-testid="key-status" />
-                  <span class="flex-1 truncate">{{ k.label || k.id.slice(0, 8) }}</span>
-                  <span
-                    v-if="k.lastError"
-                    class="text-ink-muted truncate max-w-[180px]"
-                    :title="k.lastError"
-                  >
-                    {{ k.lastError }}
-                  </span>
-                  <button
-                    class="text-sm text-link hover:underline"
-                    @click="settings.probeKey(k.id)"
-                  >
-                    探测
-                  </button>
-                  <button class="text-sm text-red-600 hover:underline" @click="removeKey(k, p)">
-                    删除
-                  </button>
-                </div>
+                </label>
               </div>
-
-              <div class="flex justify-end gap-2 pt-1">
-                <button class="btn-secondary" data-testid="p-cancel" @click="closeEdit">
-                  取消
-                </button>
-                <button
-                  class="btn-primary !h-9"
-                  :disabled="!!urlError"
-                  data-testid="p-save"
-                  @click="saveEdit"
-                >
-                  保存供应商
-                </button>
-              </div>
-            </div>
-          </div>
-
-          <button
-            class="w-full py-2.5 rounded-xl text-sm border border-dashed border-line-control text-ink-secondary hover:border-brand hover:text-brand-ink"
-            data-testid="provider-add"
-            @click="openCreate"
-          >
-            + 添加供应商
-          </button>
-        </section>
-
-        <!-- 快捷键 -->
-        <section v-show="section === 'hotkeys'" class="space-y-4">
-          <h2 class="text-base font-semibold">全局快捷键</h2>
-          <div class="space-y-3 max-w-md">
-            <div class="flex items-center gap-3">
-              <span class="text-sm flex-1">快速输入窗</span>
-              <input
-                v-model="hotkeys.quick"
-                aria-label="快速输入窗快捷键"
-                class="field-input !w-40"
-              />
-            </div>
-            <div class="flex items-center gap-3">
-              <span class="text-sm flex-1">划词问 AI</span>
-              <input
-                v-model="hotkeys.selection"
-                aria-label="划词问 AI 快捷键"
-                class="field-input !w-40"
-              />
-            </div>
-            <div class="flex items-center gap-3">
-              <span class="text-sm flex-1">截屏问 AI</span>
-              <input
-                v-model="hotkeys.capture"
-                aria-label="截屏问 AI 快捷键"
-                class="field-input !w-40"
-              />
-            </div>
-          </div>
-          <button
-            class="btn-primary !h-9"
-            data-testid="hotkey-save"
-            :disabled="!settings.initialized"
-            @click="saveHotkeys"
-          >
-            保存快捷键
-          </button>
-        </section>
-
-        <!-- 智能任务 -->
-        <section v-show="section === 'agent'" class="space-y-4">
-          <h2 class="text-base font-semibold">智能任务安全</h2>
-          <div class="space-y-3 max-w-2xl">
-            <div>
-              <span class="field-label">授权目录（智能任务文件工具的读写范围）</span>
-              <div class="flex flex-wrap gap-1.5 mt-1.5">
-                <span
-                  v-for="d in agentDirs"
-                  :key="d"
-                  class="inline-flex items-center gap-1 px-2 h-8 rounded-lg bg-subtle text-xs"
-                >
-                  <span class="truncate max-w-[300px]" :title="d">{{ d }}</span>
-                  <button
-                    class="icon-btn-sm !w-5 !h-5"
-                    :aria-label="'移除目录 ' + d"
-                    @click="removeDir(d)"
-                  >
-                    <UiIcon name="close" :size="12" />
-                  </button>
+              <label class="block max-w-2xl">
+                <span class="field-label">MCP 服务器配置（JSON，可选）</span>
+                <textarea
+                  v-model="mcpServersJson"
+                  rows="3"
+                  placeholder='例如: {"docs": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:/docs"]}}'
+                  class="field-input font-mono text-xs"
+                  @change="saveMcpServers"
+                ></textarea>
+              </label>
+              <label class="block max-w-2xl">
+                <span class="field-label">生命周期钩子（JSON 数组，可选）</span>
+                <textarea
+                  v-model="hooksJson"
+                  rows="6"
+                  data-testid="hooks-json"
+                  :placeholder="`例如: [{&quot;stage&quot;:&quot;run.end&quot;,&quot;action&quot;:&quot;notify&quot;,&quot;message&quot;:&quot;任务完成&quot;},{&quot;stage&quot;:&quot;tool.before&quot;,&quot;action&quot;:&quot;block&quot;,&quot;match&quot;:{&quot;tool&quot;:&quot;run_command&quot;},&quot;reason&quot;:&quot;本机禁止执行命令&quot;}]`"
+                  class="field-input font-mono text-xs"
+                  @change="saveHooks"
+                ></textarea>
+                <span class="field-help mt-1 block">
+                  可用阶段：{{ hookStages.join(' / ') }}；可用动作：{{ hookActions.join(' / ') }}。
+                  block 仅能让操作更严格（无法放行需要确认的调用），notify 会在界面弹一条提示。
                 </span>
-                <button
-                  class="btn-compact border border-dashed border-line-control"
-                  @click="addDir"
+                <span v-if="hooksError" class="field-help mt-1 block text-bad-ink">{{
+                  hooksError
+                }}</span>
+              </label>
+            </div>
+          </section>
+
+          <!-- 本地嵌入模型 -->
+          <section v-show="section === 'models'" class="space-y-4">
+            <h2 class="text-base font-semibold">本地向量模型</h2>
+            <p class="text-xs text-ink-muted">
+              知识库可用本地 ONNX 模型（onnxruntime + faiss）生成向量，全程离线、文档不出本机。
+              量化版（int8）体积小速度快，非量化版（fp32）精度略高；下载后在「知识库 →
+              新建」中选择。
+            </p>
+            <div class="card overflow-hidden">
+              <table class="w-full text-sm">
+                <thead class="bg-subtle text-ink-secondary">
+                  <tr>
+                    <th class="text-left px-3 py-2 font-medium">模型</th>
+                    <th class="text-left px-3 py-2 font-medium w-28">精度</th>
+                    <th class="text-left px-3 py-2 font-medium w-16">维度</th>
+                    <th class="text-left px-3 py-2 font-medium w-24">大小</th>
+                    <th class="text-left px-3 py-2 font-medium w-28">状态</th>
+                    <th class="w-24"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr
+                    v-for="p in settings.modelPackages"
+                    :key="p.id"
+                    class="border-t border-line-subtle"
+                    :data-testid="'model-' + p.model + '-' + p.quant"
+                  >
+                    <td class="px-3 py-2.5 font-medium">{{ p.model }}</td>
+                    <td class="px-3 py-2.5">
+                      {{ p.quant === 'int8' ? '量化 int8' : '非量化 fp32' }}
+                    </td>
+                    <td class="px-3 py-2.5">{{ p.dim }}</td>
+                    <td class="px-3 py-2.5 text-ink-muted">
+                      {{ p.downloaded ? fmtSize(p.sizeBytes) : p.sizeHint }}
+                    </td>
+                    <td class="px-3 py-2.5">
+                      <span v-if="p.downloaded" class="text-ok-ink text-xs">已下载</span>
+                      <span
+                        v-else-if="pkgProgress(p)"
+                        class="text-ink-secondary text-xs"
+                        role="status"
+                        >{{ pkgProgress(p) }}</span
+                      >
+                      <span v-else class="text-ink-muted text-xs">未下载</span>
+                    </td>
+                    <td class="px-3 py-2.5 text-right whitespace-nowrap">
+                      <button
+                        v-if="!p.downloaded"
+                        class="btn-compact btn-secondary !h-7 !px-2 text-xs"
+                        data-testid="model-download"
+                        :disabled="!!pkgProgress(p)"
+                        @click="downloadPkg(p)"
+                      >
+                        下载
+                      </button>
+                      <button
+                        v-else
+                        class="btn-compact !h-7 !px-2 text-xs hover:!text-red-500"
+                        :aria-label="'删除模型 ' + p.model"
+                        @click="removePkg(p)"
+                      >
+                        删除
+                      </button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="text-xs text-ink-muted">
+              模型来源：HuggingFace 镜像（hf-mirror.com），存放于数据目录 models/ 下。
+            </div>
+          </section>
+
+          <!-- 外观 -->
+          <section v-show="section === 'appearance'" class="space-y-4">
+            <h2 class="text-base font-semibold">外观</h2>
+            <div class="flex items-center gap-6 text-sm flex-wrap">
+              <div class="flex items-center gap-4">
+                <span class="text-ink-secondary">主题</span>
+                <label
+                  v-for="t in themeOptions"
+                  :key="t.value"
+                  class="flex items-center gap-1.5 cursor-pointer min-h-[36px]"
                 >
-                  + 添加目录
-                </button>
+                  <input
+                    type="radio"
+                    name="theme"
+                    :value="t.value"
+                    :checked="ui.theme === t.value"
+                    @change="ui.setTheme(t.value)"
+                  />
+                  <span>{{ t.label }}</span>
+                </label>
               </div>
-            </div>
-            <div class="max-w-md">
-              <label class="block">
-                <span class="field-label">最大步数</span>
-                <input v-model="maxSteps" type="number" min="1" max="50" class="field-input" />
-              </label>
-              <p class="field-help mt-1">
-                命令工作目录已移至会话页「项目」分组：每个项目可绑定独立目录，任务模式按会话所属项目执行命令。
-              </p>
-            </div>
-            <div class="grid grid-cols-2 gap-3 max-w-md">
-              <label>
-                <span class="field-label">联网搜索通道</span>
-                <select v-model="webSearchProvider" class="field-input">
-                  <option value="auto">自动（有 Tavily Key 则优先）</option>
-                  <option value="tavily">Tavily（需 Key）</option>
-                  <option value="ddg">DuckDuckGo（免 Key）</option>
-                </select>
-              </label>
-              <label>
-                <span class="field-label">Tavily API Key（可选）</span>
+              <label class="flex items-center gap-2 cursor-pointer min-h-[36px]">
                 <input
-                  v-model="tavilyApiKey"
-                  type="password"
-                  placeholder="留空则用 DuckDuckGo"
-                  class="field-input"
+                  type="checkbox"
+                  :checked="settings.autostart"
+                  @change="settings.setAutostart($event.target.checked)"
                 />
+                <span>开机自启</span>
+              </label>
+              <label class="flex items-center gap-2 cursor-pointer min-h-[36px]">
+                <input
+                  type="checkbox"
+                  :checked="settings.showBall"
+                  @change="toggleBall($event.target.checked)"
+                />
+                <span>悬浮球</span>
               </label>
             </div>
-            <label class="block max-w-2xl">
-              <span class="field-label">MCP 服务器配置（JSON，可选）</span>
-              <textarea
-                v-model="mcpServersJson"
-                rows="3"
-                placeholder='例如: {"docs": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:/docs"]}}'
-                class="field-input font-mono text-xs"
-              ></textarea>
-            </label>
-            <label class="block max-w-2xl">
-              <span class="field-label">生命周期钩子（JSON 数组，可选）</span>
-              <textarea
-                v-model="hooksJson"
-                rows="6"
-                data-testid="hooks-json"
-                :placeholder="`例如: [{&quot;stage&quot;:&quot;run.end&quot;,&quot;action&quot;:&quot;notify&quot;,&quot;message&quot;:&quot;任务完成&quot;},{&quot;stage&quot;:&quot;tool.before&quot;,&quot;action&quot;:&quot;block&quot;,&quot;match&quot;:{&quot;tool&quot;:&quot;run_command&quot;},&quot;reason&quot;:&quot;本机禁止执行命令&quot;}]`"
-                class="field-input font-mono text-xs"
-              ></textarea>
-              <span class="field-help mt-1 block">
-                可用阶段：{{ hookStages.join(' / ') }}；可用动作：{{ hookActions.join(' / ') }}。
-                block 仅能让操作更严格（无法放行需要确认的调用），notify 会在界面弹一条提示。
-              </span>
-              <span v-if="hooksError" class="field-help mt-1 block text-bad-ink">{{
-                hooksError
-              }}</span>
-            </label>
-            <div class="flex items-center gap-2">
-              <button class="btn-secondary !h-9" data-testid="hooks-save" @click="saveHooks">
-                保存钩子
-              </button>
-              <button class="btn-secondary !h-9" @click="syncHooks">重新载入</button>
-            </div>
-            <button
-              class="btn-primary !h-9"
-              data-testid="agent-save"
-              :disabled="!settings.initialized"
-              @click="saveAgent"
-            >
-              保存
-            </button>
-          </div>
-        </section>
+          </section>
 
-        <!-- 本地嵌入模型 -->
-        <section v-show="section === 'models'" class="space-y-4">
-          <h2 class="text-base font-semibold">本地嵌入模型</h2>
-          <p class="text-xs text-ink-muted">
-            知识库可用本地 ONNX 模型（onnxruntime + faiss）生成向量，全程离线、文档不出本机。
-            量化版（int8）体积小速度快，非量化版（fp32）精度略高；下载后在「知识库 → 新建」中选择。
-          </p>
-          <div class="card overflow-hidden">
-            <table class="w-full text-sm">
-              <thead class="bg-subtle text-ink-secondary">
-                <tr>
-                  <th class="text-left px-3 py-2 font-medium">模型</th>
-                  <th class="text-left px-3 py-2 font-medium w-28">精度</th>
-                  <th class="text-left px-3 py-2 font-medium w-16">维度</th>
-                  <th class="text-left px-3 py-2 font-medium w-24">大小</th>
-                  <th class="text-left px-3 py-2 font-medium w-28">状态</th>
-                  <th class="w-24"></th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr
-                  v-for="p in settings.modelPackages"
-                  :key="p.id"
-                  class="border-t border-line-subtle"
-                  :data-testid="'model-' + p.model + '-' + p.quant"
+          <!-- 数据 -->
+          <section v-show="section === 'data'" class="space-y-4">
+            <h2 class="text-base font-semibold">数据</h2>
+            <div class="flex items-center gap-3 text-sm flex-wrap">
+              <button class="btn-secondary" @click="exportData">导出备份</button>
+              <label class="flex items-center gap-1.5 cursor-pointer">
+                <input v-model="includeKeys" type="checkbox" />
+                <span class="text-ink-secondary"
+                  >包含 API Key（<span class="text-warn-ink">导出文件含明文 Key，请谨慎保管</span
+                  >）</span
                 >
-                  <td class="px-3 py-2.5 font-medium">{{ p.model }}</td>
-                  <td class="px-3 py-2.5">
-                    {{ p.quant === 'int8' ? '量化 int8' : '非量化 fp32' }}
-                  </td>
-                  <td class="px-3 py-2.5">{{ p.dim }}</td>
-                  <td class="px-3 py-2.5 text-ink-muted">
-                    {{ p.downloaded ? fmtSize(p.sizeBytes) : p.sizeHint }}
-                  </td>
-                  <td class="px-3 py-2.5">
-                    <span v-if="p.downloaded" class="text-ok-ink text-xs">已下载</span>
-                    <span
-                      v-else-if="pkgProgress(p)"
-                      class="text-ink-secondary text-xs"
-                      role="status"
-                      >{{ pkgProgress(p) }}</span
-                    >
-                    <span v-else class="text-ink-muted text-xs">未下载</span>
-                  </td>
-                  <td class="px-3 py-2.5 text-right whitespace-nowrap">
-                    <button
-                      v-if="!p.downloaded"
-                      class="btn-compact btn-secondary !h-7 !px-2 text-xs"
-                      data-testid="model-download"
-                      :disabled="!!pkgProgress(p)"
-                      @click="downloadPkg(p)"
-                    >
-                      下载
-                    </button>
-                    <button
-                      v-else
-                      class="btn-compact !h-7 !px-2 text-xs hover:!text-red-500"
-                      :aria-label="'删除模型 ' + p.model"
-                      @click="removePkg(p)"
-                    >
-                      删除
-                    </button>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-          <div class="text-xs text-ink-muted">
-            模型来源：HuggingFace 镜像（hf-mirror.com），存放于数据目录 models/ 下。
-          </div>
-        </section>
-
-        <!-- 外观 -->
-        <section v-show="section === 'appearance'" class="space-y-4">
-          <h2 class="text-base font-semibold">外观</h2>
-          <div class="flex items-center gap-6 text-sm flex-wrap">
-            <div class="flex items-center gap-4">
-              <span class="text-ink-secondary">主题</span>
-              <label
-                v-for="t in themeOptions"
-                :key="t.value"
-                class="flex items-center gap-1.5 cursor-pointer min-h-[36px]"
-              >
-                <input
-                  type="radio"
-                  name="theme"
-                  :value="t.value"
-                  :checked="ui.theme === t.value"
-                  @change="ui.setTheme(t.value)"
-                />
-                <span>{{ t.label }}</span>
               </label>
+              <button class="btn-secondary" @click="importData">导入备份</button>
             </div>
-            <label class="flex items-center gap-2 cursor-pointer min-h-[36px]">
-              <input
-                type="checkbox"
-                :checked="settings.autostart"
-                @change="settings.setAutostart($event.target.checked)"
-              />
-              <span>开机自启</span>
-            </label>
-            <label class="flex items-center gap-2 cursor-pointer min-h-[36px]">
-              <input
-                type="checkbox"
-                :checked="settings.showBall"
-                @change="toggleBall($event.target.checked)"
-              />
-              <span>悬浮球</span>
-            </label>
-          </div>
-        </section>
-
-        <!-- 数据 -->
-        <section v-show="section === 'data'" class="space-y-4">
-          <h2 class="text-base font-semibold">数据</h2>
-          <div class="flex items-center gap-3 text-sm flex-wrap">
-            <button class="btn-secondary" @click="exportData">导出备份</button>
-            <label class="flex items-center gap-1.5 cursor-pointer">
-              <input v-model="includeKeys" type="checkbox" />
-              <span class="text-ink-secondary"
-                >包含 API Key（<span class="text-warn-ink">导出文件含明文 Key，请谨慎保管</span
-                >）</span
-              >
-            </label>
-            <button class="btn-secondary" @click="importData">导入备份</button>
-          </div>
-          <div v-if="settings.info" class="text-xs text-ink-muted">
-            Mini Agent v{{ settings.info.version }} · {{ settings.info.driver }} · 数据目录
-            {{ settings.info.dataDir }}
-          </div>
-        </section>
+            <div v-if="settings.info" class="text-xs text-ink-muted">
+              Mini Agent v{{ settings.info.version }} · {{ settings.info.driver }} · 数据目录
+              {{ settings.info.dataDir }}
+            </div>
+          </section>
+        </div>
       </div>
     </div>
 

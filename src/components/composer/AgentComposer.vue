@@ -34,6 +34,8 @@ const props = defineProps({
   // { label, icon, enabled }
   voiceAction: { type: Object, default: null },
   runtimeState: { type: String, default: 'idle' }, // idle | running | success | error
+  // 提示词优化进行中：按钮置灰并给出忙碌状态
+  optimizing: { type: Boolean, default: false },
   sendLabel: { type: String, default: '发送' },
   stopLabel: { type: String, default: '停止' }
 })
@@ -44,6 +46,7 @@ const emit = defineEmits([
   'add',
   'voice',
   'context',
+  'optimize',
   'toggle-cluster',
   'select-mode',
   'select-model',
@@ -353,6 +356,21 @@ defineExpose({
             @click="emit('voice')"
           >
             <UiIcon :name="voiceAction.icon || 'mic'" :size="17" />
+          </button>
+
+          <!-- 提示词优化：结合会话上下文改写输入框草稿 -->
+          <button
+            v-if="!streaming"
+            class="ac-btn"
+            :class="optimizing ? 'animate-pulse' : ''"
+            type="button"
+            data-testid="prompt-optimize"
+            :disabled="disabled || submitting || optimizing || !value.trim()"
+            :aria-label="optimizing ? '正在优化提示词' : '优化提示词'"
+            :title="optimizing ? '正在优化提示词…' : '结合会话上下文优化提示词'"
+            @click="emit('optimize')"
+          >
+            <UiIcon name="wand" :size="16" />
           </button>
 
           <!-- 进行中：真实停止入口；否则发送按钮始终位于最末端 -->

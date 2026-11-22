@@ -272,8 +272,8 @@ async function startAgentRun({
     // 本次 Run 的授权快照：运行期不可被模型扩大（方案四 §4.1）
     mandate: effectiveMandate,
     traceId: inheritedTrace,
-    // 权限等级：full = 所有非只读调用直接放行（不再逐次确认）
-    permission: permission === 'full' ? 'full' : 'autonomous',
+    // 权限等级：readonly = 仅只读工具、写入类直接拒绝；full = 所有非只读调用直接放行（不再逐次确认）
+    permission: permission === 'readonly' || permission === 'full' ? permission : 'autonomous',
     // Agent 集群：允许派生多个子 Agent 并行处理子任务
     cluster: !!cluster
   }
@@ -383,9 +383,11 @@ async function doAgentRun({
     ? '\n\n当前已开启 Agent 集群：遇到可拆分的独立子任务时，请调用 spawn_agent 并行派出多个子 Agent 分别处理，最后由你汇总结果。'
     : ''
   const permissionNote =
-    state.permission === 'full'
-      ? '\n\n当前权限为完整权限：非只读工具调用将直接执行，不再逐次请求用户确认；仍须严格遵守授权目录限制。'
-      : ''
+    state.permission === 'readonly'
+      ? '\n\n当前权限为只读任务模式：仅可使用只读工具（读文件、列目录、搜索文件、内容检索、网页搜索/抓取、会话状态查询等）。写文件、改文件、执行命令、剪贴板、打开链接、更新待办与长期记忆等写入类操作会被直接拒绝，且不会请求用户确认。请只用只读方式完成任务，不要尝试写入操作。'
+      : state.permission === 'full'
+        ? '\n\n当前权限为完整权限：非只读工具调用将直接执行，不再逐次请求用户确认；仍须严格遵守授权目录限制。'
+        : ''
   const messages = [
     {
       role: 'system',
@@ -480,6 +482,28 @@ async function doAgentRun({
     })
     if (gate.blocked) return settle({ allowed: false, confirmedBy: `hook:${gate.blockedBy}` })
     if (risk === 'readonly') return settle({ allowed: true, confirmedBy: 'auto' })
+    // 只读权限：非只读工具直接拒绝，不弹确认卡；与 full 的 permission:full 标记对称。
+    // 插在 remember 会话记忆之前，保证记忆集合无法绕过 readonly 限制。
+    if (state.permission === 'readonly' && risk !== 'readonly') {
+      // 系统性策略拒绝，与 mandate.denied 同性质：落 agent_tool_calls 审计
+      repos.logToolCall(db, {
+        runId,
+        step: ++callCount,
+        tool: name,
+        args,
+        riskLevel: risk,
+        confirmedBy: 'permission:readonly',
+        result: null,
+        error: '授权拒绝: 只读模式不允许写入类工具',
+        durationMs: 0
+      })
+      return settle({
+        allowed: false,
+        confirmedBy: 'permission:readonly',
+        denyMessage:
+          '只读任务模式下该操作被拒绝：仅允许只读工具（读文件、搜索、网页查询等）。请改用只读方式完成，或建议用户切换到自主/完整权限。'
+      })
+    }
     if (state.stopped) return settle({ allowed: false, confirmedBy: 'stopped' })
     // 完整权限：用户已在输入区显式选择，不再逐次弹确认，但审计记录标记来源
     if (state.permission === 'full')

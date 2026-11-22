@@ -3,6 +3,9 @@ const crypto = require('crypto')
 const uid = () => crypto.randomUUID()
 const now = () => Date.now()
 
+// 权限分级四级（会话记忆用）：非法值一律收敛到 default，不放大
+const PERMISSION_MODES = ['default', 'readonly', 'autonomous', 'full']
+
 // ---------- settings ----------
 function getSetting(db, key) {
   const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key)
@@ -185,8 +188,8 @@ function listKeyEvents(db, limit = 100) {
 function listProjects(db) {
   return db
     .prepare(
-      `SELECT id, name, path, sort, created_at AS createdAt, updated_at AS updatedAt
-       FROM projects WHERE deleted_at IS NULL ORDER BY sort, created_at`
+      `SELECT id, name, path, pinned, sort, created_at AS createdAt, updated_at AS updatedAt
+       FROM projects WHERE deleted_at IS NULL ORDER BY pinned DESC, sort, created_at`
     )
     .all()
 }
@@ -194,7 +197,7 @@ function listProjects(db) {
 function getProject(db, id) {
   return db
     .prepare(
-      `SELECT id, name, path, sort, created_at AS createdAt, updated_at AS updatedAt
+      `SELECT id, name, path, pinned, sort, created_at AS createdAt, updated_at AS updatedAt
        FROM projects WHERE id = ? AND deleted_at IS NULL`
     )
     .get(id)
@@ -215,9 +218,10 @@ function createProject(db, { name, path }) {
 function updateProject(db, id, patch) {
   const cur = getProject(db, id)
   if (!cur) return null
-  db.prepare('UPDATE projects SET name=?, path=?, updated_at=? WHERE id=?').run(
+  db.prepare('UPDATE projects SET name=?, path=?, pinned=?, updated_at=? WHERE id=?').run(
     patch.name !== undefined ? patch.name : cur.name,
     patch.path !== undefined ? patch.path : cur.path,
+    patch.pinned !== undefined ? (patch.pinned ? 1 : 0) : cur.pinned,
     now(),
     id
   )
@@ -242,7 +246,7 @@ function listConversations(db) {
   return db
     .prepare(
       `SELECT id, title, pinned, provider_id AS providerId, model, system_prompt AS systemPrompt,
-       context_policy AS contextPolicy, project_id AS projectId,
+       context_policy AS contextPolicy, project_id AS projectId, permission,
        origin, parent_id AS parentId, created_by_run AS createdByRun,
        created_at AS createdAt, updated_at AS updatedAt
        FROM conversations WHERE deleted_at IS NULL
@@ -255,7 +259,7 @@ function getConversation(db, id) {
   return db
     .prepare(
       `SELECT id, title, pinned, provider_id AS providerId, model, system_prompt AS systemPrompt,
-       context_policy AS contextPolicy, project_id AS projectId,
+       context_policy AS contextPolicy, project_id AS projectId, permission,
        origin, parent_id AS parentId, created_by_run AS createdByRun,
        created_at AS createdAt, updated_at AS updatedAt
        FROM conversations WHERE id = ? AND deleted_at IS NULL`
@@ -268,8 +272,8 @@ function createConversation(db, opts = {}) {
   const id = opts.id || uid()
   db.prepare(
     `INSERT INTO conversations(id, title, pinned, provider_id, model, system_prompt, context_policy,
-     project_id, origin, parent_id, created_by_run, created_at, updated_at)
-     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`
+     project_id, permission, origin, parent_id, created_by_run, created_at, updated_at)
+     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     id,
     opts.title || '新会话',
@@ -279,6 +283,7 @@ function createConversation(db, opts = {}) {
     opts.systemPrompt || null,
     opts.contextPolicy ? JSON.stringify(opts.contextPolicy) : '{}',
     opts.projectId || null,
+    PERMISSION_MODES.includes(opts.permission) ? opts.permission : 'default',
     // 人工创建的会话 origin=user；Agent 通过 session_create 创建时传 origin=agent
     opts.origin === 'agent' ? 'agent' : 'user',
     opts.parentId || null,
@@ -294,7 +299,7 @@ function updateConversation(db, id, patch) {
   if (!cur) return null
   db.prepare(
     `UPDATE conversations SET title=?, pinned=?, provider_id=?, model=?, system_prompt=?,
-     context_policy=?, project_id=?, updated_at=? WHERE id=?`
+     context_policy=?, project_id=?, permission=?, updated_at=? WHERE id=?`
   ).run(
     patch.title !== undefined ? patch.title : cur.title,
     patch.pinned !== undefined ? (patch.pinned ? 1 : 0) : cur.pinned,
@@ -303,6 +308,12 @@ function updateConversation(db, id, patch) {
     patch.systemPrompt !== undefined ? patch.systemPrompt : cur.systemPrompt,
     patch.contextPolicy !== undefined ? JSON.stringify(patch.contextPolicy) : cur.contextPolicy,
     patch.projectId !== undefined ? patch.projectId : cur.projectId,
+    // 非法权限值保持原值（收敛不放大原则）
+    patch.permission !== undefined
+      ? PERMISSION_MODES.includes(patch.permission)
+        ? patch.permission
+        : cur.permission
+      : cur.permission,
     now(),
     id
   )
@@ -314,7 +325,7 @@ function listChildConversations(db, parentId) {
   return db
     .prepare(
       `SELECT id, title, pinned, provider_id AS providerId, model, system_prompt AS systemPrompt,
-       context_policy AS contextPolicy, project_id AS projectId,
+       context_policy AS contextPolicy, project_id AS projectId, permission,
        origin, parent_id AS parentId, created_by_run AS createdByRun,
        created_at AS createdAt, updated_at AS updatedAt
        FROM conversations WHERE deleted_at IS NULL AND parent_id = ?
@@ -327,7 +338,7 @@ function listAgentConversations(db, runId) {
   const rows = db
     .prepare(
       `SELECT id, title, pinned, provider_id AS providerId, model, system_prompt AS systemPrompt,
-       context_policy AS contextPolicy, project_id AS projectId,
+       context_policy AS contextPolicy, project_id AS projectId, permission,
        origin, parent_id AS parentId, created_by_run AS createdByRun,
        created_at AS createdAt, updated_at AS updatedAt
        FROM conversations WHERE deleted_at IS NULL AND origin = 'agent'
@@ -826,6 +837,7 @@ function getRunCalls(db, runId) {
 module.exports = {
   uid,
   now,
+  PERMISSION_MODES,
   getSetting,
   setSetting,
   getAllSettings,

@@ -4,6 +4,7 @@ import MessageItem from '../components/MessageItem.vue'
 import UiIcon from '../components/UiIcon.vue'
 import UiDialog from '../components/UiDialog.vue'
 import ConvRow from '../components/ConvRow.vue'
+import RowMenu from '../components/RowMenu.vue'
 import AgentComposer from '../components/composer/AgentComposer.vue'
 import { useAgentStore } from '../stores/agent'
 import { useChatStore } from '../stores/chat'
@@ -29,6 +30,11 @@ const editingTitleId = ref(null)
 const scrollEl = ref(null)
 const stickBottom = ref(true)
 let searchTimer = null
+// 提示词优化 / 分组折叠 / 提示词定位
+const optimizing = ref(false)
+const pinnedCollapsed = ref(false)
+const projectsCollapsed = ref(false)
+const recentCollapsed = ref(false)
 
 const conv = computed(() => chat.activeConv)
 const streamingMsg = computed(() => chat.messages.find((m) => m.status === 'streaming'))
@@ -130,6 +136,34 @@ async function send() {
     sending.value = false
   }
 }
+// 提示词优化：结合当前会话上下文改写输入框草稿
+async function optimizePrompt() {
+  if (optimizing.value) return
+  const content = input.value.trim()
+  if (!content) return
+  optimizing.value = true
+  try {
+    const r = await window.api.chat.optimizePrompt({
+      conversationId: chat.activeId,
+      content
+    })
+    if (r && r.prompt) input.value = r.prompt
+  } catch (e) {
+    ui.toast('提示词优化失败：' + String((e && e.message) || e), 'error')
+  } finally {
+    optimizing.value = false
+  }
+}
+
+// 左侧提示词定位柱：点击滚动到对应消息
+const promptMarkers = computed(() => chat.messages.filter((m) => m.role === 'user'))
+function scrollToPrompt(id) {
+  const root = scrollEl.value
+  if (!root) return
+  const el = root.querySelector(`[data-msg-id="${id}"]`)
+  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+
 // 停止：普通对话走 gateway 的流式中止；智能任务走 agent 运行中止（两条链路各有权柄）
 function stopStream() {
   const m = streamingMsg.value
@@ -224,6 +258,25 @@ async function removeProject(p) {
   })
   if (ok) await projects.remove(p.id)
 }
+// 项目标题行「…」菜单：置顶 / 删除
+function projectMenuItems(p) {
+  return [
+    { id: 'rename', label: '重命名项目', icon: 'edit', onSelect: () => startProjectRename(p) },
+    {
+      id: 'pin',
+      label: p.pinned ? '取消置顶' : '置顶',
+      icon: 'pin',
+      onSelect: () => projects.update(p.id, { pinned: p.pinned ? 0 : 1 })
+    },
+    {
+      id: 'remove',
+      label: '删除项目',
+      icon: 'trash',
+      danger: true,
+      onSelect: () => removeProject(p)
+    }
+  ]
+}
 
 function toggleKb(id) {
   const i = chat.selectedKbIds.indexOf(id)
@@ -244,14 +297,21 @@ const composerPlaceholder = computed(() =>
 )
 // 输入区可访问说明（placeholder 不作为唯一标签，规范 §8.3）
 const composerHint = computed(() =>
-  chat.agentMode
-    ? 'Enter 发送，Shift+Enter 换行；可调用工具，涉及写入的操作将请求确认'
-    : 'Enter 发送，Shift+Enter 换行'
+  chat.permission === 'readonly'
+    ? 'Enter 发送，Shift+Enter 换行；只读工具自动执行，写入操作将被拒绝'
+    : chat.agentMode
+      ? 'Enter 发送，Shift+Enter 换行；可调用工具，涉及写入的操作将请求确认'
+      : 'Enter 发送，Shift+Enter 换行'
 )
-// 权限三级：默认权限（纯对话）/ 自主模式（写操作逐次确认）/ 完整权限（不再逐次确认）
-// 选中值写回 chat.permission，真实决定 agent.run 的确认策略
+// 权限四级：默认权限（纯对话）/ 只读任务（仅只读工具）/ 自主模式（写操作逐次确认）/ 完整权限（不再逐次确认）
+// 选中值写回 chat.permission（按会话持久化），真实决定 agent.run 的确认策略
 const PERMISSION_META = {
   default: { label: '默认权限', hint: '普通对话，不调用工具', icon: 'chat' },
+  readonly: {
+    label: '只读任务',
+    hint: '只读工具自动执行，写入类操作直接拒绝',
+    icon: 'eye'
+  },
   autonomous: {
     label: '自主模式',
     hint: '可调用工具，涉及写入的操作将请求确认',
@@ -272,7 +332,7 @@ const modeAction = computed(() => {
     selected: chat.permission !== 'default',
     enabled: true,
     hint: cur.hint,
-    options: ['default', 'autonomous', 'full'].map((id) => ({
+    options: ['default', 'readonly', 'autonomous', 'full'].map((id) => ({
       id,
       label: PERMISSION_META[id].label,
       hint: PERMISSION_META[id].hint,
@@ -283,9 +343,9 @@ const modeAction = computed(() => {
 })
 function selectMode(id) {
   if (!PERMISSION_META[id]) return
-  chat.permission = id
-  // 权限降到默认时集群无意义（不执行任务），一并关闭避免留下无效状态
-  if (id === 'default') chat.agentCluster = false
+  chat.setPermission(id)
+  // 权限降到默认/只读时集群无意义（spawn_agent 是写入类必被拒），一并关闭
+  if (id === 'default' || id === 'readonly') chat.agentCluster = false
 }
 
 // 添加能力：项目现有的附件入口是截图（Alt+S 同一链路），不虚构文件/网页菜单
@@ -314,16 +374,17 @@ const clusterAction = computed(() => ({
   label: 'Agent 集群',
   icon: 'cluster',
   active: chat.agentCluster,
-  enabled: chat.permission !== 'default',
+  // 集群依赖 spawn_agent（写入类），只读/默认模式下必被拒，不开放
+  enabled: ['autonomous', 'full'].includes(chat.permission),
   hint:
-    chat.permission === 'default'
+    chat.permission === 'default' || chat.permission === 'readonly'
       ? '切到自主模式或完整权限后可开启集群'
       : chat.agentCluster
         ? '已开启：可将独立子任务并行派发给多个子 Agent'
         : '开启后可将独立子任务并行派发给多个子 Agent'
 }))
 function toggleCluster() {
-  if (chat.permission === 'default') return
+  if (!['autonomous', 'full'].includes(chat.permission)) return
   chat.agentCluster = !chat.agentCluster
 }
 
@@ -480,24 +541,25 @@ function startResize(e) {
 </script>
 
 <template>
-  <div class="h-full flex min-w-0">
+  <div class="h-full flex min-w-0 bg-chrome">
     <!-- 会话列表：可收起、可拖宽（F01） -->
     <aside
       v-show="ui.chatListVisible"
-      class="shrink-0 flex flex-col border-r border-line-subtle bg-subtle"
+      class="shrink-0 flex flex-col bg-chrome"
       :style="{ width: ui.chatListWidth + 'px' }"
       aria-label="会话列表"
     >
-      <div class="px-2.5 pt-3 pb-2">
+      <div class="px-3 pt-3 pb-2">
         <div class="flex items-center gap-2 mb-2">
-          <span class="text-sm font-semibold flex-1">会话</span>
+          <span class="text-base font-semibold flex-1">会话</span>
           <button
-            class="btn-primary !h-8 !px-2.5 text-xs"
+            class="icon-btn !h-8 !w-8 border border-line-subtle bg-chrome"
             data-testid="new-conv"
+            title="新建会话"
+            aria-label="新建会话"
             @click="chat.create()"
           >
-            <UiIcon name="plus" :size="14" />
-            新建
+            <UiIcon name="plus" :size="16" />
           </button>
         </div>
         <div class="relative">
@@ -530,26 +592,50 @@ function startResize(e) {
       </div>
       <div class="scroll-region flex-1 px-2 pb-2">
         <template v-if="pinnedConvs.length || !chat.filtering">
-          <div class="px-1.5 pt-1 pb-1 text-xs text-ink-muted">置顶</div>
-          <ConvRow
-            v-for="c in pinnedConvs"
-            :key="c.id"
-            :conv="c"
-            :active="c.id === chat.activeId"
-            :editing="editingTitleId === c.id"
-            @select="chat.select(c.id)"
-            @rename="startRename(c)"
-            @rename-submit="submitRename"
-            @pin="chat.updateConv(c.id, { pinned: c.pinned ? 0 : 1 })"
-            @remove="removeConv(c)"
-          />
-          <div v-if="!pinnedConvs.length" class="px-2 pb-1.5 text-xs text-ink-muted/70">
-            暂无置顶会话，悬停会话行可置顶
+          <div class="px-1.5 pt-1 pb-1 flex items-center gap-1">
+            <span class="text-xs font-semibold text-ink-primary">置顶</span>
+            <button
+              class="icon-btn-sm !w-5 !h-5"
+              :title="pinnedCollapsed ? '展开置顶会话' : '折叠置顶会话'"
+              :aria-label="pinnedCollapsed ? '展开置顶会话' : '折叠置顶会话'"
+              :aria-expanded="!pinnedCollapsed"
+              @click="pinnedCollapsed = !pinnedCollapsed"
+            >
+              <UiIcon :name="pinnedCollapsed ? 'chevronRight' : 'chevronDown'" :size="14" />
+            </button>
           </div>
+          <template v-if="!pinnedCollapsed">
+            <ConvRow
+              v-for="c in pinnedConvs"
+              :key="c.id"
+              :conv="c"
+              :active="c.id === chat.activeId"
+              :editing="editingTitleId === c.id"
+              @select="chat.select(c.id)"
+              @rename="startRename(c)"
+              @rename-submit="submitRename"
+              @pin="chat.updateConv(c.id, { pinned: c.pinned ? 0 : 1 })"
+              @remove="removeConv(c)"
+            />
+            <div v-if="!pinnedConvs.length" class="px-2 pb-1.5 text-xs text-ink-muted/70">
+              暂无置顶会话，悬停会话行可置顶
+            </div>
+          </template>
         </template>
         <template v-if="projectGroups.length || !chat.filtering">
-          <div class="px-1.5 pt-2 pb-1 text-xs text-ink-muted flex items-center justify-between">
-            <span>项目</span>
+          <div class="px-1.5 pt-2 pb-1 flex items-center justify-between">
+            <span class="flex items-center gap-1">
+              <span class="text-xs font-semibold text-ink-primary">项目</span>
+              <button
+                class="icon-btn-sm !w-5 !h-5"
+                :title="projectsCollapsed ? '展开项目' : '折叠项目'"
+                :aria-label="projectsCollapsed ? '展开项目' : '折叠项目'"
+                :aria-expanded="!projectsCollapsed"
+                @click="projectsCollapsed = !projectsCollapsed"
+              >
+                <UiIcon :name="projectsCollapsed ? 'chevronRight' : 'chevronDown'" :size="14" />
+              </button>
+            </span>
             <button
               class="icon-btn-sm !w-5 !h-5"
               data-testid="project-add"
@@ -560,99 +646,106 @@ function startResize(e) {
               <UiIcon name="plus" :size="14" />
             </button>
           </div>
-          <div v-if="!projects.projects.length" class="px-2 pb-1.5 text-xs text-ink-muted/70">
-            添加项目工作目录后，会话可按项目归类
-          </div>
-          <div v-for="g in projectGroups" :key="g.project.id" data-testid="project-item">
-            <div
-              tabindex="0"
-              class="list-row group !min-h-[40px] cursor-pointer select-none"
-              role="button"
-              :aria-expanded="isExpanded(g.project.id) ? 'true' : 'false'"
-              :title="g.project.path"
-              @click="toggleProject(g.project.id)"
-              @keydown.enter.prevent="toggleProject(g.project.id)"
-              @dblclick.stop="startProjectRename(g.project)"
-            >
-              <template v-if="editingProjectId === g.project.id">
-                <input
-                  v-model="projectDraft"
-                  class="flex-1 min-w-0 bg-transparent outline-none border-b border-brand text-sm"
-                  aria-label="项目名称"
-                  @keydown="onProjectRenameKeydown"
-                  @blur="submitProjectRename"
-                />
-              </template>
-              <template v-else>
-                <span class="shrink-0 text-ink-muted">
-                  <UiIcon
-                    :name="isExpanded(g.project.id) ? 'chevronDown' : 'chevronRight'"
-                    :size="14"
-                  />
-                </span>
-                <UiIcon name="folder" :size="14" class="shrink-0 text-brand-ink/80" />
-                <span class="flex-1 truncate">{{ g.project.name }}</span>
-                <span
-                  class="flex gap-0.5 shrink-0 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity"
-                >
-                  <button
-                    class="icon-btn-sm !w-6 !h-6"
-                    data-testid="project-new-conv"
-                    title="在此项目新建会话"
-                    aria-label="在此项目新建会话"
-                    @click.stop="createInProject(g.project)"
-                  >
-                    <UiIcon name="plus" :size="14" />
-                  </button>
-                  <button
-                    class="icon-btn-sm !w-6 !h-6 hover:!text-red-500"
-                    title="删除项目"
-                    aria-label="删除项目"
-                    @click.stop="removeProject(g.project)"
-                  >
-                    <UiIcon name="trash" :size="14" />
-                  </button>
-                </span>
-              </template>
+          <template v-if="!projectsCollapsed">
+            <div v-if="!projects.projects.length" class="px-2 pb-1.5 text-xs text-ink-muted/70">
+              添加项目工作目录后，会话可按项目归类
             </div>
-            <div v-if="isExpanded(g.project.id)" class="ml-4 border-l border-line-subtle pl-1">
-              <ConvRow
-                v-for="c in g.sessions"
-                :key="c.id"
-                :conv="c"
-                :active="c.id === chat.activeId"
-                :editing="editingTitleId === c.id"
-                @select="chat.select(c.id)"
-                @rename="startRename(c)"
-                @rename-submit="submitRename"
-                @pin="chat.updateConv(c.id, { pinned: c.pinned ? 0 : 1 })"
-                @remove="removeConv(c)"
-              />
-              <button
-                v-if="!g.sessions.length && !chat.filtering"
-                class="w-full flex items-center gap-1.5 px-2 py-1.5 text-xs text-ink-muted hover:text-ink-secondary"
-                @click="createInProject(g.project)"
+            <div v-for="g in projectGroups" :key="g.project.id" data-testid="project-item">
+              <div
+                tabindex="0"
+                class="list-row group !min-h-[40px] cursor-pointer select-none"
+                role="button"
+                :aria-expanded="isExpanded(g.project.id) ? 'true' : 'false'"
+                :title="g.project.path"
+                @click="toggleProject(g.project.id)"
+                @keydown.enter.prevent="toggleProject(g.project.id)"
               >
-                <UiIcon name="plus" :size="12" />
-                新建会话
-              </button>
+                <template v-if="editingProjectId === g.project.id">
+                  <input
+                    v-model="projectDraft"
+                    class="flex-1 min-w-0 bg-transparent outline-none border-b border-brand text-sm"
+                    aria-label="项目名称"
+                    @keydown="onProjectRenameKeydown"
+                    @blur="submitProjectRename"
+                  />
+                </template>
+                <template v-else>
+                  <span class="shrink-0 text-ink-muted">
+                    <UiIcon
+                      :name="isExpanded(g.project.id) ? 'chevronDown' : 'chevronRight'"
+                      :size="14"
+                    />
+                  </span>
+                  <UiIcon name="folder" :size="14" class="shrink-0 text-brand-ink/80" />
+                  <span class="flex-1 truncate">{{ g.project.name }}</span>
+                  <RowMenu :items="projectMenuItems(g.project)" label="项目操作" />
+                  <span
+                    class="flex gap-0.5 shrink-0 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity"
+                  >
+                    <button
+                      class="icon-btn-sm !w-6 !h-6"
+                      data-testid="project-new-conv"
+                      title="在此项目新建会话"
+                      aria-label="在此项目新建会话"
+                      @click.stop="createInProject(g.project)"
+                    >
+                      <UiIcon name="plus" :size="14" />
+                    </button>
+                  </span>
+                </template>
+              </div>
+              <div v-if="isExpanded(g.project.id)" class="ml-4 border-l border-line-subtle pl-1">
+                <ConvRow
+                  v-for="c in g.sessions"
+                  :key="c.id"
+                  :conv="c"
+                  :active="c.id === chat.activeId"
+                  :editing="editingTitleId === c.id"
+                  @select="chat.select(c.id)"
+                  @rename="startRename(c)"
+                  @rename-submit="submitRename"
+                  @pin="chat.updateConv(c.id, { pinned: c.pinned ? 0 : 1 })"
+                  @remove="removeConv(c)"
+                />
+                <button
+                  v-if="!g.sessions.length && !chat.filtering"
+                  class="w-full flex items-center gap-1.5 px-2 py-1.5 text-xs text-ink-muted hover:text-ink-secondary"
+                  @click="createInProject(g.project)"
+                >
+                  <UiIcon name="plus" :size="12" />
+                  新建会话
+                </button>
+              </div>
             </div>
-          </div>
+          </template>
         </template>
         <template v-if="unprojectedConvs.length">
-          <div class="px-1.5 pt-2 pb-1 text-xs text-ink-muted">最近</div>
-          <ConvRow
-            v-for="c in unprojectedConvs"
-            :key="c.id"
-            :conv="c"
-            :active="c.id === chat.activeId"
-            :editing="editingTitleId === c.id"
-            @select="chat.select(c.id)"
-            @rename="startRename(c)"
-            @rename-submit="submitRename"
-            @pin="chat.updateConv(c.id, { pinned: c.pinned ? 0 : 1 })"
-            @remove="removeConv(c)"
-          />
+          <div class="px-1.5 pt-2 pb-1 flex items-center gap-1">
+            <span class="text-xs font-semibold text-ink-primary">最近</span>
+            <button
+              class="icon-btn-sm !w-5 !h-5"
+              :title="recentCollapsed ? '展开最近会话' : '折叠最近会话'"
+              :aria-label="recentCollapsed ? '展开最近会话' : '折叠最近会话'"
+              :aria-expanded="!recentCollapsed"
+              @click="recentCollapsed = !recentCollapsed"
+            >
+              <UiIcon :name="recentCollapsed ? 'chevronRight' : 'chevronDown'" :size="14" />
+            </button>
+          </div>
+          <template v-if="!recentCollapsed">
+            <ConvRow
+              v-for="c in unprojectedConvs"
+              :key="c.id"
+              :conv="c"
+              :active="c.id === chat.activeId"
+              :editing="editingTitleId === c.id"
+              @select="chat.select(c.id)"
+              @rename="startRename(c)"
+              @rename-submit="submitRename"
+              @pin="chat.updateConv(c.id, { pinned: c.pinned ? 0 : 1 })"
+              @remove="removeConv(c)"
+            />
+          </template>
         </template>
         <div
           v-if="!chat.visibleConversations.length"
@@ -677,12 +770,10 @@ function startResize(e) {
       />
     </aside>
 
-    <!-- 聊天主区 -->
-    <section class="flex-1 min-w-0 flex flex-col">
+    <!-- 聊天主区：整个右区为白底悬浮卡片（含页头、消息与输入区） -->
+    <section class="flex-1 min-w-0 flex flex-col m-3 chat-surface overflow-hidden">
       <!-- 页头：列表开关 / 标题 / 生效模型 / 更多（设置入口统一在侧栏「设置」） -->
-      <header
-        class="shrink-0 h-14 flex items-center gap-2 px-4 border-b border-line-subtle bg-canvas"
-      >
+      <header class="shrink-0 h-14 flex items-center gap-2 px-4 bg-surface">
         <button
           class="icon-btn"
           :title="ui.chatListVisible ? '收起列表' : '展开列表'"
@@ -744,10 +835,26 @@ function startResize(e) {
       </header>
 
       <!-- 消息区：单滚动容器 + 回到底部（F14） -->
-      <div class="relative flex-1 min-h-0">
+      <div class="relative flex-1 min-h-0 bg-surface">
+        <!-- 提示词定位柱：横向柱形列表，垂直居中 -->
+        <div
+          v-if="promptMarkers.length"
+          class="absolute left-1 top-1/2 z-10 flex -translate-y-1/2 flex-col gap-1.5"
+          aria-label="提示词定位"
+        >
+          <button
+            v-for="m in promptMarkers"
+            :key="m.id"
+            type="button"
+            class="h-[3px] w-3 rounded-full bg-violet-300 transition-all hover:w-5 hover:bg-violet-400 dark:bg-violet-500/60 dark:hover:bg-violet-400"
+            :title="'定位提示词：' + (m.content || '').slice(0, 30)"
+            aria-label="定位到提示词"
+            @click="scrollToPrompt(m.id)"
+          />
+        </div>
         <div
           ref="scrollEl"
-          class="absolute inset-0 overflow-y-auto px-4 md:px-6 py-4"
+          class="absolute inset-0 overflow-y-auto px-4 md:px-6 py-4 bg-surface"
           @scroll.passive="onScroll"
         >
           <div class="max-w-[840px] mx-auto w-full space-y-4">
@@ -815,7 +922,7 @@ function startResize(e) {
       </div>
 
       <!-- 输入区（AgentComposer）：状态徽标 + 单张白卡（上层输入 / 下层操作栏） -->
-      <div class="shrink-0 bg-canvas px-6 pb-5 pt-3">
+      <div class="shrink-0 px-6 pb-5 pt-3 bg-surface">
         <div class="mx-auto w-full" style="max-width: 1136px">
           <AgentComposer
             :variant="composerVariant"
@@ -833,9 +940,11 @@ function startResize(e) {
             :cluster-action="clusterAction"
             :context-usage="contextUsage"
             :runtime-state="runtimeState"
+            :optimizing="optimizing"
             :send-label="chat.agentMode ? '开始任务' : '发送'"
             @update:value="input = $event"
             @submit="send"
+            @optimize="optimizePrompt"
             @stop="stopComposer"
             @add="addAttachment"
             @context="showKbPopover = !showKbPopover"

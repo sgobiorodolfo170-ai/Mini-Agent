@@ -118,6 +118,24 @@ describe('session 发送', () => {
     )
   })
 
+  it('readonly 权限走 Agent 运行器并保持只读透传（子会话不提权）', async () => {
+    const parent = seedParent()
+    const conv = await sessions.createSession({ parentConversationId: parent.id, title: 'T' })
+    const r = await sessions.sendToSession({
+      conversationId: conv.id,
+      content: '只读调查',
+      permission: 'readonly'
+    })
+    expect(r.mode).toBe('agent')
+    expect(agentStart).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: conv.id,
+        goal: '只读调查',
+        permission: 'readonly'
+      })
+    )
+  })
+
   it('空提示词被拒绝', async () => {
     const parent = seedParent()
     const conv = await sessions.createSession({ parentConversationId: parent.id, title: 'T' })

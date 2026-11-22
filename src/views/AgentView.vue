@@ -38,13 +38,16 @@ async function copyResult(c) {
 </script>
 
 <template>
-  <div class="h-full flex min-w-0">
+  <div class="h-full flex min-w-0 bg-chrome">
     <!-- 左栏：记录列表（两行：目标摘要 + 状态/时间） -->
     <aside
-      class="w-72 shrink-0 flex flex-col border-r border-line-subtle bg-subtle"
+      class="shrink-0 flex flex-col bg-chrome"
+      :style="{ width: ui.chatListWidth + 'px' }"
       aria-label="执行记录"
     >
-      <div class="px-3 py-3 text-sm font-semibold border-b border-line-subtle">执行记录</div>
+      <div class="px-3 py-3 text-base font-semibold text-ink-primary border-b border-line-subtle">
+        执行记录
+      </div>
       <div class="scroll-region flex-1 p-2 space-y-1">
         <div
           v-for="r in agent.runs"
@@ -58,13 +61,13 @@ async function copyResult(c) {
           @click="agent.select(r.id)"
           @keydown.enter.prevent="agent.select(r.id)"
         >
-          <div class="flex items-center gap-2 mb-1">
+          <div class="truncate text-sm mb-1" :title="r.goal">{{ r.goal }}</div>
+          <div class="flex items-center gap-2">
             <StatusBadge :status="r.status" />
             <span class="text-ink-muted ml-auto">{{
               new Date(r.started_at).toLocaleString('zh-CN')
             }}</span>
           </div>
-          <div class="truncate text-sm" :title="r.goal">{{ r.goal }}</div>
         </div>
         <div v-if="!agent.runs.length" class="p-4 text-center text-xs text-ink-muted">
           暂无执行记录
@@ -72,10 +75,10 @@ async function copyResult(c) {
       </div>
     </aside>
 
-    <section class="flex-1 min-w-0 flex flex-col">
+    <section class="flex-1 min-w-0 flex flex-col m-3 chat-surface overflow-hidden">
       <template v-if="agent.activeRunId && agent.activeRun">
         <!-- 顶部：目标全文 / 状态 / 耗时（F17） -->
-        <header class="shrink-0 px-5 py-3.5 border-b border-line-subtle flex items-start gap-3">
+        <header class="shrink-0 px-5 py-3.5 bg-surface flex items-start gap-3">
           <div class="min-w-0 flex-1">
             <h2 class="text-sm font-medium break-words" :title="agent.activeRun.goal">
               {{ agent.activeRun.goal }}
@@ -102,7 +105,7 @@ async function copyResult(c) {
           </button>
         </header>
 
-        <div class="scroll-region flex-1 px-5 py-4 space-y-3">
+        <div class="scroll-region flex-1 px-5 py-4 space-y-3 bg-surface">
           <div
             v-if="agent.activeRun.error"
             class="rounded-lg bg-bad text-bad-ink px-3 py-2 text-sm"

@@ -255,6 +255,7 @@ function registerIpc(ctx) {
   h('chat:stop', (msgId) => gateway.stopChat(msgId))
   h('chat:regenerate', (cid) => gateway.regenerate(cid))
   h('chat:editResend', (o) => gateway.editResend(o))
+  h('chat:optimizePrompt', (o) => gateway.optimizePrompt(o))
   h('chat:messageDelete', (msgId) => {
     const m = repos.softDeleteMessage(dbm.get(), msgId)
     if (!m) throw new Error('消息不存在')

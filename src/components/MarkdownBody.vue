@@ -8,10 +8,18 @@ const html = computed(() => renderMarkdown(props.content))
 
 function onClick(e) {
   const t = e.target
-  if (t && t.classList && t.classList.contains('code-copy')) {
-    navigator.clipboard.writeText(decodeURIComponent(t.dataset.code || ''))
-    t.textContent = '已复制'
-    setTimeout(() => (t.textContent = '复制'), 1200)
+  const copyBtn = t && typeof t.closest === 'function' ? t.closest('.code-copy') : null
+  if (copyBtn) {
+    navigator.clipboard.writeText(decodeURIComponent(copyBtn.dataset.code || ''))
+    copyBtn.classList.add('is-copied')
+    copyBtn.setAttribute('title', '已复制')
+    copyBtn.setAttribute('aria-label', '已复制')
+    clearTimeout(copyBtn._copyTimer)
+    copyBtn._copyTimer = setTimeout(() => {
+      copyBtn.classList.remove('is-copied')
+      copyBtn.setAttribute('title', '复制代码')
+      copyBtn.setAttribute('aria-label', '复制代码')
+    }, 1200)
     return
   }
   if (t && t.tagName === 'A') {

@@ -1,7 +1,7 @@
 const fs = require('fs')
 const path = require('path')
 
-const SCHEMA_VERSION = 5
+const SCHEMA_VERSION = 7
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS settings (
@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   path TEXT NOT NULL,
+  pinned INTEGER NOT NULL DEFAULT 0,
   sort INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
@@ -62,6 +63,7 @@ CREATE TABLE IF NOT EXISTS conversations (
   system_prompt TEXT,
   context_policy TEXT NOT NULL DEFAULT '{}',
   project_id TEXT,
+  permission TEXT NOT NULL DEFAULT 'default',
   origin TEXT NOT NULL DEFAULT 'user',
   parent_id TEXT,
   created_by_run TEXT,
@@ -225,6 +227,14 @@ function migrate(db) {
     db.exec(
       'CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_runs_idempotency_key ON agent_runs(idempotency_key) WHERE idempotency_key IS NOT NULL'
     )
+    // v5 → v6:项目支持置顶（置顶的项目分组排在项目区最前）
+    if (!columnExists(db, 'projects', 'pinned')) {
+      db.exec('ALTER TABLE projects ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0')
+    }
+    // v6 → v7:权限分级四级。会话记忆上次权限级别，切回会话时恢复。
+    if (!columnExists(db, 'conversations', 'permission')) {
+      db.exec("ALTER TABLE conversations ADD COLUMN permission TEXT NOT NULL DEFAULT 'default'")
+    }
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
   }
 }

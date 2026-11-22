@@ -88,6 +88,8 @@ describe('旧库迁移', () => {
     expect(conv.origin).toBe('user')
     expect(conv.parent_id).toBeNull()
     expect(conv.created_by_run).toBeNull()
+    // v7：权限列默认 default（会话级权限记忆）
+    expect(conv.permission).toBe('default')
 
     const run = db.prepare('SELECT * FROM agent_runs WHERE id = ?').get('r-legacy')
     expect(run.goal).toBe('老目标')

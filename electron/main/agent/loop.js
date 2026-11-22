@@ -54,9 +54,10 @@ async function runAgentLoop({
       const tool = toolMap[name]
       const riskLevel = tool ? tool.risk : 'readonly'
       let allowed = true
+      let decision = null
       if (decide) {
-        const d = await decide({ name, args, riskLevel, exists: !!tool })
-        allowed = !!d.allowed
+        decision = await decide({ name, args, riskLevel, exists: !!tool })
+        allowed = !!decision.allowed
       }
       if (onEvent) onEvent('tool-start', { name, args, riskLevel, allowed })
 
@@ -67,7 +68,7 @@ async function runAgentLoop({
         resultText = `未知工具: ${name}`
       } else if (!allowed) {
         ok = false
-        resultText = '用户拒绝执行该操作'
+        resultText = (decision && decision.denyMessage) || '用户拒绝执行该操作'
       } else {
         try {
           const r = await execute(tool, args)
