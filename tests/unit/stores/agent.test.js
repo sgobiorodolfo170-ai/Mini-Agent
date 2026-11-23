@@ -10,7 +10,8 @@ function stubApi() {
       runs: vi.fn(async () => [{ id: 'r1', status: 'done' }]),
       calls: vi.fn(async () => [{ id: 'call1', name: 'write_file' }]),
       stop: vi.fn(async () => ({})),
-      respond: vi.fn(async () => ({}))
+      respond: vi.fn(async () => ({})),
+      acceptanceDecide: vi.fn(async () => ({ id: 'r1', acceptance_status: 'accepted' }))
     }
   }
   window.api = api
@@ -61,14 +62,27 @@ describe('agent store', () => {
     expect(s.confirms.map((c) => c.requestId)).toEqual(['q2'])
   })
 
-  it('started/done 事件触发运行列表刷新，其他事件不触发', async () => {
+  it('started/done/acceptance 事件触发运行列表刷新，其他事件不触发', async () => {
     const s = useAgentStore()
     s.handleEvent({ type: 'started', runId: 'r1' })
     expect(window.api.agent.runs).toHaveBeenCalledTimes(1)
     s.handleEvent({ type: 'done', runId: 'r1' })
     expect(window.api.agent.runs).toHaveBeenCalledTimes(2)
+    s.handleEvent({ type: 'acceptance', runId: 'r1' })
+    expect(window.api.agent.runs).toHaveBeenCalledTimes(3)
     s.handleEvent({ type: 'tool_call', runId: 'r1' })
-    expect(window.api.agent.runs).toHaveBeenCalledTimes(2)
+    expect(window.api.agent.runs).toHaveBeenCalledTimes(3)
+  })
+
+  it('decideAcceptance 提交人工验收并刷新列表', async () => {
+    const s = useAgentStore()
+    await s.decideAcceptance('r1', 'accepted', '人工确认')
+    expect(window.api.agent.acceptanceDecide).toHaveBeenCalledWith({
+      runId: 'r1',
+      decision: 'accepted',
+      reason: '人工确认'
+    })
+    expect(window.api.agent.runs).toHaveBeenCalledTimes(1)
   })
 
   it('stopRun 立即清掉该运行的本地确认卡', async () => {

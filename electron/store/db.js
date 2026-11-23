@@ -2,7 +2,7 @@ const fs = require('fs')
 const path = require('path')
 
 const { RUN_SCHEMA, recoverRuns } = require('./run-storage')
-const SCHEMA_VERSION = 9
+const SCHEMA_VERSION = 10
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS settings (
@@ -266,6 +266,63 @@ function migrate(db) {
           FROM agent_runs child WHERE child.parent_run_id=agent_runs.id AND child.control_mode='transferred')
           WHERE status='transferred'`)
         db.exec(RUN_SCHEMA)
+        db.exec(`PRAGMA user_version = 9`)
+      })
+    }
+    if (current < 10) {
+      const { transaction } = require('../main/remote/protocol')
+      transaction(db, () => {
+        for (const [table, columns] of Object.entries({
+          agent_runs: {
+            graph_id: 'TEXT',
+            node_key: 'TEXT',
+            workspace_json: 'TEXT',
+            resume_count: 'INTEGER NOT NULL DEFAULT 0'
+          },
+          agent_tool_calls: {
+            call_id: 'TEXT',
+            status: "TEXT NOT NULL DEFAULT 'done'",
+            started_at: 'INTEGER',
+            finished_at: 'INTEGER'
+          },
+          projects: {
+            workspace_mode: "TEXT NOT NULL DEFAULT 'worktree'",
+            workspace_auto_merge: 'INTEGER NOT NULL DEFAULT 1'
+          }
+        })) {
+          for (const [name, type] of Object.entries(columns)) {
+            if (!columnExists(db, table, name))
+              db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`)
+          }
+        }
+        db.exec(`
+CREATE TABLE IF NOT EXISTS run_graphs (
+  id TEXT PRIMARY KEY,
+  parent_run_id TEXT,
+  conversation_id TEXT,
+  status TEXT NOT NULL DEFAULT 'running',
+  created_at INTEGER NOT NULL,
+  finished_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS run_dependencies (
+  run_id TEXT NOT NULL,
+  depends_on_run_id TEXT NOT NULL,
+  PRIMARY KEY (run_id, depends_on_run_id)
+);
+CREATE TABLE IF NOT EXISTS run_checkpoints (
+  run_id TEXT PRIMARY KEY,
+  seq INTEGER NOT NULL DEFAULT 0,
+  phase TEXT NOT NULL,
+  step INTEGER NOT NULL DEFAULT 0,
+  messages_json TEXT NOT NULL,
+  pending_tools_json TEXT,
+  steps_used INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_graph ON agent_runs(graph_id);
+CREATE INDEX IF NOT EXISTS idx_run_deps_dep ON run_dependencies(depends_on_run_id);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_call ON agent_tool_calls(run_id, call_id);
+`)
         db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
       })
     }

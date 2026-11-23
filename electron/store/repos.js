@@ -188,7 +188,8 @@ function listKeyEvents(db, limit = 100) {
 function listProjects(db) {
   return db
     .prepare(
-      `SELECT id, name, path, pinned, sort, created_at AS createdAt, updated_at AS updatedAt
+      `SELECT id, name, path, pinned, sort, workspace_mode AS workspaceMode,
+       workspace_auto_merge AS workspaceAutoMerge, created_at AS createdAt, updated_at AS updatedAt
        FROM projects WHERE deleted_at IS NULL ORDER BY pinned DESC, sort, created_at`
     )
     .all()
@@ -197,31 +198,55 @@ function listProjects(db) {
 function getProject(db, id) {
   return db
     .prepare(
-      `SELECT id, name, path, pinned, sort, created_at AS createdAt, updated_at AS updatedAt
+      `SELECT id, name, path, pinned, sort, workspace_mode AS workspaceMode,
+       workspace_auto_merge AS workspaceAutoMerge, created_at AS createdAt, updated_at AS updatedAt
        FROM projects WHERE id = ? AND deleted_at IS NULL`
     )
     .get(id)
 }
 
-function createProject(db, { name, path }) {
+function createProject(db, { name, path, workspaceMode = 'worktree', workspaceAutoMerge = 1 }) {
   const t = now()
   const id = uid()
   const sortRow = db
     .prepare('SELECT COALESCE(MAX(sort), 0) + 1 AS next FROM projects WHERE deleted_at IS NULL')
     .get()
   db.prepare(
-    `INSERT INTO projects(id, name, path, sort, created_at, updated_at) VALUES(?,?,?,?,?,?)`
-  ).run(id, name, path, sortRow.next, t, t)
+    `INSERT INTO projects(id, name, path, sort, workspace_mode, workspace_auto_merge, created_at, updated_at)
+     VALUES(?,?,?,?,?,?,?,?)`
+  ).run(
+    id,
+    name,
+    path,
+    sortRow.next,
+    workspaceMode === 'shared' ? 'shared' : 'worktree',
+    workspaceAutoMerge ? 1 : 0,
+    t,
+    t
+  )
   return getProject(db, id)
 }
 
 function updateProject(db, id, patch) {
   const cur = getProject(db, id)
   if (!cur) return null
-  db.prepare('UPDATE projects SET name=?, path=?, pinned=?, updated_at=? WHERE id=?').run(
+  db.prepare(
+    `UPDATE projects SET name=?, path=?, pinned=?, workspace_mode=?, workspace_auto_merge=?,
+     updated_at=? WHERE id=?`
+  ).run(
     patch.name !== undefined ? patch.name : cur.name,
     patch.path !== undefined ? patch.path : cur.path,
     patch.pinned !== undefined ? (patch.pinned ? 1 : 0) : cur.pinned,
+    patch.workspaceMode !== undefined
+      ? patch.workspaceMode === 'shared'
+        ? 'shared'
+        : 'worktree'
+      : cur.workspaceMode,
+    patch.workspaceAutoMerge !== undefined
+      ? patch.workspaceAutoMerge
+        ? 1
+        : 0
+      : cur.workspaceAutoMerge,
     now(),
     id
   )
@@ -680,7 +705,9 @@ const RUN_COLUMNS = `id, conversation_id AS conversationId, goal, status,
   acceptance_result AS acceptanceResult, trace_id AS traceId,
   idempotency_key AS idempotencyKey, version, submitted_at AS submittedAt,
   claimed_at AS claimedAt, finished_reason AS finishedReason, user_message_id AS userMessageId,
-  assistant_message_id AS assistantMessageId, transfer_to_run_id AS transferToRunId, run_spec_json AS runSpecJson`
+  assistant_message_id AS assistantMessageId, transfer_to_run_id AS transferToRunId,
+  run_spec_json AS runSpecJson, graph_id AS graphId, node_key AS nodeKey,
+  workspace_json AS workspaceJson, resume_count AS resumeCount`
 
 function isRunTerminal(status) {
   return RUN_TERMINAL.includes(status)
@@ -703,6 +730,8 @@ function createRun(db, opts = {}) {
     acceptancePolicy = null,
     traceId = null,
     idempotencyKey = null,
+    graphId = null,
+    nodeKey = null,
     status = 'running'
   } = opts
 
@@ -724,8 +753,8 @@ function createRun(db, opts = {}) {
   db.prepare(
     `INSERT INTO agent_runs(id, conversation_id, goal, status, max_steps, steps_used,
       started_at, parent_run_id, control_mode, mandate_json, acceptance_policy,
-      trace_id, idempotency_key, version)
-     VALUES(?,?,?,?,?,0,?,?,?,?,?,?,?,1)`
+      trace_id, idempotency_key, graph_id, node_key, version)
+     VALUES(?,?,?,?,?,0,?,?,?,?,?,?,?,?,?,1)`
   ).run(
     id,
     conversationId || null,
@@ -738,7 +767,9 @@ function createRun(db, opts = {}) {
     mandate ? JSON.stringify(mandate) : null,
     acceptancePolicy ? JSON.stringify(acceptancePolicy) : null,
     traceId,
-    idempotencyKey
+    idempotencyKey,
+    graphId,
+    nodeKey
   )
   return id
 }
@@ -787,6 +818,17 @@ function updateRunStatus(db, id, patch = {}) {
     )
   if (!info.changes) return { ok: false, reason: 'version_conflict', run: getRun(db, id) }
   return { ok: true, run: getRun(db, id) }
+}
+
+// 验收状态独立于 Run 状态机：Run 已是终态，验收仍可 pending → accepted/rejected/escalated。
+function updateRunAcceptance(db, id, { status, result = null, expected = null } = {}) {
+  const cur = getRun(db, id)
+  if (!cur) return null
+  if (expected && cur.acceptanceStatus !== expected) return null
+  db.prepare(
+    `UPDATE agent_runs SET acceptance_status=?, acceptance_result=?, version=version+1 WHERE id=?`
+  ).run(status, result ? JSON.stringify(result) : null, id)
+  return getRun(db, id)
 }
 
 // 兼容旧调用点：终止类状态走 CAS，失败只记录不抛（旧代码期望 void）。
@@ -955,6 +997,7 @@ module.exports = {
   createRunEx,
   updateRun,
   updateRunStatus,
+  updateRunAcceptance,
   finalizeRunStatus,
   resumeParentAfterChild,
   getRun,

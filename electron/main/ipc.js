@@ -366,6 +366,7 @@ function registerIpc(ctx) {
   h('agent:pause', (runId) => agent.pauseRun(runId))
   h('agent:resume', (runId) => agent.resumeRun(runId))
   h('agent:respond', (o) => agent.respondConfirm(o))
+  h('agent:acceptance:decide', (o) => agent.decideAcceptance(o))
   h('agent:runs', () => repos.listRuns(dbm.get(), 50))
   h('agent:calls', (runId) => repos.getRunCalls(dbm.get(), runId))
 

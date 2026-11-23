@@ -28,6 +28,7 @@ const { getHub } = require('../events/hub')
 const { parseHooks, applyHooks } = require('../events/hooks')
 const { normalizeMandate, defaultSubMandate, authorizeToolCall } = require('./mandate')
 const { createSessionBridge } = require('./session-bridge')
+const acceptance = require('./acceptance')
 const { createApprovalService } = require('../remote/approval-service')
 const { createRunControl } = require('../remote/run-control-service')
 const { isShuttingDown } = require('../lifecycle')
@@ -1019,6 +1020,21 @@ async function doAgentRun({
     stepsUsed,
     acceptanceStatus: acceptancePolicy && status === 'done' ? 'pending' : null
   })
+  if (acceptancePolicy && status === 'done') {
+    acceptance.queueAcceptance(
+      {
+        db,
+        repos,
+        chatOnce,
+        scheduler,
+        decryptSecret,
+        resolveModel,
+        broadcast,
+        emit: (type, payload) => getHub().emit(type, payload)
+      },
+      runId
+    )
+  }
   if (ctx._browser) {
     try {
       ctx._browser.close()
@@ -1041,6 +1057,18 @@ function respondConfirm({ requestId, allow, remember }) {
     actor: 'desktop',
     reason: remember ? 'remember_not_supported' : ''
   }).ok
+}
+
+function decideAcceptance(input) {
+  return acceptance.decideAcceptance(
+    {
+      db: dbm.get(),
+      repos,
+      broadcast,
+      emit: (type, payload) => getHub().emit(type, payload)
+    },
+    input
+  )
 }
 
 function stopRun(runId, reason = 'user', context = {}) {
@@ -1116,6 +1144,7 @@ module.exports = {
   getRunStatus: (id) => getRunStatus(dbm.get(), id),
   getRunResult: (id, maxChars) => getRunResult(dbm.get(), id, maxChars),
   respondConfirm,
+  decideAcceptance,
   getApprovalService,
   pauseRun,
   resumeRun,

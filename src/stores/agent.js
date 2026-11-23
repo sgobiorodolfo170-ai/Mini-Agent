@@ -30,6 +30,11 @@ export const useAgentStore = defineStore('agent', {
       this.confirms = this.confirms.filter((c) => c.requestId !== requestId)
       return window.api.agent.respond({ requestId, allow, remember })
     },
+    async decideAcceptance(runId, decision, reason = '') {
+      const run = await window.api.agent.acceptanceDecide({ runId, decision, reason })
+      await this.loadRuns()
+      return run
+    },
     pushConfirm(c) {
       this.confirms.push(c)
     },
@@ -43,7 +48,7 @@ export const useAgentStore = defineStore('agent', {
       })
     },
     handleEvent(ev) {
-      if (['queued', 'started', 'state', 'done'].includes(ev.type)) this.loadRuns()
+      if (['queued', 'started', 'state', 'done', 'acceptance'].includes(ev.type)) this.loadRuns()
       // 运行结束（含被停止/出错）时，该运行遗留的确认卡一律失效
       if (ev.type === 'done' && ev.runId) this.clearConfirms({ runId: ev.runId })
     }

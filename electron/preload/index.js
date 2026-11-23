@@ -82,6 +82,7 @@ function buildMain() {
       pause: (runId) => inv('agent:pause', runId),
       resume: (runId) => inv('agent:resume', runId),
       respond: (o) => inv('agent:respond', o),
+      acceptanceDecide: (o) => inv('agent:acceptance:decide', o),
       runs: () => inv('agent:runs'),
       calls: (runId) => inv('agent:calls', runId)
     },

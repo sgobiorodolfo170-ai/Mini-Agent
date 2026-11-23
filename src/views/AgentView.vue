@@ -37,6 +37,25 @@ function acceptanceStatus(run) {
   const status = run && run.acceptance_status
   return acceptanceStatusText[status] ? status : ''
 }
+function acceptanceResult(run) {
+  try {
+    return JSON.parse((run && run.acceptance_result) || '{}') || {}
+  } catch {
+    return {}
+  }
+}
+function canDecideAcceptance(run) {
+  return ['pending', 'escalated', 'rejected'].includes(run && run.acceptance_status)
+}
+async function decideAcceptance(decision) {
+  if (!agent.activeRun) return
+  try {
+    await agent.decideAcceptance(agent.activeRun.id, decision)
+    ui.toast(decision === 'accepted' ? '已标记验收通过' : '已标记验收未通过', 'success')
+  } catch (e) {
+    ui.toast(String((e && e.message) || e), 'error')
+  }
+}
 
 function duration(r) {
   if (!r || !r.started_at) return ''
@@ -155,6 +174,52 @@ async function copyResult(c) {
             停止执行
           </button>
         </header>
+
+        <div
+          v-if="acceptanceStatus(agent.activeRun)"
+          class="shrink-0 px-5 pb-3 bg-surface"
+          data-testid="run-acceptance-panel"
+        >
+          <div class="rounded-lg border border-line-subtle bg-panel px-3 py-2 text-xs space-y-1.5">
+            <div class="flex items-center gap-2 flex-wrap">
+              <span class="text-ink-secondary">验收</span>
+              <span class="badge" :class="acceptanceStatusClass[acceptanceStatus(agent.activeRun)]">
+                {{ acceptanceStatusText[acceptanceStatus(agent.activeRun)] }}
+              </span>
+              <span
+                v-if="acceptanceResult(agent.activeRun).reason"
+                class="text-ink-muted"
+                data-testid="run-acceptance-reason"
+              >
+                {{ acceptanceResult(agent.activeRun).reason }}
+              </span>
+            </div>
+            <ul
+              v-if="acceptanceResult(agent.activeRun).unmet?.length"
+              class="list-disc pl-4 text-ink-muted space-y-0.5"
+            >
+              <li v-for="(item, i) in acceptanceResult(agent.activeRun).unmet" :key="i">
+                {{ item }}
+              </li>
+            </ul>
+            <div v-if="canDecideAcceptance(agent.activeRun)" class="flex gap-2 pt-0.5">
+              <button
+                class="btn-secondary !h-7 !px-2.5 text-xs"
+                data-testid="run-accept-yes"
+                @click="decideAcceptance('accepted')"
+              >
+                接受
+              </button>
+              <button
+                class="btn-secondary !h-7 !px-2.5 text-xs text-bad-ink"
+                data-testid="run-accept-no"
+                @click="decideAcceptance('rejected')"
+              >
+                拒绝
+              </button>
+            </div>
+          </div>
+        </div>
 
         <div class="scroll-region flex-1 px-5 py-4 space-y-3 bg-surface">
           <div

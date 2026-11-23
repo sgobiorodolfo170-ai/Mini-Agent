@@ -97,6 +97,11 @@ describe('旧库迁移', () => {
     expect(run.status).toBe('stopped')
     expect(run.finished_reason).toBe('legacy_unrecoverable')
     expect(run.version).toBe(2)
+    // v10：图/工作区/恢复字段带默认值，旧 Run 不受影响
+    expect(run.graph_id).toBeNull()
+    expect(run.node_key).toBeNull()
+    expect(run.workspace_json).toBeNull()
+    expect(run.resume_count).toBe(0)
 
     const indexes = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'")

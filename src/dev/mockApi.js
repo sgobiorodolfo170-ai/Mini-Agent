@@ -887,7 +887,10 @@ function install() {
           max_steps: settings.agentMaxSteps || 15,
           steps_used: 0,
           started_at: now(),
-          ended_at: null
+          ended_at: null,
+          control_mode: null,
+          acceptance_status: 'not_required',
+          acceptance_result: null
         }
         runs.unshift(run)
         calls.set(runId, [])
@@ -995,6 +998,19 @@ function install() {
         return true
       },
       respond: () => true,
+      acceptanceDecide: ({ runId, decision, reason } = {}) => {
+        const run = runs.find((r) => r.id === runId)
+        if (!run) throw new Error('任务不存在')
+        run.acceptance_status = decision
+        run.acceptance_result = JSON.stringify({
+          verdict: decision,
+          reason: reason || '人工验收（mock）',
+          unmet: [],
+          manual: { decision, actor: 'desktop', at: now() }
+        })
+        emit('agent:event', { type: 'acceptance', runId, status: decision })
+        return clone(run)
+      },
       runs: () => clone(runs),
       calls: (runId) => clone(calls.get(runId) || [])
     },
