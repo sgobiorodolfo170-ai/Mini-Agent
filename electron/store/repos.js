@@ -911,11 +911,11 @@ function listChildRuns(db, parentRunId) {
 
 function logToolCall(
   db,
-  { runId, step, tool, args, riskLevel, confirmedBy, result, error, durationMs }
+  { runId, step, tool, args, riskLevel, confirmedBy, result, error, durationMs, callId = null }
 ) {
   db.prepare(
-    `INSERT INTO agent_tool_calls(run_id, step, tool, args, risk_level, confirmed_by, result, error,
-     duration_ms, at) VALUES(?,?,?,?,?,?,?,?,?,?)`
+    `INSERT INTO agent_tool_calls(run_id, step, tool, args, risk_level, confirmed_by, call_id,
+     result, error, duration_ms, at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     runId,
     step,
@@ -923,11 +923,54 @@ function logToolCall(
     JSON.stringify(args || {}),
     riskLevel,
     confirmedBy,
+    callId,
     result ? String(result).slice(0, 20000) : null,
     error || null,
     durationMs ?? null,
     now()
   )
+}
+
+// 工具执行台账：执行前写 started，完成后写 done/failed。
+// 重启恢复时 started/unknown 表示副作用结果未知，禁止自动重放。
+function startToolCall(db, { runId, step, tool, args, riskLevel, confirmedBy, callId = null }) {
+  const at = now()
+  const info = db
+    .prepare(
+      `INSERT INTO agent_tool_calls(run_id, step, tool, args, risk_level, confirmed_by, call_id,
+       status, started_at, at) VALUES(?,?,?,?,?,?,?,'started',?,?)`
+    )
+    .run(runId, step, tool, JSON.stringify(args || {}), riskLevel, confirmedBy, callId, at, at)
+  return Number(info.lastInsertRowid)
+}
+
+function finishToolCall(db, id, { result, error, durationMs }) {
+  db.prepare(
+    `UPDATE agent_tool_calls SET result=?, error=?, duration_ms=?, status=?, finished_at=?
+     WHERE id=?`
+  ).run(
+    result ? String(result).slice(0, 20000) : null,
+    error || null,
+    durationMs ?? null,
+    error ? 'failed' : 'done',
+    now(),
+    id
+  )
+}
+
+function getToolCallByCallId(db, runId, callId) {
+  if (!callId) return null
+  return db
+    .prepare('SELECT * FROM agent_tool_calls WHERE run_id=? AND call_id=? ORDER BY id DESC LIMIT 1')
+    .get(runId, callId)
+}
+
+function hasUnfinishedToolCalls(db, runId) {
+  return !!db
+    .prepare(
+      "SELECT 1 FROM agent_tool_calls WHERE run_id=? AND status IN ('started','unknown') LIMIT 1"
+    )
+    .get(runId)
 }
 
 function listRuns(db, limit = 50) {
@@ -1018,6 +1061,10 @@ module.exports = {
   RUN_TERMINAL,
   RUN_ACTIVE,
   logToolCall,
+  startToolCall,
+  finishToolCall,
+  getToolCallByCallId,
+  hasUnfinishedToolCalls,
   listRuns,
   getRunCalls
 }

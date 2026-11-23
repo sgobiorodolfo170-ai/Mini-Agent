@@ -130,6 +130,7 @@ it.skipIf(!hasGit)(
       .toBe('merged')
     expect(git(repo, 'show', 'HEAD:a.txt')).toContain('agent')
     expect(fs.existsSync(workspace.path)).toBe(false)
+    expect(repos.getRunCalls(db, run.runId)[0].status).toBe('done')
   },
   30000
 )

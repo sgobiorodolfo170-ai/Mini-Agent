@@ -174,6 +174,13 @@ async function copyResult(c) {
                 任务图
               </span>
               <span
+                v-if="agent.activeRun.resume_count"
+                class="badge bg-hint text-hint-ink"
+                data-testid="run-resumed"
+              >
+                已恢复 ×{{ agent.activeRun.resume_count }}
+              </span>
+              <span
                 v-if="workspaceInfo(agent.activeRun).mode === 'worktree'"
                 class="badge bg-subtle text-ink-secondary"
                 data-testid="run-workspace"

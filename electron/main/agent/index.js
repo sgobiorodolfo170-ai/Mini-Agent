@@ -1,7 +1,12 @@
 const os = require('os')
 const { createHash } = require('node:crypto')
 const { transaction, canonicalJson, remoteError } = require('../remote/protocol')
-const { recordRunState } = require('../../store/run-storage')
+const {
+  recordRunState,
+  saveCheckpoint,
+  loadCheckpoint,
+  clearCheckpoint
+} = require('../../store/run-storage')
 const {
   createRunQueue,
   transition,
@@ -550,6 +555,7 @@ async function launchQueuedRunInner(db, runId) {
     repos.updateMessage(db, assistantMsgId, { status: 'streaming' })
   })
   const settings = repos.getAllSettings(db)
+  const checkpoint = loadCheckpoint(db, runId)
   const baseDirs = settings.agentAuthorizedDirs || []
   const state = {
     ac: new AbortController(),
@@ -608,7 +614,8 @@ async function launchQueuedRunInner(db, runId) {
     acceptancePolicy: safeJson(run.acceptancePolicy),
     settings,
     spec,
-    workspace: workspaceInfo
+    workspace: workspaceInfo,
+    checkpoint
   })
     .catch((error) => {
       const current = repos.getRun(db, runId)
@@ -691,6 +698,7 @@ function finishRun(db, run, { status, reason, content, stepsUsed, acceptanceStat
   if (status === 'done' && !run.acceptancePolicy) {
     void maybeAutoMerge(db, run.id)
   }
+  clearCheckpoint(db, run.id)
   if (run.graphId) {
     if (status !== 'done') {
       for (const id of graph.blockedDependents(db, run.id)) {
@@ -771,7 +779,8 @@ async function doAgentRun({
   acceptancePolicy,
   settings: inherited,
   spec,
-  workspace: workspaceInfo
+  workspace: workspaceInfo,
+  checkpoint
 }) {
   const db = dbm.get()
   const settings = inherited || repos.getAllSettings(db)
@@ -923,22 +932,27 @@ async function doAgentRun({
       : state.permission === 'full'
         ? '\n\n当前权限为完整权限：非只读工具调用将直接执行，不再逐次请求用户确认；仍须严格遵守授权目录限制。'
         : ''
-  const messages = [
-    {
-      role: 'system',
-      content:
-        '你是运行在用户 Windows 桌面上的 Agent。谨慎使用工具完成目标；写文件和执行命令前先用一句话说明计划。基于工具返回结果作答，不要臆造。' +
-        `\n当前工作目录：${ctx.workingDir}` +
-        (worktreePath ? '（本次任务使用独立 Git 工作区）' : '') +
-        (state.parentRunId ? '\n你是被主 Agent 派出的子 Agent，请根据独立目标完成任务。' : '') +
-        (spec.systemPrompt ? '\n' + spec.systemPrompt : '') +
-        permissionNote +
-        clusterNote +
-        (memoryText ? `\n\n以下是你的长期记忆（供参考，可按需更新）:\n${memoryText}` : '')
-    },
+  const systemMessage = {
+    role: 'system',
+    content:
+      '你是运行在用户 Windows 桌面上的 Agent。谨慎使用工具完成目标；写文件和执行命令前先用一句话说明计划。基于工具返回结果作答，不要臆造。' +
+      `\n当前工作目录：${ctx.workingDir}` +
+      (worktreePath ? '（本次任务使用独立 Git 工作区）' : '') +
+      (state.parentRunId ? '\n你是被主 Agent 派出的子 Agent，请根据独立目标完成任务。' : '') +
+      (spec.systemPrompt ? '\n' + spec.systemPrompt : '') +
+      permissionNote +
+      clusterNote +
+      (memoryText ? `\n\n以下是你的长期记忆（供参考，可按需更新）:\n${memoryText}` : '')
+  }
+  const baseMessages = [
+    systemMessage,
     ...(Array.isArray(spec.context) ? spec.context : []),
     { role: 'user', content: goal }
   ]
+  const messages =
+    checkpoint && Array.isArray(checkpoint.messages) && checkpoint.messages.length
+      ? [systemMessage, ...checkpoint.messages.slice(1)]
+      : baseMessages
   const startedAt = Date.now()
   let lastDecision = { allowed: true, confirmedBy: 'auto' }
   let callCount = 0
@@ -1117,6 +1131,16 @@ async function doAgentRun({
       throw new Error(`授权拒绝：${decision.detail || decision.reason}`)
     }
 
+    const step = callCount + 1
+    const ledgerId = repos.startToolCall(db, {
+      runId,
+      step,
+      tool: tool.name,
+      args,
+      riskLevel: tool.risk,
+      confirmedBy: lastDecision.confirmedBy,
+      callId
+    })
     try {
       const r = await tool.handler(args, callId)
       resultText = typeof r === 'string' ? r : JSON.stringify(r)
@@ -1124,14 +1148,8 @@ async function doAgentRun({
       error = String((e && e.message) || e)
       resultText = '工具执行失败: ' + error
     }
-    callCount++
-    repos.logToolCall(db, {
-      runId,
-      step: callCount,
-      tool: tool.name,
-      args,
-      riskLevel: tool.risk,
-      confirmedBy: lastDecision.confirmedBy,
+    callCount = step
+    repos.finishToolCall(db, ledgerId, {
       result: resultText,
       error,
       durationMs: Date.now() - t0
@@ -1181,13 +1199,15 @@ async function doAgentRun({
     const result = await runAgentLoop({
       messages,
       maxSteps: state.maxSteps,
+      initialSteps: checkpoint ? Number(checkpoint.stepsUsed) || 0 : 0,
       toolMap,
       isStopped: () => state.stopped,
       isTransferred: () => !!state.transferred,
       modelCall: (msgs) => withKeyRetry(db, provider, (apiKey) => modelCallWith(apiKey)(msgs)),
       decide,
       execute,
-      onEvent
+      onEvent,
+      onCheckpoint: (snapshot) => saveCheckpoint(db, runId, snapshot)
     })
     finalContent = lastAssistantContent(result.messages)
     stepsUsed = result.steps

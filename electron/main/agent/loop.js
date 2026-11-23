@@ -13,14 +13,16 @@ async function runAgentLoop({
   modelCall,
   toolMap,
   maxSteps = 15,
+  initialSteps = 0,
   decide,
   execute,
   onEvent,
+  onCheckpoint,
   isStopped,
   isTransferred
 }) {
   const msgs = [...messages]
-  let steps = 0
+  let steps = initialSteps
   let status = 'done'
   let endedWithToolCalls = false
 
@@ -30,6 +32,15 @@ async function runAgentLoop({
       break
     }
     steps++
+    if (onCheckpoint) {
+      await onCheckpoint({
+        phase: 'before_model',
+        step: steps,
+        messages: [...msgs],
+        pendingToolCalls: [],
+        stepsUsed: steps
+      })
+    }
     const resp = await modelCall(msgs)
     if (resp?.stopped || isStopped?.()) {
       status = 'stopped'
@@ -46,6 +57,15 @@ async function runAgentLoop({
       msgs.push({ role: 'assistant', content: '', tool_calls: toolCalls })
     }
     if (onEvent) onEvent('assistant', { content: resp && resp.content, toolCalls })
+    if (onCheckpoint) {
+      await onCheckpoint({
+        phase: 'model_done',
+        step: steps,
+        messages: [...msgs],
+        pendingToolCalls: toolCalls,
+        stepsUsed: steps
+      })
+    }
 
     if (!toolCalls.length) {
       endedWithToolCalls = false
@@ -53,7 +73,8 @@ async function runAgentLoop({
     }
     endedWithToolCalls = true
 
-    for (const tc of toolCalls) {
+    for (let i = 0; i < toolCalls.length; i++) {
+      const tc = toolCalls[i]
       if (isStopped?.()) {
         status = 'stopped'
         break loop
@@ -91,6 +112,15 @@ async function runAgentLoop({
         resultText = resultText.slice(0, 20000) + '…(截断)'
       if (onEvent) onEvent('tool-done', { name, ok, result: resultText })
       msgs.push({ role: 'tool', tool_call_id: tc.id || name, content: resultText })
+      if (onCheckpoint) {
+        await onCheckpoint({
+          phase: 'tool_done',
+          step: steps,
+          messages: [...msgs],
+          pendingToolCalls: toolCalls.slice(i + 1),
+          stepsUsed: steps
+        })
+      }
       if (isTransferred?.()) {
         status = 'transferred'
         break loop

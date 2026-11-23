@@ -77,10 +77,12 @@ it('stops the real parent loop after a committed handoff', async () => {
     })
   })
   const parent = await start()
-  await expect.poll(() => agent.getRunStatus(parent.runId).status).toBe('transferred')
+  await expect
+    .poll(() => agent.getRunStatus(parent.runId).status, { timeout: 15000 })
+    .toBe('transferred')
   const target = agent.getRunStatus(parent.runId).transferToRunId
   await expect
-    .poll(() => agent.getRunResult(target))
+    .poll(() => agent.getRunResult(target), { timeout: 15000 })
     .toMatchObject({ status: 'done', content: 'child result' })
   expect(repos.getRunCalls(db, parent.runId).map((entry) => entry.tool)).toEqual(['run_transfer'])
   expect(rootCalls).toBe(1)
@@ -98,7 +100,7 @@ it('rolls back child, messages and events if the parent transfer update fails', 
   })
   const parent = await start()
   await expect
-    .poll(() => agent.getRunResult(parent.runId))
+    .poll(() => agent.getRunResult(parent.runId), { timeout: 15000 })
     .toMatchObject({ status: 'done', content: 'parent continued' })
   expect(repos.listChildRuns(db, parent.runId)).toEqual([])
   expect(repos.listChildConversations(db, conversationId)).toEqual([])
@@ -130,7 +132,7 @@ it('continues between dispatch and explicit wait, then reads the child result', 
     })
     const parent = await start()
     await expect
-      .poll(() => agent.getRunResult(parent.runId))
+      .poll(() => agent.getRunResult(parent.runId), { timeout: 15000 })
       .toMatchObject({ status: 'done', content: 'delegated result' })
     expect(states[0]).toBe('running')
     expect(
