@@ -229,11 +229,14 @@ function createUpdateChecker(options = {}) {
   }
 
   let timer = null
+  let kick = null
+  let stopped = false
 
   function start({ delayMs = 3000, intervalMs = ttlMs } = {}) {
-    if (timer) return
-    const kick = setTimeout(() => {
-      check()
+    if (timer || stopped) return
+    kick = setTimeout(() => {
+      kick = null
+      if (!stopped) check()
     }, delayMs)
     if (kick.unref) kick.unref()
     timer = setInterval(() => check({ force: true }), intervalMs)
@@ -241,6 +244,11 @@ function createUpdateChecker(options = {}) {
   }
 
   function stop() {
+    stopped = true
+    if (kick) {
+      clearTimeout(kick)
+      kick = null
+    }
     if (timer) {
       clearInterval(timer)
       timer = null

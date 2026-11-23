@@ -37,7 +37,9 @@ const projectsCollapsed = ref(false)
 const recentCollapsed = ref(false)
 
 const conv = computed(() => chat.activeConv)
-const streamingMsg = computed(() => chat.messages.find((m) => m.status === 'streaming'))
+const streamingMsg = computed(() =>
+  chat.messages.find((m) => ['streaming', 'pending'].includes(m.status))
+)
 const hasService = computed(() => settings.enabledProviders.length > 0)
 const pinnedConvs = computed(() => chat.visibleConversations.filter((c) => c.pinned))
 const unprojectedConvs = computed(() =>

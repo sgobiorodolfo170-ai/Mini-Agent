@@ -5,6 +5,10 @@ import { computed } from 'vue'
 const props = defineProps({ status: { type: String, default: '' } })
 
 const map = {
+  queued: { label: '排队中', cls: 'bg-subtle text-ink-secondary' },
+  waiting_child: { label: '等待子任务', cls: 'bg-hint text-hint-ink' },
+  transferred: { label: '已移交', cls: 'bg-subtle text-ink-secondary' },
+  interrupted: { label: '执行中断', cls: 'bg-warn text-warn-ink' },
   running: { label: '执行中', cls: 'bg-hint text-hint-ink' },
   done: { label: '已完成', cls: 'bg-ok text-ok-ink' },
   stopped: { label: '已停止', cls: 'bg-subtle text-ink-secondary' },

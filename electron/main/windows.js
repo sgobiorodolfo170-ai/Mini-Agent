@@ -181,7 +181,14 @@ function isVisible(name) {
 
 function closeWindow(name) {
   const win = windows.get(name)
-  if (win) win.close()
+  if (win && !win.isDestroyed()) win.close()
+}
+
+function destroyAll() {
+  for (const win of [...windows.values()]) {
+    if (!win.isDestroyed()) win.destroy()
+  }
+  windows.clear()
 }
 
 function broadcast(channel, payload) {
@@ -205,6 +212,7 @@ module.exports = {
   toggle,
   isVisible,
   closeWindow,
+  destroyAll,
   broadcast,
   sendTo,
   get: (name) => windows.get(name)

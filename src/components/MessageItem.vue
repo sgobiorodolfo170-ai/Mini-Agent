@@ -22,6 +22,10 @@ const statusLabel = computed(
   () =>
     ({
       streaming: '生成中…',
+      pending: '排队中',
+      transferred: '已移交',
+      interrupted: '执行中断',
+      max_steps: '已达步骤上限',
       stopped: '已停止',
       error: '出错'
     })[props.msg.status] || ''

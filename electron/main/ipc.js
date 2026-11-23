@@ -20,6 +20,7 @@ const scheduler = require('./gateway/scheduler')
 const sessionsApi = require('./agent/sessions')
 const { getHub } = require('./events/hub')
 const { parseHooks, runHooks, STAGES, ACTIONS } = require('./events/hooks')
+const runtimeLog = require('./runtime-log')
 
 function safeParse(s, d) {
   try {
@@ -356,7 +357,11 @@ function registerIpc(ctx) {
   })
 
   // agent
-  h('agent:run', (o) => agent.startAgentRun(o))
+  h('agent:run', ({ conversationId, goal, permission, cluster }) =>
+    agent.startAgentRun({ conversationId, goal, permission, cluster })
+  )
+  h('agent:status', (id) => agent.getRunStatus(id))
+  h('agent:result', ({ runId, maxChars }) => agent.getRunResult(runId, maxChars))
   h('agent:stop', (runId) => agent.stopRun(runId))
   h('agent:pause', (runId) => agent.pauseRun(runId))
   h('agent:resume', (runId) => agent.resumeRun(runId))
@@ -371,7 +376,7 @@ function registerIpc(ctx) {
     if (!remote) throw new Error('远程服务尚未初始化')
     return remote
   }
-  h('remote:state', () => remoteManager() ? remoteManager().getState() : { status: 'stopped' })
+  h('remote:state', () => (remoteManager() ? remoteManager().getState() : { status: 'stopped' }))
   h('remote:start', (o) => requireRemote().start(o || {}))
   h('remote:stop', () => requireRemote().stop())
   h('remote:qrcode', () => requireRemote().qrCode())
@@ -384,7 +389,9 @@ function registerIpc(ctx) {
   h('sessions:status', (conversationId) => sessionsApi.getSessionStatus({ conversationId }))
   h('sessions:list', (o) => sessionsApi.listSessions(o || {}))
   h('sessions:result', (o) => sessionsApi.getSessionResult(o || {}))
-  h('sessions:send', (o) => sessionsApi.sendToSession(o || {}))
+  h('sessions:send', ({ conversationId, content, permission, cluster }) =>
+    sessionsApi.sendToSession({ conversationId, content, permission, cluster })
+  )
   h('sessions:wait', (o) => sessionsApi.waitForSession(o || {}))
 
   // 事件中枢：游标轮询（前端断线/切窗后按 seq 补齐）与近期回看
@@ -395,6 +402,22 @@ function registerIpc(ctx) {
     size: getHub().size,
     listeners: getHub().listenerCount()
   }))
+
+  // 运行日志：内存环形缓冲 + userData/logs/runtime.log（完整历史可打开目录查看）
+  h('logs:list', (o) => runtimeLog.getRuntimeLog().list(o || {}))
+  h('logs:stats', () => runtimeLog.getRuntimeLog().stats())
+  h('logs:clear', () => runtimeLog.getRuntimeLog().clear())
+  h('logs:openFolder', async () => {
+    const dir = runtimeLog.getRuntimeLog().dir
+    if (!dir) return false
+    try {
+      fs.mkdirSync(dir, { recursive: true })
+    } catch {
+      // 目录已存在或创建失败时交给 shell 统一回报
+    }
+    const error = await shell.openPath(dir)
+    return !error
+  })
 
   // 生命周期钩子：读取元信息 + 保存（保存前做结构与阶段校验）
   h('hooks:meta', () => ({ stages: STAGES, actions: ACTIONS }))
@@ -459,6 +482,10 @@ function registerIpc(ctx) {
   })
   h('win:hide', (name) => {
     if (['quick', 'main', 'ball'].includes(name)) windows.hide(name)
+    return true
+  })
+  h('win:close', (name) => {
+    if (name === 'main') windows.closeWindow('main')
     return true
   })
   // 自绘标题栏的窗口控制（主窗口）

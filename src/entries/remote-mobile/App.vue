@@ -36,6 +36,7 @@ interface Run {
   goal: string
   control?: string
   conversationId?: string
+  transferToRunId?: string
   updatedAt?: number
 }
 interface Approval {
@@ -116,7 +117,9 @@ function fmtTime(ts?: number): string {
   const today = new Date()
   const sameDay = d.toDateString() === today.toDateString()
   const hm = d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
-  return sameDay ? hm : d.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' }) + ' ' + hm
+  return sameDay
+    ? hm
+    : d.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' }) + ' ' + hm
 }
 
 function fmtCountdown(ms?: number): string {
@@ -182,8 +185,16 @@ function parseError(status: number, raw: unknown): ApiError {
   const o = (raw ?? {}) as Record<string, unknown>
   const inner = (o.error ?? o) as Record<string, unknown>
   const message = text(inner?.message ?? o?.message ?? `请求失败（HTTP ${status}）`, 300)
-  const code = text(inner?.code ?? o?.code ?? (status === 401 ? 'UNAUTHENTICATED' : 'HTTP_ERROR'), 40)
-  return new ApiError(status, message || `请求失败（HTTP ${status}）`, code, Boolean(inner?.retryable))
+  const code = text(
+    inner?.code ?? o?.code ?? (status === 401 ? 'UNAUTHENTICATED' : 'HTTP_ERROR'),
+    40
+  )
+  return new ApiError(
+    status,
+    message || `请求失败（HTTP ${status}）`,
+    code,
+    Boolean(inner?.retryable)
+  )
 }
 
 async function http<T = Record<string, unknown>>(
@@ -238,13 +249,23 @@ const serverAuth = reactive({ authenticated: false, role: '', authVersion: 0, ep
 const credentials = reactive({ deviceId: '', deviceSecret: '' })
 const device = reactive<DeviceInfo & Record<string, unknown>>({})
 const capability = computed(() => {
-  const role = text(field(device, ['role', 'deviceRole']), 20).toLowerCase() || text(serverAuth.role, 20).toLowerCase()
-  const list = Array.isArray(device.capabilities) ? device.capabilities.map((c) => text(c, 24).toLowerCase()) : []
+  const role =
+    text(field(device, ['role', 'deviceRole']), 20).toLowerCase() ||
+    text(serverAuth.role, 20).toLowerCase()
+  const list = Array.isArray(device.capabilities)
+    ? device.capabilities.map((c) => text(c, 24).toLowerCase())
+    : []
   return {
     role: role || '未知',
     viewer: list.length ? list.includes('view') || list.includes('conversation.read') : role !== '',
-    operator: list.length ? list.includes('operate') || list.includes('agent.run.start') || list.includes('chat.message.send') : role === 'operator',
-    approver: list.length ? list.includes('approve') || list.includes('approval.respond') : role === 'approver'
+    operator: list.length
+      ? list.includes('operate') ||
+        list.includes('agent.run.start') ||
+        list.includes('chat.message.send')
+      : role === 'operator',
+    approver: list.length
+      ? list.includes('approve') || list.includes('approval.respond')
+      : role === 'approver'
   }
 })
 
@@ -264,10 +285,13 @@ const pair = reactive<{
 function pushToast(tone: Tone, message: string): void {
   const id = uuid()
   toasts.push({ id, tone, message })
-  window.setTimeout(() => {
-    const i = toasts.findIndex((t) => t.id === id)
-    if (i >= 0) toasts.splice(i, 1)
-  }, tone === 'bad' ? 6000 : 3500)
+  window.setTimeout(
+    () => {
+      const i = toasts.findIndex((t) => t.id === id)
+      if (i >= 0) toasts.splice(i, 1)
+    },
+    tone === 'bad' ? 6000 : 3500
+  )
 }
 
 /* ---------------- sessionStorage 凭证 ---------------- */
@@ -324,7 +348,11 @@ function extractTicket(): string {
   }
   // 立刻清理地址栏与历史条目，避免 ticket 留在可见 URL / 复制分享里
   try {
-    history.replaceState(null, '', location.pathname + location.search.replace(/[?&](ticket|t)=[^&]*/g, '').replace(/^&/, '?'))
+    history.replaceState(
+      null,
+      '',
+      location.pathname + location.search.replace(/[?&](ticket|t)=[^&]*/g, '').replace(/^&/, '?')
+    )
   } catch {
     location.hash = ''
   }
@@ -360,7 +388,12 @@ async function createSession(): Promise<boolean> {
     return true
   } catch (e) {
     const err = toApiError(e)
-    if (err.status === 401 || err.status === 403 || err.code === 'DEVICE_REVOKED' || err.code === 'SESSION_EXPIRED') {
+    if (
+      err.status === 401 ||
+      err.status === 403 ||
+      err.code === 'DEVICE_REVOKED' ||
+      err.code === 'SESSION_EXPIRED'
+    ) {
       clearCreds()
       pushToast('warn', '设备凭证已失效或被撤销，请重新扫码配对')
       return false
@@ -481,7 +514,13 @@ async function startPairing(): Promise<void> {
 }
 
 async function logout(): Promise<void> {
-  if (!(await confirmAction({ title: '退出登录', message: '退出当前会话并撤销短期凭证，设备仍可稍后用新配对链接重新接入。' }))) return
+  if (
+    !(await confirmAction({
+      title: '退出登录',
+      message: '退出当前会话并撤销短期凭证，设备仍可稍后用新配对链接重新接入。'
+    }))
+  )
+    return
   busy.logout = true
   try {
     await http('/auth/logout', { method: 'POST', body: {} })
@@ -512,7 +551,12 @@ function wsUrl(): string {
 }
 
 function clearTimer(ref: 'reconnect' | 'heartbeat' | 'watchdog' | 'ack'): void {
-  const map = { reconnect: reconnectTimer, heartbeat: heartbeatTimer, watchdog: watchdogTimer, ack: ackTimer }
+  const map = {
+    reconnect: reconnectTimer,
+    heartbeat: heartbeatTimer,
+    watchdog: watchdogTimer,
+    ack: ackTimer
+  }
   const id = map[ref]
   if (id !== null) window.clearTimeout(id)
   if (ref === 'reconnect') reconnectTimer = null
@@ -553,7 +597,15 @@ function connectSocket(): void {
     clearTimer('heartbeat')
     heartbeatTimer = window.setInterval(() => {
       if (socket && socket.readyState === WebSocket.OPEN) {
-        sendRaw({ v: 1, id: uuid(), kind: 'command', type: 'device.heartbeat', request_id: uuid(), conversation_id: null, payload: {} })
+        sendRaw({
+          v: 1,
+          id: uuid(),
+          kind: 'command',
+          type: 'device.heartbeat',
+          request_id: uuid(),
+          conversation_id: null,
+          payload: {}
+        })
       }
     }, 20000)
     clearTimer('watchdog')
@@ -602,7 +654,8 @@ function closeSocket(): void {
       ws.onmessage = null
       ws.onerror = null
       ws.onopen = null
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close(1000, 'client')
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)
+        ws.close(1000, 'client')
     } catch {
       /* 忽略关闭异常 */
     }
@@ -616,15 +669,18 @@ function scheduleReconnect(): void {
   reconnectAttempt += 1
   const delay = Math.round(base * (1 + (Math.random() * 2 - 1) * BACKOFF_JITTER))
   conn.value = 'retrying'
-  reconnectTimer = window.setTimeout(() => {
-    reconnectTimer = null
-    if (phase.value !== 'app') return
-    if (!serverAuth.authenticated) {
-      void refreshAuthStatus().then((ok) => (ok ? connectSocket() : goPairing('登录状态已过期')))
-      return
-    }
-    connectSocket()
-  }, Math.max(500, delay))
+  reconnectTimer = window.setTimeout(
+    () => {
+      reconnectTimer = null
+      if (phase.value !== 'app') return
+      if (!serverAuth.authenticated) {
+        void refreshAuthStatus().then((ok) => (ok ? connectSocket() : goPairing('登录状态已过期')))
+        return
+      }
+      connectSocket()
+    },
+    Math.max(500, delay)
+  )
 }
 
 function checkStale(): void {
@@ -683,7 +739,11 @@ function failAllPending(reason: string): void {
   for (const [id, item] of pending) {
     window.clearTimeout(item.timer)
     pending.delete(id)
-    if (item.type !== 'session.subscribe' && item.type !== 'device.heartbeat' && item.type !== 'events.ack') {
+    if (
+      item.type !== 'session.subscribe' &&
+      item.type !== 'device.heartbeat' &&
+      item.type !== 'events.ack'
+    ) {
       pushToast('warn', `${labelOf(item.type)}：${reason}`)
     }
   }
@@ -718,7 +778,8 @@ function settleAck(requestId: string, status: string, detail: unknown): void {
     return
   }
   const err = (detail ?? {}) as Record<string, unknown>
-  const message = text(err?.message ?? (typeof detail === 'string' ? detail : ''), 200) || '服务端未接受该命令'
+  const message =
+    text(err?.message ?? (typeof detail === 'string' ? detail : ''), 200) || '服务端未接受该命令'
   pushToast('bad', `${labelOf(item.type)}失败：${message}`)
 }
 
@@ -743,7 +804,11 @@ function handleFrame(raw: string): void {
   const conversationId = text(field(msg, ['conversation_id', 'conversationId']), 64)
 
   if (kind === 'command.ack' || kind === 'ack') {
-    settleAck(text(field(msg, ['request_id', 'requestId']), 64), text(field(msg, ['status', 'state'], 'accepted'), 24), msg.result ?? msg.error ?? payload)
+    settleAck(
+      text(field(msg, ['request_id', 'requestId']), 64),
+      text(field(msg, ['status', 'state'], 'accepted'), 24),
+      msg.result ?? msg.error ?? payload
+    )
     return
   }
   if (kind === 'protocol.error' || type === 'protocol.error') {
@@ -765,7 +830,8 @@ function handleFrame(raw: string): void {
     const id = text(field(payload, ['message_id', 'messageId', 'id']), 64)
     const content = text(field(payload, ['content', 'text']), MAX_CONTENT)
     const msgRole = text(field(payload, ['role'], 'assistant'), 16)
-    if (id) upsertMessage({ id, role: msgRole || 'assistant', content, status: 'done', conversationId })
+    const status = text(field(payload, ['status'], 'done'), 24) || 'done'
+    if (id) upsertMessage({ id, role: msgRole || 'assistant', content, status, conversationId })
     if (type.includes('failed') || type.includes('error')) markMessageStatus(id, 'error')
     scheduleAck(seq)
     return
@@ -781,7 +847,11 @@ function handleFrame(raw: string): void {
     return
   }
   if (type.startsWith('device.') || type.startsWith('auth.') || type.includes('revoked')) {
-    if (type.includes('revoked') || type.includes('unauthenticated') || type.includes('session.expired')) {
+    if (
+      type.includes('revoked') ||
+      type.includes('unauthenticated') ||
+      type.includes('session.expired')
+    ) {
       goPairing('桌面端已撤销本设备或会话已过期')
       return
     }
@@ -830,7 +900,8 @@ async function resumeSync(): Promise<void> {
     goPairing('登录状态已过期，请重新配对')
     return
   }
-  const dead = !socket || socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CLOSING
+  const dead =
+    !socket || socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CLOSING
   if (dead || Date.now() - lastEventAt.value > STALE_MS) {
     lastEventAt.value = Date.now()
     reconnectAttempt = 0
@@ -898,6 +969,7 @@ function normalizeRun(o: Record<string, unknown>): Run | null {
     goal: text(field(o, ['goal', 'objective', 'title'], 200)) || '未命名任务',
     control: text(field(o, ['control', 'controlStatus', 'control_status']), 24),
     conversationId: text(field(o, ['conversationId', 'conversation_id']), 64),
+    transferToRunId: text(field(o, ['transferToRunId', 'transfer_to_run_id']), 64),
     updatedAt: Number(field(o, ['updatedAt', 'updated_at', 'createdAt'], 0)) || 0
   }
 }
@@ -936,7 +1008,8 @@ async function loadConversations(): Promise<void> {
     conversations.value = listOf(data, ['conversations', 'items', 'list'])
       .map(normalizeConversation)
       .filter((c) => c.id)
-    if (!activeConversationId.value && conversations.value.length) void selectConversation(conversations.value[0].id)
+    if (!activeConversationId.value && conversations.value.length)
+      void selectConversation(conversations.value[0].id)
   } catch (e) {
     const err = toApiError(e)
     if (err.status === 401) goPairing('登录状态已过期')
@@ -1032,7 +1105,8 @@ function appendDelta(id: string, delta: string, conversationId: string): void {
   const existing = messages.value.find((x) => x.id === id)
   if (existing) {
     const merged = existing.content + delta
-    existing.content = merged.length > MAX_CONTENT ? merged.slice(merged.length - MAX_CONTENT) : merged
+    existing.content =
+      merged.length > MAX_CONTENT ? merged.slice(merged.length - MAX_CONTENT) : merged
     existing.status = 'streaming'
   } else {
     messages.value.push({
@@ -1064,6 +1138,7 @@ const RUN_STATUS_LABELS: Record<string, string> = {
   error: '出错',
   max_steps: '达到步数上限',
   transferred: '已移交',
+  interrupted: '执行中断',
   cancelled: '已取消'
 }
 
@@ -1077,13 +1152,21 @@ function isRunActive(run: Run): boolean {
   return ['queued', 'running', 'waiting_child'].includes(run.status)
 }
 
-function applyRunEvent(type: string, payload: Record<string, unknown>, conversationId: string): void {
+function applyRunEvent(
+  type: string,
+  payload: Record<string, unknown>,
+  conversationId: string
+): void {
   const id = text(field(payload, ['run_id', 'runId', 'id']), 64)
   if (!id) {
     void loadRuns()
     return
   }
-  const incoming = normalizeRun({ ...payload, id, conversation_id: conversationId || payload.conversation_id })
+  const incoming = normalizeRun({
+    ...payload,
+    id,
+    conversation_id: conversationId || payload.conversation_id
+  })
   if (!incoming) return
   const i = runs.value.findIndex((r) => r.id === id)
   if (i >= 0) {
@@ -1093,7 +1176,8 @@ function applyRunEvent(type: string, payload: Record<string, unknown>, conversat
       ...incoming,
       status: incoming.status || prev.status,
       goal: incoming.goal || prev.goal,
-      control: incoming.control ?? prev.control
+      control: incoming.control ?? prev.control,
+      transferToRunId: incoming.transferToRunId || prev.transferToRunId
     }
     runs.value[i] = next
   } else {
@@ -1115,12 +1199,19 @@ function applyApprovalEvent(type: string, payload: Record<string, unknown>): voi
   if (type.startsWith('approval.decided') || type.startsWith('approval.resolved')) {
     const status = text(field(payload, ['status', 'decision'], ''), 16).toLowerCase()
     if (id && status && ['approved', 'rejected'].includes(status)) {
-      pushToast(status === 'approved' ? 'ok' : 'warn', `审批已被${status === 'approved' ? '批准' : '拒绝'}${idDecidedByMine(id) ? '' : '（其他设备）'}`)
+      pushToast(
+        status === 'approved' ? 'ok' : 'warn',
+        `审批已被${status === 'approved' ? '批准' : '拒绝'}${idDecidedByMine(id) ? '' : '（其他设备）'}`
+      )
     }
     void loadApprovals()
     return
   }
-  if (type.startsWith('approval.expired') || type.startsWith('approval.cancelled') || type.startsWith('approval.superseded')) {
+  if (
+    type.startsWith('approval.expired') ||
+    type.startsWith('approval.cancelled') ||
+    type.startsWith('approval.superseded')
+  ) {
     void loadApprovals()
     return
   }
@@ -1161,7 +1252,11 @@ async function sendChat(): Promise<void> {
     return
   }
   busy.send = true
-  const rid = sendCommand('chat.message.send', { content, mode: 'chat' }, activeConversationId.value || null)
+  const rid = sendCommand(
+    'chat.message.send',
+    { content, mode: 'chat' },
+    activeConversationId.value || null
+  )
   if (!rid) {
     busy.send = false
     pushToast('warn', '实时通道未连接，正在重连，请稍后重试')
@@ -1182,7 +1277,11 @@ function stopStreaming(): void {
     pushToast('info', '当前没有正在生成的回复')
     return
   }
-  const rid = sendCommand('chat.message.stop', { message_id: streaming.id, msgId: streaming.id }, activeConversationId.value || null)
+  const rid = sendCommand(
+    'chat.message.stop',
+    { message_id: streaming.id, msgId: streaming.id },
+    activeConversationId.value || null
+  )
   if (!rid) pushToast('warn', '实时通道未连接')
 }
 
@@ -1199,7 +1298,8 @@ async function startRun(): Promise<void> {
   if (permission.value === 'autonomous') {
     const ok = await confirmAction({
       title: '以自主权限启动任务',
-      message: 'autonomous 允许 Agent 在授权目录内自主调用工具（含写操作）。请确认目标描述清晰、范围可控。',
+      message:
+        'autonomous 允许 Agent 在授权目录内自主调用工具（含写操作）。请确认目标描述清晰、范围可控。',
       confirmText: '确认启动',
       danger: true
     })
@@ -1227,12 +1327,26 @@ async function controlRun(run: Run, action: 'pause' | 'resume' | 'stop'): Promis
     return
   }
   const copy = {
-    pause: { title: '请求暂停任务', message: '暂停只在安全检查点生效，不会中断正在执行的模型调用或工具。' },
+    pause: {
+      title: '请求暂停任务',
+      message: '暂停只在安全检查点生效，不会中断正在执行的模型调用或工具。'
+    },
     resume: { title: '恢复任务', message: '从当前安全等待点继续同一个任务，不会重置步数。' },
-    stop: { title: '请求停止任务', message: '停止是协作式的：模型请求会被中止，已在执行的工具需返回后才收敛。' }
+    stop: {
+      title: '请求停止任务',
+      message: '停止是协作式的：模型请求会被中止，已在执行的工具需返回后才收敛。'
+    }
   }[action]
-  if (action !== 'resume' && !(await confirmAction({ ...copy, confirmText: '确认', danger: action === 'stop' }))) return
-  const rid = sendCommand(`agent.run.${action}`, { run_id: run.id, runId: run.id }, run.conversationId || null)
+  if (
+    action !== 'resume' &&
+    !(await confirmAction({ ...copy, confirmText: '确认', danger: action === 'stop' }))
+  )
+    return
+  const rid = sendCommand(
+    `agent.run.${action}`,
+    { run_id: run.id, runId: run.id },
+    run.conversationId || null
+  )
   if (!rid) {
     pushToast('warn', '实时通道未连接')
     connectSocket()
@@ -1243,7 +1357,10 @@ async function controlRun(run: Run, action: 'pause' | 'resume' | 'stop'): Promis
   pushToast('info', '控制请求已发送')
 }
 
-async function respondApproval(approval: Approval, decision: 'approved' | 'rejected'): Promise<void> {
+async function respondApproval(
+  approval: Approval,
+  decision: 'approved' | 'rejected'
+): Promise<void> {
   if (!capability.value.approver) {
     pushToast('warn', '当前设备角色没有审批权限')
     return
@@ -1266,7 +1383,12 @@ async function respondApproval(approval: Approval, decision: 'approved' | 'rejec
   if (!ok) return
   const rid = sendCommand(
     'approval.respond',
-    { approval_id: approval.id, approvalId: approval.id, decision, expected_version: approval.version },
+    {
+      approval_id: approval.id,
+      approvalId: approval.id,
+      decision,
+      expected_version: approval.version
+    },
     approval.conversationId || null
   )
   if (!rid) {
@@ -1321,13 +1443,19 @@ function resolveConfirm(value: boolean): void {
 
 const connLabel = computed(() => {
   if (insecure.value && conn.value === 'online') return '已连接（非加密）'
-  return { offline: '未连接', connecting: '连接中', online: '已连接', retrying: '重连中' }[conn.value]
+  return { offline: '未连接', connecting: '连接中', online: '已连接', retrying: '重连中' }[
+    conn.value
+  ]
 })
 const connClass = computed(() => 'dot dot-' + conn.value)
 const pendingCount = computed(() => approvals.value.length)
 const activeRuns = computed(() => runs.value.filter(isRunActive))
 const canSend = computed(
-  () => capability.value.operator && conn.value === 'online' && draft.value.trim().length > 0 && !busy.send
+  () =>
+    capability.value.operator &&
+    conn.value === 'online' &&
+    draft.value.trim().length > 0 &&
+    !busy.send
 )
 const roleHint = computed(() => {
   const c = capability.value
@@ -1339,7 +1467,11 @@ const roleHint = computed(() => {
 })
 
 function msgClass(m: Message): string {
-  return 'msg msg-' + (m.role === 'user' ? 'user' : 'agent') + (m.status === 'streaming' ? ' is-streaming' : '')
+  return (
+    'msg msg-' +
+    (m.role === 'user' ? 'user' : 'agent') +
+    (m.status === 'streaming' ? ' is-streaming' : '')
+  )
 }
 
 function riskClass(risk?: string): string {
@@ -1389,7 +1521,8 @@ onBeforeUnmount(() => {
     </header>
 
     <p v-if="insecure" class="banner banner-warn">
-      当前为非加密的局域网 HTTP/WS 连接，消息与凭证可能被同网络攻击者窃取。仅在受信任网络下临时使用。
+      当前为非加密的局域网 HTTP/WS
+      连接，消息与凭证可能被同网络攻击者窃取。仅在受信任网络下临时使用。
     </p>
 
     <main class="rm-main">
@@ -1409,8 +1542,15 @@ onBeforeUnmount(() => {
           </p>
           <label class="field">
             <span>也可以手动粘贴配对码（ticket）</span>
-            <input v-model="pair.ticket" type="text" inputmode="text" autocomplete="off" spellcheck="false"
-              placeholder="ticket" maxlength="128" />
+            <input
+              v-model="pair.ticket"
+              type="text"
+              inputmode="text"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="ticket"
+              maxlength="128"
+            />
           </label>
         </div>
 
@@ -1422,23 +1562,45 @@ onBeforeUnmount(() => {
 
           <label class="field">
             <span>设备名称</span>
-            <input v-model="pair.name" type="text" maxlength="40" autocomplete="off" :disabled="pair.status === 'submitting'" />
+            <input
+              v-model="pair.name"
+              type="text"
+              maxlength="40"
+              autocomplete="off"
+              :disabled="pair.status === 'submitting'"
+            />
           </label>
 
-          <p class="muted small">扫码即确认连接，当前及后续创建的会话将自动授权，无需核对码或逐项勾选。</p>
+          <p class="muted small">
+            扫码即确认连接，当前及后续创建的会话将自动授权，无需核对码或逐项勾选。
+          </p>
 
           <ul class="security-notes">
             <li>配对码一次性使用，180 秒过期；本页不会把它写入 URL、日志或存储。</li>
-            <li>设备凭证 device secret 只保存在 sessionStorage：关闭标签页即失效，不写 localStorage/IndexedDB。</li>
+            <li>
+              设备凭证 device secret 只保存在 sessionStorage：关闭标签页即失效，不写
+              localStorage/IndexedDB。
+            </li>
             <li>浏览器本地存储不具备密钥库强度，请勿在他人手机或公共设备上配对。</li>
           </ul>
 
-          <div v-if="pair.status === 'idle' || pair.status === 'error' || pair.status === 'expired'" class="row">
-            <button class="btn-primary" type="button" :disabled="pair.status === 'submitting'" @click="startPairing">
+          <div
+            v-if="pair.status === 'idle' || pair.status === 'error' || pair.status === 'expired'"
+            class="row"
+          >
+            <button
+              class="btn-primary"
+              type="button"
+              :disabled="pair.status === 'submitting'"
+              @click="startPairing"
+            >
               立即连接
             </button>
           </div>
-          <div v-else-if="pair.status === 'submitting'" class="row"><span class="spinner" aria-hidden="true"></span><span class="muted">正在连接桌面端…</span></div>
+          <div v-else-if="pair.status === 'submitting'" class="row">
+            <span class="spinner" aria-hidden="true"></span
+            ><span class="muted">正在连接桌面端…</span>
+          </div>
 
           <p v-if="pair.error" class="banner banner-bad">{{ pair.error }}</p>
         </div>
@@ -1447,11 +1609,23 @@ onBeforeUnmount(() => {
       <!-- 主界面：会话 / 任务 / 审批 / 设备 -->
       <section v-else class="pane pane-fill">
         <nav class="tabs" role="tablist">
-          <button v-for="t in TABS" :key="t.key" class="tab" role="tab" type="button"
-            :aria-selected="tab === t.key" :class="{ active: tab === t.key }" @click="switchTab(t.key)">
+          <button
+            v-for="t in TABS"
+            :key="t.key"
+            class="tab"
+            role="tab"
+            type="button"
+            :aria-selected="tab === t.key"
+            :class="{ active: tab === t.key }"
+            @click="switchTab(t.key)"
+          >
             <span>{{ t.label }}</span>
-            <span v-if="t.key === 'approvals' && pendingCount" class="pill">{{ pendingCount }}</span>
-            <span v-else-if="t.key === 'runs' && activeRuns.length" class="pill pill-soft">{{ activeRuns.length }}</span>
+            <span v-if="t.key === 'approvals' && pendingCount" class="pill">{{
+              pendingCount
+            }}</span>
+            <span v-else-if="t.key === 'runs' && activeRuns.length" class="pill pill-soft">{{
+              activeRuns.length
+            }}</span>
           </button>
         </nav>
 
@@ -1460,12 +1634,17 @@ onBeforeUnmount(() => {
           <div class="conv-bar">
             <label class="field field-inline">
               <span class="sr-only">会话</span>
-              <select v-model="activeConversationId" @change="selectConversation(activeConversationId)">
+              <select
+                v-model="activeConversationId"
+                @change="selectConversation(activeConversationId)"
+              >
                 <option v-for="c in conversations" :key="c.id" :value="c.id">{{ c.title }}</option>
                 <option v-if="!conversations.length" value="">（无授权会话）</option>
               </select>
             </label>
-            <button class="btn-ghost" type="button" :disabled="busy.messages" @click="loadMessages">刷新</button>
+            <button class="btn-ghost" type="button" :disabled="busy.messages" @click="loadMessages">
+              刷新
+            </button>
           </div>
 
           <div ref="messagesEl" class="messages scroll">
@@ -1483,12 +1662,22 @@ onBeforeUnmount(() => {
           </div>
 
           <footer class="composer">
-            <textarea v-model="draft" rows="2" maxlength="16000" :disabled="!capability.operator"
-              :placeholder="capability.operator ? '发消息给 Agent…' : '当前角色为只读，不能发送消息'" @keydown.enter.exact.prevent="sendChat"></textarea>
+            <textarea
+              v-model="draft"
+              rows="2"
+              maxlength="16000"
+              :disabled="!capability.operator"
+              :placeholder="
+                capability.operator ? '发消息给 Agent…' : '当前角色为只读，不能发送消息'
+              "
+              @keydown.enter.exact.prevent="sendChat"
+            ></textarea>
             <div class="row row-end">
               <span class="muted small">{{ draft.length }}/16000</span>
               <button class="btn-ghost" type="button" @click="stopStreaming">停止</button>
-              <button class="btn-primary" type="button" :disabled="!canSend" @click="sendChat">发送</button>
+              <button class="btn-primary" type="button" :disabled="!canSend" @click="sendChat">
+                发送
+              </button>
             </div>
           </footer>
         </div>
@@ -1498,31 +1687,61 @@ onBeforeUnmount(() => {
           <div class="card">
             <label class="field">
               <span>任务目标</span>
-              <textarea v-model="goal" rows="3" maxlength="2000" :disabled="!capability.operator"
-                placeholder="例如：整理本周会议纪要并生成待办清单"></textarea>
+              <textarea
+                v-model="goal"
+                rows="3"
+                maxlength="2000"
+                :disabled="!capability.operator"
+                placeholder="例如：整理本周会议纪要并生成待办清单"
+              ></textarea>
             </label>
             <div class="row row-between">
               <div class="seg" role="group" aria-label="权限">
-                <button type="button" :class="{ active: permission === 'readonly' }" @click="permission = 'readonly'">只读</button>
-                <button type="button" :class="{ active: permission === 'autonomous' }" @click="permission = 'autonomous'">自主</button>
+                <button
+                  type="button"
+                  :class="{ active: permission === 'readonly' }"
+                  @click="permission = 'readonly'"
+                >
+                  只读
+                </button>
+                <button
+                  type="button"
+                  :class="{ active: permission === 'autonomous' }"
+                  @click="permission = 'autonomous'"
+                >
+                  自主
+                </button>
               </div>
-              <button class="btn-primary" type="button" :disabled="!capability.operator || !goal.trim()" @click="startRun">
+              <button
+                class="btn-primary"
+                type="button"
+                :disabled="!capability.operator || !goal.trim()"
+                @click="startRun"
+              >
                 启动任务
               </button>
             </div>
             <p class="muted small">
-              {{ permission === 'autonomous' ? 'autonomous：Agent 可在授权目录内自主调用工具，含写操作，会二次确认。' : 'readonly：Agent 只能读取与分析，不写入、不执行副作用。' }}
+              {{
+                permission === 'autonomous'
+                  ? 'autonomous：Agent 可在授权目录内自主调用工具，含写操作，会二次确认。'
+                  : 'readonly：Agent 只能读取与分析，不写入、不执行副作用。'
+              }}
             </p>
-            <p v-if="!capability.operator" class="muted small">当前角色 {{ capability.role }}（{{ roleHint }}），不能启动任务。</p>
+            <p v-if="!capability.operator" class="muted small">
+              当前角色 {{ capability.role }}（{{ roleHint }}），不能启动任务。
+            </p>
           </div>
 
           <div class="row row-between">
             <h3 class="sub-h">任务列表</h3>
-            <button class="btn-ghost" type="button" :disabled="busy.runs" @click="loadRuns">刷新</button>
+            <button class="btn-ghost" type="button" :disabled="busy.runs" @click="loadRuns">
+              刷新
+            </button>
           </div>
           <p v-if="busy.runs && !runs.length" class="muted center">加载中…</p>
           <p v-else-if="!runs.length" class="muted center">暂无任务。</p>
-          <article v-for="r in runs" :key="r.id" class="card card-run">
+          <article v-for="r in runs" :id="'run-' + r.id" :key="r.id" class="card card-run">
             <header class="row row-between">
               <strong class="run-goal">{{ r.goal }}</strong>
               <span class="badge badge-info">{{ runLabel(r) }}</span>
@@ -1530,13 +1749,40 @@ onBeforeUnmount(() => {
             <p class="muted small mono">{{ r.id.slice(0, 8) }} · {{ fmtTime(r.updatedAt) }}</p>
             <div class="row row-end">
               <template v-if="isRunActive(r)">
-                <button class="btn-ghost" type="button" :disabled="!capability.operator || r.control === 'pause_requested' || r.control === 'paused'"
-                  @click="controlRun(r, 'pause')">暂停</button>
-                <button class="btn-ghost" type="button" :disabled="!capability.operator || r.control !== 'paused'"
-                  @click="controlRun(r, 'resume')">继续</button>
-                <button class="btn-danger" type="button" :disabled="!capability.operator || r.control === 'stop_requested'"
-                  @click="controlRun(r, 'stop')">停止</button>
+                <button
+                  class="btn-ghost"
+                  type="button"
+                  :disabled="
+                    !capability.operator ||
+                    r.control === 'pause_requested' ||
+                    r.control === 'paused'
+                  "
+                  @click="controlRun(r, 'pause')"
+                >
+                  暂停
+                </button>
+                <button
+                  class="btn-ghost"
+                  type="button"
+                  :disabled="!capability.operator || r.control !== 'paused'"
+                  @click="controlRun(r, 'resume')"
+                >
+                  继续
+                </button>
+                <button
+                  class="btn-danger"
+                  type="button"
+                  :disabled="!capability.operator || r.control === 'stop_requested'"
+                  @click="controlRun(r, 'stop')"
+                >
+                  停止
+                </button>
               </template>
+              <a
+                v-else-if="r.transferToRunId && runs.some((run) => run.id === r.transferToRunId)"
+                :href="'#run-' + r.transferToRunId"
+                >查看接手任务</a
+              >
               <span v-else class="muted small">已结束</span>
             </div>
           </article>
@@ -1546,7 +1792,14 @@ onBeforeUnmount(() => {
         <div v-else-if="tab === 'approvals'" class="stack">
           <div class="row row-between">
             <h3 class="sub-h">待审批（{{ pendingCount }}）</h3>
-            <button class="btn-ghost" type="button" :disabled="busy.approvals" @click="loadApprovals">刷新</button>
+            <button
+              class="btn-ghost"
+              type="button"
+              :disabled="busy.approvals"
+              @click="loadApprovals"
+            >
+              刷新
+            </button>
           </div>
           <p v-if="!capability.approver" class="banner banner-info">
             当前角色 {{ capability.role }} 没有审批权限，只能查看待审批列表。
@@ -1560,11 +1813,26 @@ onBeforeUnmount(() => {
             </header>
             <p v-if="a.argsSummary" class="args">{{ a.argsSummary }}</p>
             <p class="muted small">
-              Run {{ a.runId ? a.runId.slice(0, 8) : '—' }} · 申请 {{ fmtTime(a.createdAt) }} · {{ fmtCountdown(a.expiresAt) }} · v{{ a.version }}
+              Run {{ a.runId ? a.runId.slice(0, 8) : '—' }} · 申请 {{ fmtTime(a.createdAt) }} ·
+              {{ fmtCountdown(a.expiresAt) }} · v{{ a.version }}
             </p>
             <div class="row row-end">
-              <button class="btn-ghost" type="button" :disabled="!capability.approver" @click="respondApproval(a, 'rejected')">拒绝</button>
-              <button class="btn-primary" type="button" :disabled="!capability.approver" @click="respondApproval(a, 'approved')">批准</button>
+              <button
+                class="btn-ghost"
+                type="button"
+                :disabled="!capability.approver"
+                @click="respondApproval(a, 'rejected')"
+              >
+                拒绝
+              </button>
+              <button
+                class="btn-primary"
+                type="button"
+                :disabled="!capability.approver"
+                @click="respondApproval(a, 'approved')"
+              >
+                批准
+              </button>
             </div>
           </article>
         </div>
@@ -1574,27 +1842,43 @@ onBeforeUnmount(() => {
           <div class="card">
             <h3 class="sub-h">当前设备</h3>
             <dl class="kv">
-              <dt>名称</dt><dd>{{ device.name || pair.name || '本机' }}</dd>
-              <dt>角色</dt><dd>{{ capability.role }}</dd>
-              <dt>能力</dt><dd>{{ roleHint }}</dd>
-              <dt>设备 ID</dt><dd class="mono">{{ device.deviceId || credentials.deviceId || '—' }}</dd>
-              <dt>状态</dt><dd>{{ device.status || (serverAuth.authenticated ? 'active' : '未知') }}</dd>
-              <dt>最近活动</dt><dd>{{ fmtTime(Number(device.lastSeenAt) || 0) }}</dd>
-              <dt>事件游标</dt><dd class="mono">seq {{ lastSeq }} · {{ streamEpoch ? streamEpoch.slice(0, 8) : '—' }}</dd>
-              <dt>协议通道</dt><dd>{{ insecure ? 'ws（非加密）' : 'wss' }}</dd>
+              <dt>名称</dt>
+              <dd>{{ device.name || pair.name || '本机' }}</dd>
+              <dt>角色</dt>
+              <dd>{{ capability.role }}</dd>
+              <dt>能力</dt>
+              <dd>{{ roleHint }}</dd>
+              <dt>设备 ID</dt>
+              <dd class="mono">{{ device.deviceId || credentials.deviceId || '—' }}</dd>
+              <dt>状态</dt>
+              <dd>{{ device.status || (serverAuth.authenticated ? 'active' : '未知') }}</dd>
+              <dt>最近活动</dt>
+              <dd>{{ fmtTime(Number(device.lastSeenAt) || 0) }}</dd>
+              <dt>事件游标</dt>
+              <dd class="mono">
+                seq {{ lastSeq }} · {{ streamEpoch ? streamEpoch.slice(0, 8) : '—' }}
+              </dd>
+              <dt>协议通道</dt>
+              <dd>{{ insecure ? 'ws（非加密）' : 'wss' }}</dd>
             </dl>
           </div>
 
           <div class="card">
             <h3 class="sub-h">凭证与安全</h3>
             <ul class="security-notes">
-              <li>device secret 仅存 sessionStorage，关闭标签页自动失效；刷新页面可自动恢复会话。</li>
-              <li>桌面服务使用短期 HttpOnly Cookie 鉴权，WebSocket URL 与命令帧均不携带长期凭证。</li>
+              <li>
+                device secret 仅存 sessionStorage，关闭标签页自动失效；刷新页面可自动恢复会话。
+              </li>
+              <li>
+                桌面服务使用短期 HttpOnly Cookie 鉴权，WebSocket URL 与命令帧均不携带长期凭证。
+              </li>
               <li>「退出登录」只撤销当前浏览器会话；移除设备需在桌面端执行。</li>
             </ul>
             <div class="row row-end">
               <button class="btn-ghost" type="button" @click="resumeSync">重新同步</button>
-              <button class="btn-danger" type="button" :disabled="busy.logout" @click="logout">{{ busy.logout ? '退出中…' : '退出登录' }}</button>
+              <button class="btn-danger" type="button" :disabled="busy.logout" @click="logout">
+                {{ busy.logout ? '退出中…' : '退出登录' }}
+              </button>
             </div>
             <p v-if="insecure" class="banner banner-warn">非加密模式下请勿发送任何敏感内容。</p>
           </div>
@@ -1604,17 +1888,29 @@ onBeforeUnmount(() => {
 
     <!-- 提示条 -->
     <div class="toasts" aria-live="polite">
-      <div v-for="t in toasts" :key="t.id" class="toast" :class="'toast-' + t.tone">{{ t.message }}</div>
+      <div v-for="t in toasts" :key="t.id" class="toast" :class="'toast-' + t.tone">
+        {{ t.message }}
+      </div>
     </div>
 
     <!-- 确认对话框 -->
-    <div v-if="confirmState.open" class="overlay" role="dialog" aria-modal="true" :aria-label="confirmState.title">
+    <div
+      v-if="confirmState.open"
+      class="overlay"
+      role="dialog"
+      aria-modal="true"
+      :aria-label="confirmState.title"
+    >
       <div class="dialog">
         <h3>{{ confirmState.title }}</h3>
         <p class="dialog-body">{{ confirmState.message }}</p>
         <div class="row row-end">
           <button class="btn-ghost" type="button" @click="resolveConfirm(false)">取消</button>
-          <button :class="confirmState.danger ? 'btn-danger' : 'btn-primary'" type="button" @click="resolveConfirm(true)">
+          <button
+            :class="confirmState.danger ? 'btn-danger' : 'btn-primary'"
+            type="button"
+            @click="resolveConfirm(true)"
+          >
             {{ confirmState.confirmText }}
           </button>
         </div>

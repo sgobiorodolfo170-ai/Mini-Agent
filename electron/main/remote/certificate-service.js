@@ -57,7 +57,9 @@ function randomSerial() {
 }
 
 function certificateFingerprint(pem) {
-  const der = forge.asn1.toDer(forge.pki.certificateToAsn1(forge.pki.certificateFromPem(pem))).getBytes()
+  const der = forge.asn1
+    .toDer(forge.pki.certificateToAsn1(forge.pki.certificateFromPem(pem)))
+    .getBytes()
   const digest = crypto.createHash('sha256').update(Buffer.from(der, 'binary')).digest('hex')
   return digest.match(/.{2}/g).join(':').toUpperCase()
 }
@@ -74,8 +76,10 @@ function assertKey(privateKey, certificate, label) {
 }
 
 function validAt(certificate, nowMs) {
-  return certificate.validity.notBefore.getTime() <= nowMs &&
+  return (
+    certificate.validity.notBefore.getTime() <= nowMs &&
     certificate.validity.notAfter.getTime() > nowMs
+  )
 }
 
 function commonName(value) {
@@ -102,7 +106,8 @@ function createCa(nowMs) {
 
 function createServer(caKey, caCert, privateKey, ip, nowMs) {
   const certificate = forge.pki.createCertificate()
-  certificate.publicKey = privateKey.publicKey || forge.pki.setRsaPublicKey(privateKey.n, privateKey.e)
+  certificate.publicKey =
+    privateKey.publicKey || forge.pki.setRsaPublicKey(privateKey.n, privateKey.e)
   certificate.serialNumber = randomSerial()
   certificate.validity.notBefore = new Date(nowMs - CLOCK_SKEW_MS)
   certificate.validity.notAfter = new Date(nowMs + SERVER_LIFETIME_MS)
@@ -200,7 +205,9 @@ async function ensureUnlocked({ dataDir, ip, encrypt, decrypt, now }) {
   const dir = materialDir(dataDir)
   requireIPv4(ip)
   const nowMs = timestamp(now)
-  const files = Object.fromEntries(Object.entries(FILES).map(([key, name]) => [key, path.join(dir, name)]))
+  const files = Object.fromEntries(
+    Object.entries(FILES).map(([key, name]) => [key, path.join(dir, name)])
+  )
   const missing = await missingFiles(dir)
   if (missing.length !== 0 && missing.length !== ALL_FILES.length) {
     throw certificateError(`security material is incomplete (missing: ${missing.join(', ')})`)
@@ -220,7 +227,8 @@ async function ensureUnlocked({ dataDir, ip, encrypt, decrypt, now }) {
     assertKey(caKey, caCert, 'CA')
     if (!caCert.verify(caCert)) throw certificateError('CA certificate signature is invalid')
     const constraints = caCert.getExtension('basicConstraints')
-    if (!constraints || constraints.cA !== true) throw certificateError('CA basicConstraints must have cA=true')
+    if (!constraints || constraints.cA !== true)
+      throw certificateError('CA basicConstraints must have cA=true')
     privateKey = await decryptPrivateKey(files.key, decrypt, 'server')
     certificate = await readCertificate(files.cert, 'server')
     assertKey(privateKey, certificate, 'server')
@@ -242,7 +250,8 @@ async function ensureUnlocked({ dataDir, ip, encrypt, decrypt, now }) {
   }
 
   if (certificate && validAt(certificate, nowMs)) {
-    if (!caCert.verify(certificate)) throw certificateError('server certificate is not signed by the local CA')
+    if (!caCert.verify(certificate))
+      throw certificateError('server certificate is not signed by the local CA')
     if (!serverAddresses(certificate).includes(ip)) certificate = null
   } else {
     certificate = null
@@ -280,7 +289,13 @@ async function ensureUnlocked({ dataDir, ip, encrypt, decrypt, now }) {
   }
 }
 
-async function ensureCertificate({ dataDir, ip, encrypt = encryptSecret, decrypt = decryptSecret, now } = {}) {
+async function ensureCertificate({
+  dataDir,
+  ip,
+  encrypt = encryptSecret,
+  decrypt = decryptSecret,
+  now
+} = {}) {
   const dir = materialDir(dataDir)
   const previous = inFlight.get(dir) || Promise.resolve()
   const operation = previous.then(() => ensureUnlocked({ dataDir, ip, encrypt, decrypt, now }))

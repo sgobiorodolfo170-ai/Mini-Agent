@@ -11,11 +11,12 @@ const buildInfo = require('./build-info')
 const { registerIpc, probeAllForProvider } = require('./ipc')
 const { initProbeScheduler, stopProbeScheduler } = require('./probe-scheduler')
 const { getHub } = require('./events/hub')
+const runtimeLog = require('./runtime-log')
 const { initUpdater, getUpdater, stopUpdater } = updaterMod
 
 let forceQuit = false
 let remoteManager = null
-let remoteCleanup = null
+let shutdownPromise = null
 
 // E2E test mode: isolated userData dir also acts as the test-mode switch
 // (skips single-instance lock and global hotkey registration).
@@ -36,11 +37,74 @@ process.on('unhandledRejection', (e) => {
 })
 
 function requestQuit() {
+  if (shutdownPromise) return shutdownPromise
   forceQuit = true
-  app.quit()
+  const { runShutdownSteps, processRegistry, markShuttingDown } = require('./lifecycle')
+  markShuttingDown()
+  // 看门狗：所有阶段均有超时（默认 5s，共 6 段 + 1 段 4s ≈ 29s），
+  // 总预算取 35s 留出余量，兜底任何失控的单步。
+  const watchdog = setTimeout(() => {
+    console.error('[shutdown] 清理总预算耗尽，强制退出')
+    app.exit(0)
+  }, 35000)
+  if (watchdog.unref) watchdog.unref()
+  const gateway = require('./gateway/index')
+  const agent = require('./agent/index')
+  const embedLocal = require('./rag/embed-local')
+  const faissIndex = require('./rag/faiss-index')
+
+  shutdownPromise = runShutdownSteps([
+    {
+      name: '停止定时任务',
+      run: () => {
+        stopProbeScheduler()
+        stopUpdater()
+      }
+    },
+    { name: '关闭远程服务', run: () => (remoteManager ? remoteManager.stop() : undefined) },
+    {
+      name: '中止会话与智能任务',
+      timeoutMs: 4000,
+      run: async () => {
+        await Promise.all([gateway.stopAllStreams(), agent.stopAllRuns()])
+      }
+    },
+    { name: '回收子进程', run: () => processRegistry.stopAll() },
+    {
+      name: '释放模型与窗口',
+      run: async () => {
+        await embedLocal.disposeSessions()
+        faissIndex.invalidateAll()
+        tray.destroyTray()
+        windows.destroyAll()
+      }
+    },
+    {
+      name: '关闭数据库',
+      run: () => {
+        try {
+          dbm.close()
+        } catch (e) {
+          console.warn('[shutdown] 数据库关闭失败', e)
+        }
+      }
+    }
+  ])
+    .then((results) => {
+      for (const r of results) {
+        if (r.status === 'ok') console.log(`[shutdown] ${r.name}: 完成`)
+      }
+    })
+    .finally(() => {
+      clearTimeout(watchdog)
+      shortcutsMod.unregisterAll()
+      app.exit(0)
+    })
+  return shutdownPromise
 }
 
 function activateQuick() {
+  if (forceQuit) return
   windows.createQuickWindow()
   windows.show('quick')
   windows.sendTo('quick', 'quick:activated', {})
@@ -63,6 +127,7 @@ async function captureSelectionFlow() {
 }
 
 function startCapture() {
+  if (forceQuit) return
   const { screen } = require('electron')
   const d = screen.getDisplayNearestPoint(screen.getCursorScreenPoint())
   windows.createCaptureWindow(d)
@@ -105,9 +170,25 @@ if (!gotLock) {
   app.on('second-instance', () => windows.show('main'))
 
   app.whenReady().then(() => {
+    // 运行日志尽早初始化：启动、数据库、退出清理的控制台输出都进入设置页可回看的日志。
+    const log = runtimeLog.initRuntimeLog({
+      dir: path.join(app.getPath('userData'), 'logs')
+    })
+    log.installConsoleCapture()
+    log.log('info', 'app', '应用启动', {
+      version: app.getVersion(),
+      platform: process.platform,
+      testMode: isTestMode
+    })
+
     dbm.open(path.join(app.getPath('userData'), 'miniagent.db'))
-    // 所有推送同时进入事件中枢：界面可见即历史可见，前端可按 seq 游标补齐漏收
+    const dbInfo = dbm.info() || {}
+    log.log('info', 'db', '数据库已打开', { path: dbInfo.path, driver: dbInfo.driver })
+
+    // 所有推送同时进入事件中枢：界面可见即历史可见，前端可按 seq 游标补齐漏收。
+    // 事件同时写入运行日志，设置页可回看任务、工具调用、通知等运行轨迹。
     const hub = getHub()
+    hub.on('*', (record) => log.event(record))
     notify.setBroadcaster((ch, payload) => {
       hub.emit(ch, payload || {})
       if (remoteManager) remoteManager.events.bridge(ch, payload || {})
@@ -116,10 +197,11 @@ if (!gotLock) {
 
     const main = windows.createMainWindow()
     main.on('close', (e) => {
-      if (!forceQuit) {
-        e.preventDefault()
-        main.hide()
-      }
+      if (forceQuit) return
+      const { shouldCloseToTray } = require('./lifecycle')
+      e.preventDefault()
+      if (shouldCloseToTray(repos.getSetting(dbm.get(), 'closeToTray'))) main.hide()
+      else void requestQuit()
     })
 
     const db = dbm.get()
@@ -149,6 +231,8 @@ if (!gotLock) {
       buildInfo: buildInfo.getBuildInfo()
     })
 
+    require('./agent').resumeQueuedRuns()
+
     // 周期自动探测（需求 4.2）：每分钟一跳，按供应商 probe_interval_min 到期探测。
     // 测试模式不启动，避免干扰 e2e 的确定性。首跳即对各到期供应商完成启动探测。
     if (!isTestMode) {
@@ -177,28 +261,14 @@ if (!gotLock) {
   })
 
   app.on('before-quit', (event) => {
-    if (remoteManager && !remoteCleanup) {
-      event.preventDefault()
-      remoteCleanup = remoteManager.stop().catch(() => {}).finally(() => app.quit())
-      return
-    }
-    forceQuit = true
-    finalizeQuit()
+    // 系统关机、外部 app.quit() 都必须走完整回收流程；清理结束后由 requestQuit 统一 app.exit。
+    event.preventDefault()
+    void requestQuit()
   })
 
-  function finalizeQuit() {
-    shortcutsMod.unregisterAll()
-    stopProbeScheduler()
-    stopUpdater()
-    try {
-      dbm.close()
-    } catch {
-      /* ignore */
-    }
-  }
+  app.on('will-quit', () => shortcutsMod.unregisterAll())
 
   app.on('window-all-closed', () => {
-    // Tray keeps the app alive; only a real quit request exits.
-    if (forceQuit) app.quit()
+    // 不在这里直接退出：窗口销毁只是清理的一步，最终退出由 requestQuit 统一完成。
   })
 }

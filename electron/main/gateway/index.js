@@ -7,6 +7,7 @@ const { decryptSecret } = require('../../store/keys')
 const { broadcast } = require('../notify')
 const { searchKb } = require('../rag/index')
 const title = require('./title')
+const { isShuttingDown } = require('../lifecycle')
 
 // assistantMsgId -> { ac: AbortController, conversationId }
 // 值里带上 conversationId，让「按会话中止」与前端事件归属判断有据可依。
@@ -156,7 +157,22 @@ function lastUserText(db, conversationId) {
 
 async function startStream({ conversationId, assistantMsgId, kbIds, attachments }) {
   const db = dbm.get()
-  const { provider, model, conv } = resolveModel(db, conversationId)
+  // 退出流程已开始：不再登记新流，并把占位消息落为 stopped，避免界面停在「生成中」。
+  if (isShuttingDown()) {
+    try {
+      repos.updateMessage(db, assistantMsgId, { status: 'stopped' })
+      broadcast('chat:event', { type: 'stopped', conversationId, msgId: assistantMsgId })
+    } catch {
+      // 数据库可能已关闭，退出阶段忽略
+    }
+    return
+  }
+  // 在首个 await 前登记，退出时能中止仍处于准备/重试间隙的流。
+  const streamController = new AbortController()
+  let resolveDone
+  const done = new Promise((resolve) => (resolveDone = resolve))
+  const streamEntry = { ac: streamController, conversationId, done }
+  active.set(assistantMsgId, streamEntry)
   let acc = ''
   // 检查点节流状态（每次 startStream 独立）：首跳从当下起算，避免第一个 token 就写库
   let lastCheckpointAt = Date.now()
@@ -172,6 +188,8 @@ async function startStream({ conversationId, assistantMsgId, kbIds, attachments 
     repos.updateMessage(db, assistantMsgId, { content: acc })
   }
   try {
+    // 放在 try 内：resolveModel 抛错时也必须走 finally 释放 active 与 done。
+    const { provider, model, conv } = resolveModel(db, conversationId)
     if (!provider) throw new Error('未配置模型服务，请先在设置中添加供应商')
     if (!model) throw new Error('未配置模型，请在「设置 → 会话」中选择')
 
@@ -233,8 +251,14 @@ async function startStream({ conversationId, assistantMsgId, kbIds, attachments 
       const key = scheduler.pickKey(keyRows, provider.rotation_strategy, exclude, Date.now())
       if (!key) break
       exclude.push(key.id)
-      const ac = new AbortController()
-      const entry = { ac, conversationId }
+      // 准备期间可能被 stopAllStreams 中止或 abortStreamsOf 取代：不得在此处复活旧流。
+      if (superseded.delete(assistantMsgId)) return
+      if (streamController.signal.aborted) {
+        repos.updateMessage(db, assistantMsgId, { content: acc, status: 'stopped' })
+        return
+      }
+      const ac = streamEntry.ac
+      const entry = streamEntry
       active.set(assistantMsgId, entry)
       try {
         const r = await chatStream(
@@ -334,11 +358,16 @@ async function startStream({ conversationId, assistantMsgId, kbIds, attachments 
     repos.updateMessage(db, assistantMsgId, { status: 'error', content: acc, meta: { error: msg } })
     active.delete(assistantMsgId)
     broadcast('chat:event', { type: 'error', conversationId, msgId: assistantMsgId, message: msg })
+  } finally {
+    if (active.get(assistantMsgId) === streamEntry) active.delete(assistantMsgId)
+    resolveDone()
   }
+  return streamEntry.done
 }
 
 async function sendChat({ conversationId, content, kbIds, attachments, originMessageId }) {
   const db = dbm.get()
+  if (isShuttingDown()) throw new Error('应用正在退出，无法发送新消息')
   if (originMessageId) {
     const existing = repos.getMessage(db, originMessageId)
     if (existing) {
@@ -351,6 +380,7 @@ async function sendChat({ conversationId, content, kbIds, attachments, originMes
   const conv = repos.getConversation(db, conversationId)
   if (!conv) throw new Error('会话不存在')
   // 后端闸门：同一会话同时只允许一条在途流（前端 hasStreaming 只是第一道拦截）
+  repos.assertNoActiveRun(db, conversationId)
   abortStreamsOf(conversationId, 'new-send')
   // 「第一轮」在插入本条消息前判定：会话此前的消息为空即第一轮
   const isFirstRound =
@@ -408,6 +438,14 @@ function abortStreamsOf(conversationId, by = 'unknown') {
         // 已结束的控制器 abort 是空操作
       }
       active.delete(msgId)
+      // 旧消息已不可能再收到本流的终态事件（superseded 分支会静默退出），
+      // 这里立即落 stopped，避免新发送后旧消息永久停在「生成中」。
+      try {
+        repos.updateMessage(dbm.get(), msgId, { status: 'stopped' })
+        broadcast('chat:event', { type: 'stopped', conversationId, msgId })
+      } catch {
+        // 数据库未就绪时忽略，不影响中止
+      }
       recalled.push(msgId)
     }
   }
@@ -420,9 +458,11 @@ function abortStreamsOf(conversationId, by = 'unknown') {
 
 async function regenerate(conversationId) {
   const db = dbm.get()
+  if (isShuttingDown()) throw new Error('应用正在退出，无法重新生成')
   const rows = repos.listMessages(db, conversationId)
   const lastAssistant = [...rows].reverse().find((m) => m.role === 'assistant')
   if (!lastAssistant) throw new Error('没有可重新生成的回复')
+  repos.assertNoActiveRun(db, conversationId)
   abortStreamsOf(conversationId, 'regenerate')
   repos.softDeleteMessagesFrom(db, conversationId, lastAssistant.seq)
   const remaining = repos.listMessages(db, conversationId)
@@ -451,8 +491,10 @@ async function regenerate(conversationId) {
 
 async function editResend({ msgId, content }) {
   const db = dbm.get()
+  if (isShuttingDown()) throw new Error('应用正在退出，无法编辑重发')
   const msg = repos.getMessage(db, msgId)
   if (!msg) throw new Error('消息不存在')
+  repos.assertNoActiveRun(db, msg.conversationId)
   abortStreamsOf(msg.conversationId, 'edit-resend')
   repos.updateMessage(db, msgId, { content })
   repos.softDeleteMessagesFrom(db, msg.conversationId, msg.seq + 1)
@@ -485,6 +527,22 @@ function stopChat(msgId) {
     return true
   }
   return false
+}
+
+async function stopAllStreams() {
+  const current = [...active.entries()]
+  for (const [, entry] of current) {
+    try {
+      entry.ac.abort()
+    } catch {
+      // 已结束的 AbortController 无需处理
+    }
+  }
+  await Promise.allSettled(current.map(([, entry]) => entry.done))
+  // 只清理本次快照：等待期间新登记的流不归这里管（入口已由 isShuttingDown 拦截）。
+  for (const [msgId, entry] of current) {
+    if (active.get(msgId) === entry) active.delete(msgId)
+  }
 }
 
 // 提示词优化：结合当前会话最近几轮上下文，把输入框草稿改写为更明确的提示词。
@@ -562,6 +620,7 @@ module.exports = {
   regenerate,
   editResend,
   stopChat,
+  stopAllStreams,
   optimizePrompt,
   resolveModel,
   modelParams,

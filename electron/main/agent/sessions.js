@@ -66,20 +66,32 @@ function depthOf(db, conversationId) {
   return depth
 }
 
-function sessionView(db, conversationId) {
+function sessionView(db, conversationId, selection) {
   const conv = deps.repos.getConversation(db, conversationId)
   if (!conv) return null
-  const runs = db
-    .prepare(
-      `SELECT id, status, goal, max_steps AS maxSteps, steps_used AS stepsUsed,
-       started_at AS startedAt, ended_at AS endedAt
-       FROM agent_runs WHERE conversation_id = ? ORDER BY started_at DESC LIMIT 1`
-    )
-    .all(conversationId)
-  const run = runs[0] || null
-  const runRow = run ? deps.repos.getRun(db, run.id) : null
   const messages = deps.repos.listMessages(db, conversationId)
-  const lastAssistant = [...messages].reverse().find((m) => m.role === 'assistant')
+  const assistant = selection
+    ? messages.find((m) => m.id === selection.lastMessageId)
+    : [...messages].reverse().find((m) => m.role === 'assistant')
+  const runId = selection ? selection.runId : gateway.safeJson(assistant?.meta)?.agentRunId
+  let run = runId ? deps.repos.getRun(db, runId) : null
+  if (
+    !selection &&
+    !run &&
+    (!assistant || !messages.some((m) => gateway.safeJson(m.meta)?.agentRunId))
+  ) {
+    const latest = db
+      .prepare(
+        `SELECT id,run_spec_json FROM agent_runs
+      WHERE conversation_id=? ORDER BY started_at DESC,rowid DESC LIMIT 1`
+      )
+      .get(conversationId)
+    if (latest && !latest.run_spec_json) run = deps.repos.getRun(db, latest.id)
+  }
+  const lastAssistant = run?.assistantMessageId
+    ? messages.find((m) => m.id === run.assistantMessageId)
+    : assistant
+  const runRow = run
   return {
     conversationId,
     title: conv.title,
@@ -93,7 +105,14 @@ function sessionView(db, conversationId) {
     controlMode: runRow ? runRow.controlMode || null : null,
     traceId: runRow ? runRow.traceId || null : null,
     acceptanceStatus: runRow ? runRow.acceptanceStatus || 'not_required' : 'not_required',
-    status: run ? run.status : lastAssistant ? lastAssistant.status : 'idle',
+    status: run
+      ? run.status
+      : lastAssistant
+        ? lastAssistant.status
+        : selection?.lastMessageId
+          ? 'stopped'
+          : 'idle',
+    transferToRunId: run?.transferToRunId || null,
     stepsUsed: run ? run.stepsUsed : 0,
     maxSteps: run ? run.maxSteps : null,
     messageCount: messages.length,
@@ -231,20 +250,31 @@ function listSessions({ parentId, runId, limit = 20 } = {}) {
 // 有界轮询等待：等到 run 进入终态或超时。
 // 用轮询而非长连接，是因为子会话可能由另一条 IPC 链路驱动，
 // 事件订阅拿不到「刚结束」的确定性通知；轮询语义简单且可预期。
-async function waitForSession({ conversationId, timeoutMs = DEFAULT_WAIT_MS, pollMs = POLL_MS }) {
+async function waitForSession({
+  conversationId,
+  timeoutMs = DEFAULT_WAIT_MS,
+  pollMs = POLL_MS,
+  signal
+}) {
   const limit = Math.min(MAX_WAIT_MS, Math.max(1000, Number(timeoutMs) || DEFAULT_WAIT_MS))
   const interval = Math.max(200, Number(pollMs) || POLL_MS)
   const started = Date.now()
-  let last = null
+  const selection = getSessionStatus({ conversationId })
   for (;;) {
-    last = getSessionStatus({ conversationId })
+    if (signal?.aborted) throw new Error('任务已停止')
+    const last = sessionView(deps.dbm.get(), conversationId, selection)
+    if (!last) throw new Error('会话不存在')
     if (last.status && !ACTIVE_STATUSES.has(last.status)) {
       return { ...last, waited: Date.now() - started, timedOut: false }
     }
     if (Date.now() - started >= limit) {
       return { ...last, waited: Date.now() - started, timedOut: true }
     }
-    await new Promise((r) => setTimeout(r, interval))
+    await require('node:timers/promises').setTimeout(
+      Math.min(interval, Math.max(1, limit - (Date.now() - started))),
+      undefined,
+      { signal }
+    )
   }
 }
 
@@ -254,12 +284,17 @@ function getSessionResult({ conversationId, maxChars = 8000, calls = 10 }) {
   const view = sessionView(db, conversationId)
   if (!view) throw new Error('会话不存在')
   const messages = deps.repos.listMessages(db, conversationId)
-  const lastAssistant = [...messages].reverse().find((m) => m.role === 'assistant')
+  const lastAssistant = messages.find((m) => m.id === view.lastMessageId)
   const content = lastAssistant ? String(lastAssistant.content || '') : ''
   const toolCalls = view.runId
     ? deps.repos.getRunCalls(db, view.runId).slice(-Math.max(1, calls))
     : []
-  const userMsg = [...messages].reverse().find((m) => m.role === 'user')
+  const run = view.runId && deps.repos.getRun(db, view.runId)
+  const userMsg = run?.userMessageId
+    ? messages.find((m) => m.id === run.userMessageId)
+    : [...messages]
+        .reverse()
+        .find((m) => m.role === 'user' && (!lastAssistant || m.seq < lastAssistant.seq))
   return {
     conversationId,
     runId: view.runId,

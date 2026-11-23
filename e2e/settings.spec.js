@@ -102,3 +102,42 @@ describe('设置页「会话」分组（会话设置迁入）', () => {
     expect(unexpectedErrors(consoleErrors)).toEqual([])
   })
 })
+
+describe('设置页「运行日志」分组', () => {
+  it('展示主进程运行日志，支持搜索筛选与清空', async () => {
+    const { win, consoleErrors } = ctx
+    await win.getByTestId('nav-settings').click()
+    await win.getByTestId('settings-section-logs').click()
+
+    await win.getByTestId('log-row').first().waitFor({ timeout: 10000 })
+    expect(await win.getByTestId('log-row').count()).toBeGreaterThan(0)
+    // 启动日志已由主进程写入运行日志
+    await win
+      .getByTestId('log-row')
+      .filter({ hasText: '应用启动' })
+      .first()
+      .waitFor({ timeout: 5000 })
+
+    // 关键字过滤在已加载的日志上即时生效
+    await win.getByTestId('log-search').fill('数据库已打开')
+    await win
+      .getByTestId('log-row')
+      .filter({ hasText: '数据库已打开' })
+      .first()
+      .waitFor({ timeout: 5000 })
+    expect(await win.getByTestId('log-row').count()).toBe(1)
+
+    await win.getByTestId('log-search').fill('')
+    // 关闭轮询，避免清空与后台刷新交叉造成断言抖动
+    if (await win.getByTestId('log-auto-refresh').isChecked()) {
+      await win.getByTestId('log-auto-refresh').uncheck()
+    }
+    await win.getByTestId('log-clear').click()
+    await win.locator('button.btn-danger', { hasText: '清空' }).click()
+    await win.waitForFunction(() => document.querySelector('[data-testid="log-row"]') === null)
+    expect(await win.getByTestId('log-row').count()).toBe(0)
+    expect(await win.evaluate(() => window.api.logs.list({ limit: 10 }))).toEqual([])
+
+    expect(unexpectedErrors(consoleErrors)).toEqual([])
+  })
+})

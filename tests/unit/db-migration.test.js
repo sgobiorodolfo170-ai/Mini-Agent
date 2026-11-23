@@ -94,7 +94,9 @@ describe('旧库迁移', () => {
     const run = db.prepare('SELECT * FROM agent_runs WHERE id = ?').get('r-legacy')
     expect(run.goal).toBe('老目标')
     expect(run.acceptance_status).toBe('not_required')
-    expect(run.version).toBe(1)
+    expect(run.status).toBe('stopped')
+    expect(run.finished_reason).toBe('legacy_unrecoverable')
+    expect(run.version).toBe(2)
 
     const indexes = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'")

@@ -6,7 +6,11 @@ import { createRequire } from 'node:module'
 
 const require = createRequire(import.meta.url)
 const forge = require('node-forge')
-const { ensureCertificate, exportCa, reset } = require('../../electron/main/remote/certificate-service')
+const {
+  ensureCertificate,
+  exportCa,
+  reset
+} = require('../../electron/main/remote/certificate-service')
 
 const NOW = new Date('2026-11-22T00:00:00.000Z')
 const IP = '192.168.1.23'
@@ -74,11 +78,15 @@ describe('remote certificate service', () => {
   it('reuses all unexpired material without rewriting encrypted keys', async () => {
     const first = await ensureCertificate(options(dataDir))
     const paths = files(dataDir)
-    const before = await Promise.all([paths.caKey, paths.cert, paths.key].map((file) => fs.readFile(file, 'utf8')))
+    const before = await Promise.all(
+      [paths.caKey, paths.cert, paths.key].map((file) => fs.readFile(file, 'utf8'))
+    )
     const second = await ensureCertificate(options(dataDir, IP, new Date(NOW.getTime() + 86400000)))
 
     expect(second).toEqual(first)
-    const after = await Promise.all([paths.caKey, paths.cert, paths.key].map((file) => fs.readFile(file, 'utf8')))
+    const after = await Promise.all(
+      [paths.caKey, paths.cert, paths.key].map((file) => fs.readFile(file, 'utf8'))
+    )
     expect(after).toEqual(before)
   })
 
@@ -114,8 +122,9 @@ describe('remote certificate service', () => {
   })
 
   it('rejects an encryptor that returns plaintext private keys', async () => {
-    await expect(ensureCertificate({ ...options(dataDir), encrypt: async (value) => value }))
-      .rejects.toThrow('CA private key encryption returned plaintext')
+    await expect(
+      ensureCertificate({ ...options(dataDir), encrypt: async (value) => value })
+    ).rejects.toThrow('CA private key encryption returned plaintext')
     expect(await fs.readdir(path.join(dataDir, 'remote-certificates'))).toEqual([])
   })
 
@@ -138,8 +147,9 @@ describe('remote certificate service', () => {
       throw new Error('DPAPI unavailable')
     }
 
-    await expect(ensureCertificate({ ...options(dataDir), decrypt: failingDecrypt }))
-      .rejects.toThrow('CA private key decryption failed')
+    await expect(
+      ensureCertificate({ ...options(dataDir), decrypt: failingDecrypt })
+    ).rejects.toThrow('CA private key decryption failed')
     expect(await fs.readFile(paths.caKey, 'utf8')).toBe(before)
   })
 

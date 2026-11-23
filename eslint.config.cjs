@@ -26,7 +26,12 @@ module.exports = [
     languageOptions: {
       globals: { ...globals.browser },
       parser: vueParser,
-      parserOptions: { parser: tsParser, extraFileExtensions: ['.vue'], ecmaVersion: 'latest', sourceType: 'module' }
+      parserOptions: {
+        parser: tsParser,
+        extraFileExtensions: ['.vue'],
+        ecmaVersion: 'latest',
+        sourceType: 'module'
+      }
     }
   },
   {

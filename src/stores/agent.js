@@ -43,7 +43,7 @@ export const useAgentStore = defineStore('agent', {
       })
     },
     handleEvent(ev) {
-      if (ev.type === 'started' || ev.type === 'done') this.loadRuns()
+      if (['queued', 'started', 'state', 'done'].includes(ev.type)) this.loadRuns()
       // 运行结束（含被停止/出错）时，该运行遗留的确认卡一律失效
       if (ev.type === 'done' && ev.runId) this.clearConfirms({ runId: ev.runId })
     }

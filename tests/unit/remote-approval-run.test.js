@@ -12,7 +12,9 @@ const { RemoteAuthService } = require('../../electron/main/remote/auth-service')
 let db, conv, run, approvals, runs, events
 
 beforeEach(() => {
-  dbm.close(); dbm.open(':memory:'); db = dbm.get()
+  dbm.close()
+  dbm.open(':memory:')
+  db = dbm.get()
   conv = repos.createConversation(db, { title: '审批测试' })
   const runId = repos.createRun(db, { conversationId: conv.id, goal: '测试任务' })
   run = repos.getRun(db, runId)
@@ -23,20 +25,38 @@ beforeEach(() => {
 
 describe('持久化审批服务', () => {
   it('创建审批→批准→resolve→重复响应被拒绝', async () => {
-    const p = approvals.decide({ runId: run.id, conversationId: conv.id, name: 'write_file', args: { path: 'a.txt', content: 'x' }, riskLevel: 'side_effect' })
+    const p = approvals.decide({
+      runId: run.id,
+      conversationId: conv.id,
+      name: 'write_file',
+      args: { path: 'a.txt', content: 'x' },
+      riskLevel: 'side_effect'
+    })
     const pending = db.prepare("SELECT * FROM agent_approvals WHERE status='pending'").get()
     expect(pending.tool).toBe('write_file')
 
-    const r1 = approvals.respond({ approvalId: pending.approval_id, decision: 'approved', actor: 'desktop' })
+    const r1 = approvals.respond({
+      approvalId: pending.approval_id,
+      decision: 'approved',
+      actor: 'desktop'
+    })
     expect(r1.ok).toBe(true)
     const result = await p
     expect(result.allowed).toBe(true)
 
-    expect(() => approvals.respond({ approvalId: pending.approval_id, decision: 'approved', actor: 'desktop' })).toThrow(/已处理/)
+    expect(() =>
+      approvals.respond({ approvalId: pending.approval_id, decision: 'approved', actor: 'desktop' })
+    ).toThrow(/已处理/)
   })
 
   it('拒绝审批→Agent 收到拒绝结果', async () => {
-    const p = approvals.decide({ runId: run.id, conversationId: conv.id, name: 'run_command', args: { command: 'ls' }, riskLevel: 'destructive' })
+    const p = approvals.decide({
+      runId: run.id,
+      conversationId: conv.id,
+      name: 'run_command',
+      args: { command: 'ls' },
+      riskLevel: 'destructive'
+    })
     const pending = db.prepare("SELECT * FROM agent_approvals WHERE status='pending'").get()
     approvals.respond({ approvalId: pending.approval_id, decision: 'rejected', actor: 'desktop' })
     const result = await p
@@ -44,10 +64,18 @@ describe('持久化审批服务', () => {
   })
 
   it('参数摘要在批准后变化时置 superseded', async () => {
-    const p = approvals.decide({ runId: run.id, conversationId: conv.id, name: 'write_file', args: { path: 'a.txt' }, riskLevel: 'side_effect' })
+    const p = approvals.decide({
+      runId: run.id,
+      conversationId: conv.id,
+      name: 'write_file',
+      args: { path: 'a.txt' },
+      riskLevel: 'side_effect'
+    })
     const pending = db.prepare("SELECT * FROM agent_approvals WHERE status='pending'").get()
     // 模拟批准后参数被篡改
-    db.prepare("UPDATE agent_approvals SET args_hash='tampered' WHERE approval_id=?").run(pending.approval_id)
+    db.prepare("UPDATE agent_approvals SET args_hash='tampered' WHERE approval_id=?").run(
+      pending.approval_id
+    )
     approvals.respond({ approvalId: pending.approval_id, decision: 'approved', actor: 'desktop' })
     const result = await p
     expect(result.allowed).toBe(false)
@@ -55,16 +83,35 @@ describe('持久化审批服务', () => {
   })
 
   it('取消 Run 时待处理审批被取消', async () => {
-    const p = approvals.decide({ runId: run.id, conversationId: conv.id, name: 'write_file', args: { path: 'b.txt' }, riskLevel: 'side_effect' })
+    const p = approvals.decide({
+      runId: run.id,
+      conversationId: conv.id,
+      name: 'write_file',
+      args: { path: 'b.txt' },
+      riskLevel: 'side_effect'
+    })
     approvals.cancelRun(run.id, 'user')
     const result = await p
     expect(result.allowed).toBe(false)
   })
 
   it('版本不匹配时拒绝审批', async () => {
-    approvals.decide({ runId: run.id, conversationId: conv.id, name: 'write_file', args: { path: 'c.txt' }, riskLevel: 'side_effect' })
+    approvals.decide({
+      runId: run.id,
+      conversationId: conv.id,
+      name: 'write_file',
+      args: { path: 'c.txt' },
+      riskLevel: 'side_effect'
+    })
     const pending = db.prepare("SELECT * FROM agent_approvals WHERE status='pending'").get()
-    expect(() => approvals.respond({ approvalId: pending.approval_id, decision: 'approved', actor: 'desktop', expectedVersion: 99 })).toThrow(/已变化/)
+    expect(() =>
+      approvals.respond({
+        approvalId: pending.approval_id,
+        decision: 'approved',
+        actor: 'desktop',
+        expectedVersion: 99
+      })
+    ).toThrow(/已变化/)
   })
 })
 
@@ -118,7 +165,12 @@ describe('远程事件存储', () => {
     events.authService = auth
 
     const authCtx = { deviceId: device.device_id, role: 'operator', authVersion: 1 }
-    events.record({ type: 'run.status.changed', conversationId: conv.id, runId: run.id, payload: { status: 'running' } })
+    events.record({
+      type: 'run.status.changed',
+      conversationId: conv.id,
+      runId: run.id,
+      payload: { status: 'running' }
+    })
     const snap = events.snapshot(authCtx)
     expect(snap.conversations.map((c) => c.id)).toContain(conv.id)
     expect(snap.runs.length).toBeGreaterThan(0)
@@ -133,7 +185,8 @@ describe('远程事件存储', () => {
     const device = db.prepare('SELECT * FROM remote_devices WHERE device_id=?').get(req.deviceId)
     events.authService = auth
 
-    for (let i = 0; i < 5; i++) events.record({ type: 'message.delta', conversationId: conv.id, payload: { i } })
+    for (let i = 0; i < 5; i++)
+      events.record({ type: 'message.delta', conversationId: conv.id, payload: { i } })
     const page = events.since({ deviceId: device.device_id }, 0, events.epoch())
     expect(page.events.length).toBe(5)
     expect(page.truncated).toBe(false)

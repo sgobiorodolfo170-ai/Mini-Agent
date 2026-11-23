@@ -56,7 +56,8 @@ describe('自绘标题栏', () => {
       { timeout: 5000 }
     )
     const isMax = await electronApp.evaluate(({ BrowserWindow }) =>
-      BrowserWindow.getAllWindows().find((x) => x.webContents.getURL().includes('main-window'))
+      BrowserWindow.getAllWindows()
+        .find((x) => x.webContents.getURL().includes('main-window'))
         .isMaximized()
     )
     expect(isMax).toBe(true)

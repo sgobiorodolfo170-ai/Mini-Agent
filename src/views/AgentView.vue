@@ -10,9 +10,33 @@ const ui = useUiStore()
 const expandedResult = ref({})
 
 // 仅运行中提供停止入口（F17：done/error/stopped 记录不再显示可用停止按钮）
-const isRunning = computed(() => agent.activeRun && agent.activeRun.status === 'running')
+const isRunning = computed(
+  () => agent.activeRun && ['queued', 'running', 'waiting_child'].includes(agent.activeRun.status)
+)
 
 const riskText = { side_effect: '副作用', destructive: '破坏性', read_only: '只读' }
+// 控制模式说明这条 Run 如何从父 Run 派生；验收状态与执行状态分开，避免把
+// 「执行完成」误当成「人工验收通过」。
+const controlModeText = { delegated: '父任务派发', transferred: '移交接手' }
+const acceptanceStatusText = {
+  pending: '待人工验收',
+  accepted: '验收通过',
+  rejected: '验收未通过',
+  escalated: '验收需升级'
+}
+const acceptanceStatusClass = {
+  pending: 'bg-warn text-warn-ink',
+  accepted: 'bg-ok text-ok-ink',
+  rejected: 'bg-bad text-bad-ink',
+  escalated: 'bg-warn text-warn-ink'
+}
+function controlModeLabel(run) {
+  return (run && controlModeText[run.control_mode]) || ''
+}
+function acceptanceStatus(run) {
+  const status = run && run.acceptance_status
+  return acceptanceStatusText[status] ? status : ''
+}
 
 function duration(r) {
   if (!r || !r.started_at) return ''
@@ -45,7 +69,9 @@ async function copyResult(c) {
       :style="{ width: ui.chatListWidth + 'px' }"
       aria-label="执行记录"
     >
-      <div class="px-3 py-3 text-base font-semibold text-ink-primary border-b border-line-subtle bg-panel">
+      <div
+        class="px-3 py-3 text-base font-semibold text-ink-primary border-b border-line-subtle bg-panel"
+      >
         执行记录
       </div>
       <div class="scroll-region flex-1 p-2 space-y-1 bg-panel">
@@ -64,6 +90,9 @@ async function copyResult(c) {
           <div class="truncate text-sm mb-1" :title="r.goal">{{ r.goal }}</div>
           <div class="flex items-center gap-2">
             <StatusBadge :status="r.status" />
+            <span v-if="r.control_mode" class="text-[11px] text-ink-muted">
+              · {{ r.control_mode === 'transferred' ? '接手' : '派发' }}
+            </span>
             <span class="text-ink-muted ml-auto">{{
               new Date(r.started_at).toLocaleString('zh-CN')
             }}</span>
@@ -85,6 +114,28 @@ async function copyResult(c) {
             </h2>
             <div class="text-xs text-ink-muted mt-1 flex items-center gap-2 flex-wrap">
               <StatusBadge :status="agent.activeRun.status" />
+              <span
+                v-if="controlModeLabel(agent.activeRun)"
+                class="badge bg-subtle text-ink-secondary"
+                data-testid="run-control-mode"
+              >
+                {{ controlModeLabel(agent.activeRun) }}
+              </span>
+              <span
+                v-if="acceptanceStatus(agent.activeRun)"
+                class="badge"
+                :class="acceptanceStatusClass[acceptanceStatus(agent.activeRun)]"
+                data-testid="run-acceptance"
+              >
+                {{ acceptanceStatusText[acceptanceStatus(agent.activeRun)] }}
+              </span>
+              <button
+                v-if="agent.activeRun.transfer_to_run_id"
+                class="link"
+                @click="agent.select(agent.activeRun.transfer_to_run_id)"
+              >
+                查看接手任务
+              </button>
               <span class="inline-flex items-center gap-1">
                 <UiIcon name="clock" :size="13" />
                 耗时 {{ duration(agent.activeRun) }}
@@ -162,7 +213,10 @@ async function copyResult(c) {
       </template>
 
       <!-- 空态 -->
-      <div v-else class="h-full flex items-center justify-center text-ink-muted text-center bg-surface">
+      <div
+        v-else
+        class="h-full flex items-center justify-center text-ink-muted text-center bg-surface"
+      >
         <div>
           <div class="text-base text-ink-secondary mb-2">在会话中开启「任务模式」发起智能任务</div>
           <div class="text-xs">只读工具自动执行；写文件 / 执行命令需逐次确认</div>

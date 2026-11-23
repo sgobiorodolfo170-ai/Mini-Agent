@@ -15,10 +15,14 @@ export const useSessionsStore = defineStore('sessions', {
   getters: {
     childrenOf: (state) => (parentId) => state.list.filter((s) => s.parentId === parentId),
     running(state) {
-      return state.list.filter((s) => ['running', 'streaming', 'pending'].includes(s.status))
+      return state.list.filter((s) =>
+        ['queued', 'running', 'waiting_child', 'streaming', 'pending'].includes(s.status)
+      )
     },
     finished(state) {
-      return state.list.filter((s) => ['done', 'stopped', 'error'].includes(s.status))
+      return state.list.filter((s) =>
+        ['done', 'stopped', 'error', 'max_steps', 'transferred', 'interrupted'].includes(s.status)
+      )
     }
   },
   actions: {

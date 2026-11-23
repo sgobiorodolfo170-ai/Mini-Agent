@@ -25,7 +25,7 @@ export const useChatStore = defineStore('chat', {
       return state.conversations.find((c) => c.id === state.activeId) || null
     },
     hasStreaming(state) {
-      return state.messages.some((m) => m.status === 'streaming')
+      return state.messages.some((m) => ['streaming', 'pending'].includes(m.status))
     },
     filtering(state) {
       return !!state.filterQuery
@@ -178,10 +178,10 @@ export const useChatStore = defineStore('chat', {
         m.status = 'streaming'
       } else if (ev.type === 'done') {
         m.content = ev.content
-        m.status = 'done'
+        m.status = ev.status || 'done'
         if (ev.meta) m.meta = ev.meta
       } else if (ev.type === 'stopped') {
-        m.status = 'stopped'
+        m.status = ev.status || 'stopped'
         if (typeof ev.content === 'string') m.content = ev.content
       } else if (ev.type === 'error') {
         m.status = 'error'

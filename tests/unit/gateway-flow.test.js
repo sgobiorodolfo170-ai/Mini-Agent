@@ -141,6 +141,47 @@ describe('sendChat 全链路', () => {
     expect(assistant.content).toBe('开头')
   })
 
+  it('新发送取代旧流后，旧消息落 stopped 而不是一直 streaming', async () => {
+    const { convId } = seed()
+    let calls = 0
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, opts) => {
+      calls++
+      if (calls === 1) {
+        return {
+          ok: true,
+          status: 200,
+          body: (async function* () {
+            yield Buffer.from('data: {"choices":[{"delta":{"content":"旧回答"}}]}\n\n')
+            await new Promise((_, reject) => {
+              const onAbort = () =>
+                reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+              if (opts.signal.aborted) onAbort()
+              else opts.signal.addEventListener('abort', onAbort)
+            })
+          })()
+        }
+      }
+      return sseRes(['data: {"choices":[{"delta":{"content":"新回答"}}]}\n\n', 'data: [DONE]\n\n'])
+    })
+    const r1 = await gateway.sendChat({ conversationId: convId, content: '第一问' })
+    expect(
+      await waitFor(() =>
+        events.some((e) => e.p.type === 'delta' && e.p.msgId === r1.assistantMsgId)
+      )
+    ).toBe(true)
+
+    const r2 = await gateway.sendChat({ conversationId: convId, content: '第二问' })
+    // 旧流被取代：必须在发起新发送时立即落 stopped，否则界面永久显示「生成中」
+    expect(repos.getMessage(dbm.get(), r1.assistantMsgId).status).toBe('stopped')
+    expect(
+      events.some(
+        (e) => e.ch === 'chat:event' && e.p.type === 'stopped' && e.p.msgId === r1.assistantMsgId
+      )
+    ).toBe(true)
+    expect(await waitFor(() => doneOf(r2.assistantMsgId))).toBe(true)
+    expect(repos.getMessage(dbm.get(), r2.assistantMsgId).status).toBe('done')
+  })
+
   it('regenerate 删除旧回复并重新请求', async () => {
     const { convId } = seed()
     let calls = 0

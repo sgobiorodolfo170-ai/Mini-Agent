@@ -7,8 +7,11 @@ import { createMockServer } from './mock-server'
 export async function launchApp({ reuseUserData = null, env = {} } = {}) {
   const userData = reuseUserData || fs.mkdtempSync(path.join(os.tmpdir(), 'miniagent-e2e-'))
   const mock = await createMockServer()
+  const executablePath = process.env.MINIAGENT_E2E_EXECUTABLE
+  const packaged = process.env.MINIAGENT_E2E_PACKAGED === '1'
   const electronApp = await _electron.launch({
-    args: ['.'],
+    executablePath,
+    args: packaged ? [] : ['.'],
     cwd: process.cwd(),
     env: {
       ...process.env,

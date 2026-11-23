@@ -23,23 +23,40 @@ describe('应用基础', () => {
   it('会话管理：新建 / 重命名 / 置顶 / 删除（删除需确认）', async () => {
     const win = ctx.win
     await win.getByTestId('new-conv').click()
-    await win.locator('[data-testid="conv-item"]').first().waitFor()
+    const firstRow = win.locator('[data-testid="conv-item"]').first()
+    await firstRow.waitFor()
 
-    await win.locator('[data-testid="conv-item"]').first().dblclick()
+    // 行内「…」菜单是重命名 / 置顶 / 删除的唯一入口
+    await firstRow.hover()
+    await firstRow.getByRole('button', { name: '会话操作' }).click()
+    await win.getByRole('menuitem', { name: '重命名' }).click()
     await win.locator('input.border-b').waitFor({ timeout: 5000 })
     await win.locator('input.border-b').fill('集成会话')
     await win.keyboard.press('Enter')
     await win.locator('[data-testid="conv-item"]', { hasText: '集成会话' }).first().waitFor()
 
-    await win.locator('[title="置顶/取消置顶"]').first().click()
-    await win.locator('[title="已置顶"]').first().waitFor()
+    await firstRow.hover()
+    await firstRow.getByRole('button', { name: '会话操作' }).click()
+    await win.getByRole('menuitem', { name: '置顶' }).click()
+    await expect
+      .poll(() =>
+        win.evaluate(async () => {
+          const list = await window.api.conversations.list()
+          return list.find((c) => c.title === '集成会话')?.pinned
+        })
+      )
+      .toBe(1)
 
-    await win.locator('[title="删除"]').first().click()
+    await firstRow.hover()
+    await firstRow.getByRole('button', { name: '会话操作' }).click()
+    await win.getByRole('menuitem', { name: '删除' }).click()
     // F04：删除进入确认弹窗，取消不落库，确认后才移除
     await win.getByText('删除会话「集成会话」？').waitFor()
     await win.getByText('取消', { exact: true }).click()
     await win.locator('[data-testid="conv-item"]', { hasText: '集成会话' }).first().waitFor()
-    await win.locator('[title="删除"]').first().click()
+    await firstRow.hover()
+    await firstRow.getByRole('button', { name: '会话操作' }).click()
+    await win.getByRole('menuitem', { name: '删除' }).click()
     await win.getByText('删除会话「集成会话」？').waitFor()
     await win.getByText('删除', { exact: true }).last().click()
     await win

@@ -84,6 +84,17 @@ describe('settings store 初始化', () => {
     expect(s2.showBall).toBe(false)
   })
 
+  it('closeToTray 默认开启，显式关闭时为 false（关闭按钮改为退出软件）', async () => {
+    const s = useSettingsStore()
+    await s.init()
+    expect(s.closeToTray).toBe(true)
+
+    window.api.settings.all.mockResolvedValue({ closeToTray: false })
+    const s2 = useSettingsStore()
+    await s2.init()
+    expect(s2.closeToTray).toBe(false)
+  })
+
   it('init 完成后 initialized 置真（F09：表单初始化同步依赖此标志）', async () => {
     const s = useSettingsStore()
     expect(s.initialized).toBe(false)

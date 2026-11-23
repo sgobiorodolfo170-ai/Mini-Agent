@@ -22,6 +22,7 @@ export function createMockServer() {
     agentFile: '',
     // 集群验证：主 Agent 第一次调用 spawn_agent 时派发多个子任务
     clusterSpawn: false,
+    transferRun: false,
     // 记录同时在途的子 Agent 数量峰值，用来证明「并发」而非串行
     subInFlight: 0,
     subPeak: 0
@@ -122,6 +123,33 @@ export function createMockServer() {
           }, 120)
           return
         }
+        if (body.tools && state.transferRun && !hasToolResult) {
+          const calls = [
+            {
+              index: 0,
+              id: 'handoff',
+              type: 'function',
+              function: {
+                name: 'run_transfer',
+                arguments: JSON.stringify({ goal: '接手目标' })
+              }
+            },
+            {
+              index: 1,
+              id: 'after-handoff',
+              type: 'function',
+              function: {
+                name: 'run_dispatch',
+                arguments: JSON.stringify({ goal: '不得派发的目标' })
+              }
+            }
+          ]
+          sse(res, [
+            JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: calls } }] }),
+            JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })
+          ])
+          return
+        }
         if (body.tools && state.clusterSpawn) {
           // 已经收回子 Agent 结论 → 汇总收尾；否则派发一次批量 spawn
           const sawSubResult = msgs.some(
@@ -155,7 +183,7 @@ export function createMockServer() {
                         type: 'function',
                         function: {
                           name: 'spawn_agent',
-                          arguments: JSON.stringify({ goals: ['子任务一', '子任务二', '子任务三'] })
+                          arguments: JSON.stringify({ goals: ['子任务一', '子任务二'] })
                         }
                       }
                     ]

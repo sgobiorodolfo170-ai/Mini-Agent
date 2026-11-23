@@ -1,7 +1,8 @@
 const fs = require('fs')
 const path = require('path')
 
-const SCHEMA_VERSION = 8
+const { RUN_SCHEMA, recoverRuns } = require('./run-storage')
+const SCHEMA_VERSION = 9
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS settings (
@@ -238,7 +239,36 @@ function migrate(db) {
     // v7 → v8：局域网远程控制、持久审批与事件恢复。先完成旧列迁移再建远程索引。
     require('../main/remote/schema').REMOTE_SCHEMA_SQL
     db.exec(require('../main/remote/schema').REMOTE_SCHEMA_SQL)
-    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
+    if (current < 9) {
+      const { transaction } = require('../main/remote/protocol')
+      transaction(db, () => {
+        for (const [name, type] of Object.entries({
+          submitted_at: 'INTEGER',
+          claimed_at: 'INTEGER',
+          finished_reason: 'TEXT',
+          user_message_id: 'TEXT',
+          assistant_message_id: 'TEXT',
+          transfer_to_run_id: 'TEXT',
+          run_spec_json: 'TEXT'
+        })) {
+          if (!columnExists(db, 'agent_runs', name))
+            db.exec(`ALTER TABLE agent_runs ADD COLUMN ${name} ${type}`)
+        }
+        for (const [column, role, key] of [
+          ['user_message_id', 'user', 'runId'],
+          ['assistant_message_id', 'assistant', 'agentRunId']
+        ]) {
+          db.exec(`UPDATE agent_runs SET ${column}=(SELECT CASE WHEN COUNT(*)=1 THEN MAX(m.id) END
+            FROM messages m WHERE m.conversation_id=agent_runs.conversation_id AND m.role='${role}'
+              AND json_extract(CASE WHEN json_valid(m.meta) THEN m.meta END,'$.${key}')=agent_runs.id)`)
+        }
+        db.exec(`UPDATE agent_runs SET transfer_to_run_id=(SELECT CASE WHEN COUNT(*)=1 THEN MAX(child.id) END
+          FROM agent_runs child WHERE child.parent_run_id=agent_runs.id AND child.control_mode='transferred')
+          WHERE status='transferred'`)
+        db.exec(RUN_SCHEMA)
+        db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
+      })
+    }
   }
 }
 
@@ -253,16 +283,7 @@ function open(dbPath) {
   db.exec('PRAGMA journal_mode = WAL')
   db.exec('PRAGMA foreign_keys = ON')
   migrate(db)
-  // Any 'streaming' message left over from a previous session is a zombie —
-  // the app is starting fresh, no stream can still be attached to it (the
-  // done update is lost when the process dies mid-stream). Mark them stopped.
-  db.prepare("UPDATE messages SET status = 'stopped' WHERE status = 'streaming'").run()
-  // 同理回收运行记录：异常退出后 agent_runs 会永久停在 running，
-  // 列表会一直显示「执行中」而停止按钮实际无效。
-  db.prepare(
-    "UPDATE agent_runs SET status = 'stopped', ended_at = COALESCE(ended_at, ?) WHERE status IN ('running','waiting_child')"
-  ).run(Date.now())
-  db.prepare("UPDATE agent_approvals SET status='cancelled', decision_reason='app_restarted' WHERE status='pending'").run()
+  recoverRuns(db)
   globalThis.__miniagentDB = db
   globalThis.__miniagentDBInfo = { path: dbPath, driver: 'node:sqlite' }
   return db

@@ -12,7 +12,9 @@ function canAutoTitle() {
 }
 
 function fallbackTitle(content) {
-  const s = String(content || '').replace(/\s+/g, ' ').trim()
+  const s = String(content || '')
+    .replace(/\s+/g, ' ')
+    .trim()
   return (s.slice(0, FALLBACK_MAX) || '新会话').trim() || '新会话'
 }
 

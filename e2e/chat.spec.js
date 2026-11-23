@@ -72,7 +72,7 @@ describe('对话全链路（真实 UI → IPC → 网关 → mock 模型服务�
     await win.getByText('E2E模拟回复').waitFor({ timeout: 25000 })
     await win.getByText('生成中…').waitFor({ state: 'detached', timeout: 20000 })
 
-    await win.getByText('重新生成').click()
+    await win.getByRole('button', { name: '重新生成回答' }).click()
     await win.getByText('生成中…').waitFor({ state: 'detached', timeout: 25000 })
     expect(await win.getByText('E2E模拟回复').count()).toBe(1)
   })

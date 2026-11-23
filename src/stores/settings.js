@@ -10,6 +10,7 @@ export const useSettingsStore = defineStore('settings', {
     hotkeys: { quick: 'Alt+Space', selection: 'Alt+Q', capture: 'Alt+S' },
     hotkeyReport: null,
     showBall: true,
+    closeToTray: true,
     // 本地嵌入模型包（onnxruntime + BGE 中文系列）
     modelPackages: [],
     modelProgress: null, // { id, file, received, totalBytes, done, status, error }
@@ -31,6 +32,7 @@ export const useSettingsStore = defineStore('settings', {
       this.autostart = await window.api.app.autostart()
       this.hotkeys = await window.api.app.hotkeys()
       this.showBall = this.settings.showBall !== false
+      this.closeToTray = this.settings.closeToTray !== false
       await this.reloadProviders()
       this.initialized = true
     },

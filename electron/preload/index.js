@@ -76,6 +76,8 @@ function buildMain() {
     },
     agent: {
       run: (o) => inv('agent:run', o),
+      status: (runId) => inv('agent:status', runId),
+      result: (o) => inv('agent:result', o),
       stop: (runId) => inv('agent:stop', runId),
       pause: (runId) => inv('agent:pause', runId),
       resume: (runId) => inv('agent:resume', runId),
@@ -104,6 +106,12 @@ function buildMain() {
       since: (o) => inv('events:since', o),
       recent: (o) => inv('events:recent', o),
       stats: () => inv('events:stats')
+    },
+    logs: {
+      list: (o) => inv('logs:list', o),
+      stats: () => inv('logs:stats'),
+      clear: () => inv('logs:clear'),
+      openFolder: () => inv('logs:openFolder')
     },
     hooks: {
       meta: () => inv('hooks:meta'),
@@ -138,6 +146,7 @@ function buildMain() {
       minimize: () => inv('win:minimize'),
       toggleMaximize: () => inv('win:toggleMaximize'),
       isMaximized: () => inv('win:isMaximized'),
+      close: () => inv('win:close', 'main'),
       hide: () => inv('win:hide', 'main')
     },
     on

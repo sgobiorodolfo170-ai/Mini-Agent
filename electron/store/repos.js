@@ -352,7 +352,29 @@ function touchConversation(db, id) {
   db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(now(), id)
 }
 
+function assertNoActiveRun(db, conversationId) {
+  if (
+    db
+      .prepare(
+        `SELECT 1 FROM agent_runs WHERE conversation_id=? AND status IN ('queued','running','waiting_child')`
+      )
+      .get(conversationId)
+  ) {
+    throw new Error('SESSION_BUSY：会话正在执行 Agent 任务')
+  }
+}
+
 function softDeleteConversation(db, id) {
+  assertNoActiveRun(db, id)
+  if (
+    db
+      .prepare(
+        `SELECT 1 FROM messages WHERE conversation_id=? AND deleted_at IS NULL AND status='streaming'`
+      )
+      .get(id)
+  ) {
+    throw new Error('SESSION_BUSY：会话正在生成回复')
+  }
   const t = now()
   db.prepare('UPDATE conversations SET deleted_at=?, updated_at=? WHERE id=?').run(t, t, id)
 }
@@ -455,6 +477,8 @@ function softDeleteMessagesFrom(db, conversationId, fromSeq) {
 function softDeleteMessage(db, id) {
   const cur = getMessage(db, id)
   if (!cur) return null
+  assertNoActiveRun(db, cur.conversationId)
+  if (cur.status === 'streaming') throw new Error('SESSION_BUSY：回复还在生成')
   db.prepare('UPDATE messages SET deleted_at=?, updated_at=? WHERE id=?').run(now(), now(), id)
   return getMessage(db, id)
 }
@@ -640,13 +664,13 @@ function getKbStats(db, kbId) {
 
 // ---------- agent ----------
 // Run 状态机（方案四 §5.1）：终态不可逆；重试必须创建新 Run，不得原地重启。
-const RUN_TERMINAL = ['done', 'stopped', 'error', 'max_steps', 'transferred']
+const RUN_TERMINAL = ['done', 'stopped', 'error', 'max_steps', 'transferred', 'interrupted']
 const RUN_ACTIVE = ['queued', 'running', 'waiting_child']
 // 允许的来源状态；未列出的转换一律拒绝。只约束本产品写库，不假设任务必经每个中间态。
 const RUN_NEXT = {
   queued: ['running', 'stopped', 'error'],
-  running: ['waiting_child', 'done', 'stopped', 'error', 'max_steps', 'transferred'],
-  waiting_child: ['running', 'stopped', 'error']
+  running: ['waiting_child', 'done', 'stopped', 'error', 'max_steps', 'transferred', 'interrupted'],
+  waiting_child: ['running', 'stopped', 'error', 'interrupted']
 }
 
 const RUN_COLUMNS = `id, conversation_id AS conversationId, goal, status,
@@ -654,7 +678,9 @@ const RUN_COLUMNS = `id, conversation_id AS conversationId, goal, status,
   parent_run_id AS parentRunId, control_mode AS controlMode, mandate_json AS mandateJson,
   acceptance_policy AS acceptancePolicy, acceptance_status AS acceptanceStatus,
   acceptance_result AS acceptanceResult, trace_id AS traceId,
-  idempotency_key AS idempotencyKey, version`
+  idempotency_key AS idempotencyKey, version, submitted_at AS submittedAt,
+  claimed_at AS claimedAt, finished_reason AS finishedReason, user_message_id AS userMessageId,
+  assistant_message_id AS assistantMessageId, transfer_to_run_id AS transferToRunId, run_spec_json AS runSpecJson`
 
 function isRunTerminal(status) {
   return RUN_TERMINAL.includes(status)
@@ -900,6 +926,7 @@ module.exports = {
   updateConversation,
   touchConversation,
   softDeleteConversation,
+  assertNoActiveRun,
   searchConversations,
   listMessages,
   nextSeq,

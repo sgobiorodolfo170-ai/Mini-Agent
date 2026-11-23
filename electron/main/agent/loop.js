@@ -16,20 +16,25 @@ async function runAgentLoop({
   decide,
   execute,
   onEvent,
-  isStopped
+  isStopped,
+  isTransferred
 }) {
   const msgs = [...messages]
   let steps = 0
   let status = 'done'
   let endedWithToolCalls = false
 
-  while (steps < maxSteps) {
+  loop: while (steps < maxSteps) {
     if (isStopped && isStopped()) {
       status = 'stopped'
       break
     }
     steps++
     const resp = await modelCall(msgs)
+    if (resp?.stopped || isStopped?.()) {
+      status = 'stopped'
+      break
+    }
     const toolCalls = (resp && resp.toolCalls) || []
     if (resp && resp.content) {
       msgs.push({
@@ -49,6 +54,10 @@ async function runAgentLoop({
     endedWithToolCalls = true
 
     for (const tc of toolCalls) {
+      if (isStopped?.()) {
+        status = 'stopped'
+        break loop
+      }
       const name = tc.function && tc.function.name
       const args = safeParseJson((tc.function && tc.function.arguments) || '{}') || {}
       const tool = toolMap[name]
@@ -71,7 +80,7 @@ async function runAgentLoop({
         resultText = (decision && decision.denyMessage) || '用户拒绝执行该操作'
       } else {
         try {
-          const r = await execute(tool, args)
+          const r = await execute(tool, args, tc.id)
           resultText = typeof r === 'string' ? r : JSON.stringify(r)
         } catch (e) {
           ok = false
@@ -82,6 +91,14 @@ async function runAgentLoop({
         resultText = resultText.slice(0, 20000) + '…(截断)'
       if (onEvent) onEvent('tool-done', { name, ok, result: resultText })
       msgs.push({ role: 'tool', tool_call_id: tc.id || name, content: resultText })
+      if (isTransferred?.()) {
+        status = 'transferred'
+        break loop
+      }
+      if (isStopped?.()) {
+        status = 'stopped'
+        break loop
+      }
     }
   }
   if (status === 'done' && endedWithToolCalls) status = 'max_steps'

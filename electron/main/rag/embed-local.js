@@ -1,5 +1,6 @@
 const { loadTokenizer } = require('./tokenizer-bert')
 const { onnxPath, packageDir } = require('./local-models')
+const { isShuttingDown } = require('../lifecycle')
 
 // BGE v1.5 中文模型的查询侧指令（官方建议：短查询检索场景加前缀可显著提升召回）。
 const QUERY_INSTRUCTION = '为这个句子生成表示以用于检索相关文章:'
@@ -98,7 +99,30 @@ async function embedWithSession({
 // 会话缓存：同一模型文件只创建一次 session（加载+图优化较慢）。
 const sessions = new Map()
 
+// 正在使用 session 的嵌入批次计数：退出时先等它们结束，避免 release 运行中的 ORT session。
+let inFlightEmbeds = 0
+let idleWaiters = []
+
+function beginEmbed() {
+  inFlightEmbeds++
+}
+
+function endEmbed() {
+  inFlightEmbeds = Math.max(0, inFlightEmbeds - 1)
+  if (inFlightEmbeds === 0) {
+    const waiters = idleWaiters
+    idleWaiters = []
+    for (const resolve of waiters) resolve()
+  }
+}
+
+function waitForIdle() {
+  if (inFlightEmbeds === 0) return Promise.resolve()
+  return new Promise((resolve) => idleWaiters.push(resolve))
+}
+
 async function getSession(modelsRoot, pkg, ortImpl = require('onnxruntime-node')) {
+  if (isShuttingDown()) throw new Error('应用正在退出，已取消模型加载')
   const key = pkg.id
   if (sessions.has(key)) return sessions.get(key)
   const modelFile = onnxPath(modelsRoot, pkg)
@@ -113,19 +137,37 @@ function clearSessionCache() {
   sessions.clear()
 }
 
+async function disposeSessions() {
+  // 先等正在跑的嵌入批次结束，再释放 session，避免推理中途被 release。
+  await waitForIdle()
+  const current = [...sessions.values()]
+  sessions.clear()
+  await Promise.allSettled(
+    current.map((session) =>
+      session && typeof session.release === 'function' ? session.release() : undefined
+    )
+  )
+}
+
 // 高层入口：本地嵌入一批文本。queryMode 时自动加 BGE 查询指令前缀。
 async function embedTextsLocal({ modelsRoot, pkg, texts, queryMode = false, batchSize = 8 }) {
-  const ortImpl = require('onnxruntime-node')
-  const session = await getSession(modelsRoot, pkg, ortImpl)
-  const tokenizer = loadTokenizer(packageDir(modelsRoot, pkg))
-  return embedWithSession({
-    session,
-    tokenizer,
-    texts,
-    queryMode,
-    batchSize,
-    ortImpl
-  })
+  if (isShuttingDown()) throw new Error('应用正在退出，已取消嵌入任务')
+  beginEmbed()
+  try {
+    const ortImpl = require('onnxruntime-node')
+    const session = await getSession(modelsRoot, pkg, ortImpl)
+    const tokenizer = loadTokenizer(packageDir(modelsRoot, pkg))
+    return await embedWithSession({
+      session,
+      tokenizer,
+      texts,
+      queryMode,
+      batchSize,
+      ortImpl
+    })
+  } finally {
+    endEmbed()
+  }
 }
 
 module.exports = {
@@ -136,5 +178,6 @@ module.exports = {
   embedWithSession,
   getSession,
   clearSessionCache,
+  disposeSessions,
   embedTextsLocal
 }

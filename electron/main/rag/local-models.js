@@ -1,5 +1,6 @@
 const fs = require('fs')
 const path = require('path')
+const { isShuttingDown } = require('../lifecycle')
 
 // 本地嵌入模型包：BGE 中文 v1.5 系列 ONNX 导出（Xenova 仓库），量化/非量化各一。
 // 一键下载到 userData/models/<id>/，每包只需 model.onnx + tokenizer.json + config.json。
@@ -140,6 +141,7 @@ async function downloadPackage(
   const total = pkg.files.length
   let done = 0
   for (const rel of pkg.files) {
+    if (isShuttingDown()) return { id: pkg.id, dir, aborted: true }
     const dest = path.join(dir, rel.replace('onnx/', ''))
     if (fsImpl.existsSync(dest)) {
       done++

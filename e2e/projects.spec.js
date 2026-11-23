@@ -37,18 +37,37 @@ describe('项目工作目录', () => {
     expect(await win.locator('[data-testid="conv-item"]').count()).toBe(1)
 
     // 从项目列表内的会话行置顶 → 会话移入「置顶」组，项目组内清空
-    await win.locator('[data-testid="project-item"] [title="置顶/取消置顶"]').click()
-    await win.locator('[title="已置顶"]').first().waitFor()
+    const projectConv = win
+      .locator('[data-testid="project-item"]', { hasText: '测试项目' })
+      .locator('[data-testid="conv-item"]')
+      .first()
+    await projectConv.hover()
+    await projectConv.getByRole('button', { name: '会话操作' }).click()
+    await win.getByRole('menuitem', { name: '置顶' }).click()
+    await expect
+      .poll(() =>
+        win.evaluate(async () => {
+          const list = await window.api.conversations.list()
+          return list[0]?.pinned
+        })
+      )
+      .toBe(1)
     expect(
       await win.locator('[data-testid="project-item"] [data-testid="conv-item"]').count()
     ).toBe(0)
 
     // 取消置顶回归项目组
-    await win.locator('[title="置顶/取消置顶"]').first().click()
+    const pinnedRow = win.locator('[data-testid="conv-item"]').first()
+    await pinnedRow.hover()
+    await pinnedRow.getByRole('button', { name: '会话操作' }).click()
+    await win.getByRole('menuitem', { name: '取消置顶' }).click()
     await win.locator('[data-testid="project-item"] [data-testid="conv-item"]').first().waitFor()
 
     // 删除项目（需确认）→ 项目行消失，会话回归「最近」
-    await win.locator('[title="删除项目"]').click()
+    const projectRow = win.locator('[data-testid="project-item"]', { hasText: '测试项目' })
+    await projectRow.hover()
+    await projectRow.getByRole('button', { name: '项目操作', exact: true }).click()
+    await win.getByRole('menuitem', { name: '删除项目' }).click()
     await win.getByText('删除项目「测试项目」？').waitFor()
     await win.getByText('删除', { exact: true }).last().click()
     await win.locator('[data-testid="project-item"]').waitFor({ state: 'detached' })

@@ -7,6 +7,7 @@ const { webSearch } = require('./web-search')
 const { createBrowserSession } = require('./browser-session')
 const { withMcpServer } = require('./mcp-client')
 const { upsertMemoryFile } = require('./memory')
+const { processRegistry } = require('../lifecycle')
 
 function htmlToText(html) {
   return String(html)
@@ -24,7 +25,7 @@ function htmlToText(html) {
 
 function runPowerShell(command, cwd, timeoutMs = 60000) {
   return new Promise((resolve) => {
-    execFile(
+    const child = execFile(
       'powershell.exe',
       ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', String(command)],
       {
@@ -45,6 +46,7 @@ function runPowerShell(command, cwd, timeoutMs = 60000) {
         resolve({ ok: !err, output: out || '(无输出)' })
       }
     )
+    processRegistry.track(child)
   })
 }
 
@@ -372,6 +374,82 @@ function defineTools(ctx) {
         return upsertMemoryFile(ctx.memoryPath, name, content)
       }
     },
+    ...[
+      [
+        'run_dispatch',
+        'side_effect',
+        '派发子任务并立即返回 runId，父任务继续执行。',
+        {
+          goal: { type: 'string' },
+          conversationId: { type: 'string' },
+          title: { type: 'string' }
+        },
+        ['goal'],
+        ctx.runDispatch
+      ],
+      [
+        'run_transfer',
+        'side_effect',
+        '原子移交给子任务，成功后当前任务立即退出。',
+        {
+          goal: { type: 'string' },
+          conversationId: { type: 'string' },
+          title: { type: 'string' }
+        },
+        ['goal'],
+        ctx.runTransfer
+      ],
+      [
+        'run_wait',
+        'readonly',
+        '暂停当前任务，等待指定的直属委派子任务。',
+        {
+          runIds: { type: 'array', items: { type: 'string' } },
+          timeoutMs: { type: 'number' }
+        },
+        ['runIds'],
+        ctx.runWait
+      ],
+      [
+        'run_status',
+        'readonly',
+        '按 runId 查询当前任务派出的子任务状态。',
+        {
+          runId: { type: 'string' }
+        },
+        ['runId'],
+        ctx.runStatus
+      ],
+      [
+        'run_result',
+        'readonly',
+        '按 runId 查询当前任务派出的子任务结果。',
+        {
+          runId: { type: 'string' },
+          maxChars: { type: 'number' }
+        },
+        ['runId'],
+        ctx.runResult
+      ],
+      [
+        'run_cancel',
+        'side_effect',
+        '取消当前任务直接委派的子任务。',
+        {
+          runId: { type: 'string' }
+        },
+        ['runId'],
+        ctx.runCancel
+      ]
+    ]
+      .filter(([, , , , , handler]) => typeof handler === 'function')
+      .map(([name, risk, description, properties, required, handler]) => ({
+        name,
+        risk,
+        description,
+        parameters: { type: 'object', properties, required },
+        handler
+      })),
     {
       name: 'session_create',
       risk: 'side_effect',
@@ -401,7 +479,7 @@ function defineTools(ctx) {
       name: 'session_send',
       risk: 'side_effect',
       description:
-        '向指定会话发送提示词。mode=chat 按普通对话回答，mode=agent 以任务模式执行（可再调用工具）。同一会话不允许并发发送。controlMode 仅任务模式有效：delegated=派活儿等结果（默认），transferred=把任务整个交出去、自己不再继续',
+        '向指定会话发送提示词。mode=chat 按普通对话回答，mode=agent 以任务模式执行（可再调用工具）。同一会话不允许并发发送。controlMode 仅任务模式有效：delegated=派发后继续（用 run_wait 等待），transferred=把任务整个交出去、自己不再继续',
       parameters: {
         type: 'object',
         properties: {
@@ -420,7 +498,10 @@ function defineTools(ctx) {
         },
         required: ['conversationId', 'content']
       },
-      handler: async ({ conversationId, content, mode, controlMode, acceptanceCriteria }) => {
+      handler: async (
+        { conversationId, content, mode, controlMode, acceptanceCriteria },
+        callId
+      ) => {
         if (typeof ctx.sendToSession !== 'function') throw new Error('会话管理未启用')
         if (controlMode && !['delegated', 'transferred'].includes(controlMode)) {
           throw new Error(`非法的 controlMode: ${controlMode}（仅支持 delegated / transferred）`)
@@ -430,6 +511,7 @@ function defineTools(ctx) {
           content,
           mode: mode === 'agent' ? 'agent' : 'chat',
           controlMode: controlMode || 'delegated',
+          ...(callId ? { idempotencyKey: callId } : {}),
           acceptancePolicy: acceptanceCriteria
             ? {
                 schemaVersion: 1,
@@ -512,7 +594,7 @@ function defineTools(ctx) {
       name: 'spawn_agent',
       risk: 'side_effect',
       description:
-        '派生子 Agent 独立完成子任务并只返回最终结论（子 Agent 不可再派生；其工具调用走同样的确认流程）。开启 Agent 集群时可用 goals 一次派发多个并行子任务',
+        '派生子 Agent 独立完成子任务并只返回最终结论（子任务拥有独立会话和运行记录）。开启 Agent 集群时可用 goals 一次派发多个并行子任务',
       parameters: {
         type: 'object',
         properties: {
@@ -524,14 +606,15 @@ function defineTools(ctx) {
           }
         }
       },
-      handler: async ({ goal, goals }) => {
+      handler: async ({ goal, goals }, callId) => {
         const list = Array.isArray(goals)
           ? goals.map((g) => String(g || '').trim()).filter(Boolean)
           : []
         const g = String(goal || '').trim()
         if (!g && !list.length) throw new Error('goal 不能为空')
         if (typeof ctx.spawnAgent !== 'function') throw new Error('子 Agent 未启用')
-        return ctx.spawnAgent(list.length > 1 ? { goals: list } : { goal: g || list[0] })
+        const payload = list.length > 1 ? { goals: list } : { goal: g || list[0] }
+        return callId ? ctx.spawnAgent(payload, callId) : ctx.spawnAgent(payload)
       }
     },
     {

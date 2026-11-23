@@ -40,7 +40,11 @@ function seed() {
     label: '一号',
     secretEnc: 'plain:' + Buffer.from('sk-1', 'utf8').toString('base64')
   })
-  const conv = repos.createConversation(dbm.get(), { title: '新会话', providerId: pid, model: 'm1' })
+  const conv = repos.createConversation(dbm.get(), {
+    title: '新会话',
+    providerId: pid,
+    model: 'm1'
+  })
   return conv.id
 }
 

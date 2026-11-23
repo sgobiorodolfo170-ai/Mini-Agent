@@ -1,4 +1,15 @@
 const os = require('os')
+const { createHash } = require('node:crypto')
+const { transaction, canonicalJson, remoteError } = require('../remote/protocol')
+const { recordRunState } = require('../../store/run-storage')
+const {
+  createRunQueue,
+  transition,
+  followTransfer,
+  getRunStatus,
+  getRunResult,
+  waitForRuns
+} = require('./run-runtime')
 const path = require('path')
 const repos = require('../../store/repos')
 const dbm = require('../../store/db')
@@ -19,6 +30,7 @@ const { normalizeMandate, defaultSubMandate, authorizeToolCall } = require('./ma
 const { createSessionBridge } = require('./session-bridge')
 const { createApprovalService } = require('../remote/approval-service')
 const { createRunControl } = require('../remote/run-control-service')
+const { isShuttingDown } = require('../lifecycle')
 
 let controlRuntime = null
 function getControlRuntime(db) {
@@ -27,7 +39,11 @@ function getControlRuntime(db) {
       db,
       approvals: createApprovalService({ db, events: globalThis.__miniagentRemoteEvents || null })
     }
-    controlRuntime.runs = createRunControl({ db, agent: { stopRun }, events: globalThis.__miniagentRemoteEvents || null })
+    controlRuntime.runs = createRunControl({
+      db,
+      agent: { stopRun },
+      events: globalThis.__miniagentRemoteEvents || null
+    })
   }
   return controlRuntime
 }
@@ -152,9 +168,9 @@ async function withKeyRetry(db, provider, fn) {
   throw new Error(lastErr || '无可用 Key')
 }
 
-// 最大派生深度（方案四 §7.1）：沿 parent_run_id 链计算，默认只允许一层。
+// 沿 parent_run_id 链计算派生和移交的深度。
 // 集中在此处配置，禁止各模块硬编码不同值。
-const MAX_DELEGATION_DEPTH = 1
+const MAX_DELEGATION_DEPTH = 2
 
 function depthOfRun(db, runId) {
   let depth = 0
@@ -172,119 +188,301 @@ function depthOfRun(db, runId) {
 }
 
 // 校验能否把 childConversation 的任务挂到 parentRunId 之下
-function assertCanDelegate(db, parentRunId) {
+function assertCanDelegate(db, parentRunId, controlMode, count) {
   const parent = repos.getRun(db, parentRunId)
-  if (!parent) throw new Error('父任务不存在')
-  if (!['running', 'waiting_child'].includes(parent.status)) {
-    throw new Error(`父任务状态 ${parent.status} 不允许派生`)
+  const state = active.get(parentRunId)
+  if (!parent || parent.status !== 'running' || !state || state.stopped) {
+    throw new Error('父任务当前不可派发')
   }
-  if (parent.controlMode === 'transferred') throw new Error('已移交的任务不可再派生')
-  if (parent.parentRunId && !parent.mandateJson) throw new Error('父任务缺少授权快照')
-  // 深度：沿 parent_run_id 链
-  if (depthOfRun(db, parentRunId) + 1 > MAX_DELEGATION_DEPTH) {
-    throw new Error(`派生深度已达上限(${MAX_DELEGATION_DEPTH} 层)`)
+  if (state.mandate && !state.mandate.canDelegate) throw new Error('父任务授权未包含派发权限')
+  if (depthOfRun(db, parentRunId) >= MAX_DELEGATION_DEPTH) throw new Error('已达到任务派发深度上限')
+  const children = repos
+    .listChildRuns(db, parentRunId)
+    .filter((child) => child.controlMode === 'delegated')
+    .map((child) => followTransfer(db, child))
+    .filter((child) => !repos.isRunTerminal(child.status))
+  const limit = controlMode === 'transferred' ? 0 : state.cluster ? 2 : 1
+  if (children.length + (controlMode === 'transferred' ? 0 : count) > limit) {
+    throw new Error('活动子任务超过并发上限')
   }
-  // 同一父 Run 同时只允许一个活动子 Run（方案四 §6.4）
-  const activeChildren = repos.listActiveChildRuns(db, parentRunId)
-  if (activeChildren.length) throw new Error('父任务已有进行中的子任务，暂不可再派生')
-  if (parent.mandateJson) {
-    let pm = null
-    try {
-      pm = JSON.parse(parent.mandateJson)
-    } catch {
-      pm = null
-    }
-    if (pm && pm.canDelegate !== true) throw new Error('父任务授权未包含派生权限')
-  }
-  return parent
+  return { parent, state }
 }
 
-async function startAgentRun({
-  conversationId,
-  goal,
-  permission,
-  cluster,
-  parentRunId,
-  controlMode,
-  mandate,
-  acceptancePolicy,
-  traceId,
-  idempotencyKey
-}) {
+const runQueue = createRunQueue({ launch: launchQueuedRun, shuttingDown: isShuttingDown })
+
+function publishRegistration(db, row) {
+  broadcast('chat:event', {
+    type: 'snapshot',
+    conversationId: row.conversationId,
+    messages: [row.userMsgId, row.assistantMsgId].map((id) => msgOut(repos.getMessage(db, id)))
+  })
+  broadcast('agent:event', { type: 'queued', ...row })
+}
+
+function registerRuns(requests, { parentRunId, controlMode, idempotencyKey } = {}) {
   const db = dbm.get()
-  if (idempotencyKey) {
-    const existing = db.prepare('SELECT id FROM agent_runs WHERE idempotency_key=?').get(idempotencyKey)
-    if (existing) return { runId: existing.id, reused: true }
-  }
-  const { provider, model } = resolveModel(db, conversationId)
-  if (!provider) throw new Error('未配置模型服务')
-  if (!model) throw new Error('未配置模型')
-  const settings = repos.getAllSettings(db)
-
-  // 子任务：先校验父任务与授权，再求交得到有效权限
-  let effectiveMandate = normalizeMandate(mandate)
-  let inheritedTrace = traceId || null
-  if (parentRunId) {
-    if (!controlMode || !['delegated', 'transferred'].includes(controlMode)) {
-      throw new Error('派生任务必须指定 controlMode: delegated 或 transferred')
+  if (isShuttingDown()) throw new Error('应用正在退出，无法开始新的智能任务')
+  const scope = parentRunId ? `parent:${parentRunId}` : 'root'
+  const fingerprint = createHash('sha256')
+    .update(
+      canonicalJson({
+        requests: JSON.parse(JSON.stringify(requests)),
+        controlMode: controlMode || null
+      })
+    )
+    .digest('hex')
+  let transferParent
+  const rows = transaction(db, () => {
+    if (idempotencyKey) {
+      const prev = db
+        .prepare('SELECT * FROM run_dispatch_requests WHERE scope=? AND request_key=?')
+        .get(scope, idempotencyKey)
+      if (prev) {
+        if (prev.fingerprint !== fingerprint)
+          throw remoteError('IDEMPOTENCY_CONFLICT', '请求编号已用于其他任务', 409)
+        return JSON.parse(prev.run_ids).map((id) => {
+          const run = getRunStatus(db, id)
+          return {
+            runId: id,
+            conversationId: run.conversationId,
+            status: run.status,
+            userMsgId: run.userMessageId,
+            assistantMsgId: run.assistantMessageId,
+            reused: true
+          }
+        })
+      }
     }
-    const parent = assertCanDelegate(db, parentRunId)
-    let parentMandate = null
-    try {
-      parentMandate = parent.mandateJson ? JSON.parse(parent.mandateJson) : null
-    } catch {
-      parentMandate = null
+    const owner = parentRunId
+      ? assertCanDelegate(db, parentRunId, controlMode, requests.length)
+      : null
+    const settings = repos.getAllSettings(db)
+    const registered = requests.map((request) => {
+      const goal = String(request.goal || '').trim()
+      if (!goal) throw new Error('任务目标不能为空')
+      let { conversationId } = request
+      const parentConv = owner && repos.getConversation(db, owner.parent.conversationId)
+      if (!conversationId && parentConv) {
+        conversationId = repos.createConversation(db, {
+          title: String(request.title || goal).slice(0, 80),
+          origin: 'agent',
+          parentId: parentConv.id,
+          createdByRun: parentRunId,
+          providerId: parentConv.providerId,
+          model: parentConv.model,
+          projectId: parentConv.projectId,
+          systemPrompt: parentConv.systemPrompt
+        }).id
+      }
+      const conv = repos.getConversation(db, conversationId)
+      if (
+        !conv ||
+        (owner && (conv.parentId !== parentConv?.id || conv.projectId !== parentConv.projectId))
+      ) {
+        throw remoteError('INVALID_TARGET', '任务只能派发到本项目的直接子会话', 400)
+      }
+      if (
+        db
+          .prepare(
+            `SELECT 1 FROM agent_runs
+        WHERE conversation_id=? AND status IN ('queued','running','waiting_child')`
+          )
+          .get(conversationId) ||
+        db
+          .prepare(
+            `SELECT 1 FROM messages WHERE conversation_id=? AND deleted_at IS NULL
+          AND status='streaming'`
+          )
+          .get(conversationId)
+      ) {
+        throw remoteError('SESSION_BUSY', '会话正在执行', 409)
+      }
+      const { provider, model } = resolveModel(db, conversationId)
+      if (!provider || !model) throw new Error('未配置模型服务或模型')
+      const mandate = owner
+        ? defaultSubMandate(owner.state.mandate)
+        : normalizeMandate(request.mandate)
+      let permission =
+        request.permission === 'readonly' || request.permission === 'full'
+          ? request.permission
+          : 'autonomous'
+      if (owner) permission = owner.state.permission === 'readonly' ? 'readonly' : 'autonomous'
+      if (mandate?.permissionMode === 'readonly') permission = 'readonly'
+      if (mandate && mandate.permissionMode !== 'full' && permission === 'full')
+        permission = 'autonomous'
+      const maxSteps = Math.min(
+        Number(settings.agentMaxSteps) || 15,
+        mandate?.limits.maxSteps || Infinity
+      )
+      const runId = repos.createRun(db, {
+        conversationId,
+        goal,
+        maxSteps,
+        status: 'queued',
+        parentRunId,
+        controlMode,
+        mandate,
+        acceptancePolicy: request.acceptancePolicy,
+        traceId: owner ? owner.parent.traceId || parentRunId : request.traceId || repos.uid()
+      })
+      const first = repos.listMessages(db, conversationId).length === 0
+      const user = repos.insertMessage(db, {
+        conversationId,
+        role: 'user',
+        content: goal,
+        meta: { agent: true, runId }
+      })
+      const assistant = repos.insertMessage(db, {
+        conversationId,
+        role: 'assistant',
+        content: '',
+        status: 'pending',
+        meta: { agentRunId: runId }
+      })
+      db.prepare(
+        `UPDATE agent_runs SET submitted_at=?,user_message_id=?,assistant_message_id=?,
+        run_spec_json=? WHERE id=?`
+      ).run(
+        Date.now(),
+        user.id,
+        assistant.id,
+        JSON.stringify({
+          version: 1,
+          providerId: provider.id,
+          model,
+          permission,
+          cluster: !!(owner ? owner.state.cluster : request.cluster),
+          projectId: conv.projectId,
+          first,
+          endpoint: provider.base_url,
+          context: repos
+            .listMessages(db, conversationId)
+            .filter(
+              (m) =>
+                ['user', 'assistant'].includes(m.role) &&
+                m.id !== user.id &&
+                m.id !== assistant.id &&
+                m.status === 'done'
+            )
+            .slice(-20)
+            .map(({ role, content }) => ({ role, content: String(content).slice(0, 2000) })),
+          systemPrompt: conv.systemPrompt || ''
+        }),
+        runId
+      )
+      repos.touchConversation(db, conversationId)
+      recordRunState(db, runId)
+      return {
+        runId,
+        conversationId,
+        userMsgId: user.id,
+        assistantMsgId: assistant.id,
+        status: 'queued'
+      }
+    })
+    if (controlMode === 'transferred') {
+      const target = registered[0]
+      transition(db, parentRunId, { status: 'transferred' })
+      db.prepare(
+        `UPDATE agent_runs SET transfer_to_run_id=?,finished_reason='transferred' WHERE id=?`
+      ).run(target.runId, parentRunId)
+      const content = '任务已移交给子会话。'
+      repos.updateMessage(db, owner.parent.assistantMessageId, { content, status: 'transferred' })
+      transferParent = owner.state
     }
-    // 无 mandate 时不得全继承：收敛到受限默认（方案四 §4.3）
-    effectiveMandate = effectiveMandate
-      ? require('./mandate').intersectMandate(parentMandate, effectiveMandate)
-      : defaultSubMandate(parentMandate)
-    inheritedTrace = parent.traceId || parent.id
-  } else if (!inheritedTrace) {
-    inheritedTrace = repos.uid()
-  }
+    if (idempotencyKey)
+      db.prepare('INSERT INTO run_dispatch_requests VALUES(?,?,?,?)').run(
+        scope,
+        idempotencyKey,
+        fingerprint,
+        JSON.stringify(registered.map((row) => row.runId))
+      )
+    return registered
+  })
+  if (transferParent) transferParent.transferred = true
+  for (const row of rows) if (!row.reused) publishRegistration(db, row)
+  runQueue.schedule(db)
+  return rows
+}
 
-  const runId = repos.createRun(db, {
-    conversationId,
-    goal,
-    maxSteps: Number(settings.agentMaxSteps) || 15,
+async function startAgentRun({ parentRunId, controlMode, idempotencyKey, ...request }) {
+  if (parentRunId && !['delegated', 'transferred'].includes(controlMode))
+    throw new Error('非法任务关系')
+  if (!parentRunId && controlMode) throw new Error('任务派生必须指定父任务')
+  return registerRuns([request], {
     parentRunId: parentRunId || null,
-    controlMode: parentRunId ? controlMode : null,
-    mandate: effectiveMandate,
-    acceptancePolicy: acceptancePolicy || null,
-    traceId: inheritedTrace,
-    idempotencyKey: idempotencyKey || null
-  })
+    controlMode: controlMode || null,
+    idempotencyKey
+  })[0]
+}
 
-  // 委派：同一事务内把父 Run 置为 waiting_child；移交：父 Run 置终态。
-  // 先建子 Run 再改父状态，任一失败都不会造成任务丢失（方案四 §6.2）。
-  if (parentRunId) {
-    const parentTarget = controlMode === 'transferred' ? 'transferred' : 'waiting_child'
-    const upd = repos.updateRunStatus(db, parentRunId, { status: parentTarget })
-    if (!upd.ok) {
-      // 回滚子 Run，避免出现孤儿任务
-      db.prepare('DELETE FROM agent_runs WHERE id = ?').run(runId)
-      throw new Error(`父任务状态更新失败：${upd.reason}`)
-    }
+function launchQueuedRun(db, runId) {
+  const run = repos.getRun(db, runId)
+  const { conversationId, assistantMessageId: assistantMsgId, goal } = run
+  const spec = safeJson(run.runSpecJson)
+  const conv = repos.getConversation(db, conversationId)
+  const { provider, model } = resolveModel(db, conversationId)
+  if (
+    spec?.version !== 1 ||
+    !conv ||
+    conv.projectId !== spec.projectId ||
+    !provider ||
+    provider.id !== spec.providerId ||
+    model !== spec.model ||
+    provider.base_url !== spec.endpoint
+  ) {
+    finishRun(db, run, {
+      status: 'error',
+      reason: 'configuration_changed',
+      content: '任务配置已变更，请重新派发。'
+    })
+    runQueue.release(db, runId)
+    return
   }
-  // 「第一轮」在插入本条消息前判定（对齐 gateway.sendChat 的语义）
-  const isFirstRound = repos.listMessages(db, conversationId).length === 0
-  const userMsg = repos.insertMessage(db, {
-    conversationId,
-    role: 'user',
-    content: goal,
-    meta: { agent: true, runId }
+  transaction(db, () => {
+    transition(db, runId, { status: 'running' })
+    db.prepare('UPDATE agent_runs SET claimed_at=?,started_at=? WHERE id=?').run(
+      Date.now(),
+      Date.now(),
+      runId
+    )
+    repos.updateMessage(db, assistantMsgId, { status: 'streaming' })
   })
-  const assistant = repos.insertMessage(db, {
+  const settings = repos.getAllSettings(db)
+  const state = {
+    ac: new AbortController(),
+    stopped: false,
+    remember: new Set(),
+    confirms: new Map(),
+    parentRunId: run.parentRunId,
+    controlMode: run.controlMode,
+    pauseNotified: false,
+    mandate: normalizeMandate(safeJson(run.mandateJson)),
+    traceId: run.traceId,
+    permission: spec.permission,
+    cluster: spec.cluster,
+    maxSteps: run.maxSteps
+  }
+  active.set(runId, state)
+  getHub().emit('run.start', {
+    runId,
     conversationId,
-    role: 'assistant',
-    content: '',
-    status: 'streaming',
-    meta: { agentRunId: runId }
+    parentRunId: run.parentRunId,
+    traceId: run.traceId
   })
-  // 任务会话标题 = 第一轮目标（goal）优化后的结果；异步执行，不阻塞运行链路。
-  // 标题仍是默认值才生成（title 模块内部校验），测试环境走原文截断回退
-  if (isFirstRound) {
+  broadcast('chat:event', {
+    type: 'snapshot',
+    conversationId,
+    messages: [msgOut(repos.getMessage(db, assistantMsgId))]
+  })
+  broadcast('agent:event', {
+    type: 'started',
+    runId,
+    assistantMsgId,
+    conversationId,
+    status: 'running'
+  })
+  if (spec.first) {
     title
       .titleConversation(
         { dbm, repos, scheduler, chatOnce, resolveModel, decryptSecret, broadcast },
@@ -292,53 +490,97 @@ async function startAgentRun({
       )
       .catch(() => {})
   }
-  const state = {
-    ac: new AbortController(),
-    stopped: false,
-    remember: new Set(),
-    confirms: new Map(),
-    // 父运行：子会话里的运行由此派生，用于会话管理与审计回溯
-    parentRunId: parentRunId || null,
-    controlMode: parentRunId ? controlMode : null,
-    pauseNotified: false,
-    // 本次 Run 的授权快照：运行期不可被模型扩大（方案四 §4.1）
-    mandate: effectiveMandate,
-    traceId: inheritedTrace,
-    // 权限等级：readonly = 仅只读工具、写入类直接拒绝；full = 所有非只读调用直接放行（不再逐次确认）
-    permission: permission === 'readonly' || permission === 'full' ? permission : 'autonomous',
-    // Agent 集群：允许派生多个子 Agent 并行处理子任务
-    cluster: !!cluster
-  }
-  active.set(runId, state)
-  const hub = getHub()
-  hub.emit('run.start', {
+  state.done = doAgentRun({
     runId,
     conversationId,
-    parentRunId: state.parentRunId,
-    controlMode: state.controlMode,
-    traceId: state.traceId,
-    goal: String(goal || '').slice(0, 200),
-    permission: state.permission,
-    cluster: state.cluster
-  })
-  broadcast('chat:event', {
-    type: 'snapshot',
-    conversationId,
-    messages: [msgOut(repos.getMessage(db, userMsg.id)), msgOut(repos.getMessage(db, assistant.id))]
-  })
-  broadcast('agent:event', { type: 'started', runId, assistantMsgId: assistant.id, conversationId })
-  doAgentRun({
-    runId,
-    conversationId,
-    assistantMsgId: assistant.id,
+    assistantMsgId,
     provider,
     model,
     goal,
     state,
-    acceptancePolicy,
-    settings
-  }).catch(() => {})
-  return { runId, userMsgId: userMsg.id, assistantMsgId: assistant.id }
+    acceptancePolicy: safeJson(run.acceptancePolicy),
+    settings,
+    spec
+  })
+    .catch((error) => {
+      const current = repos.getRun(db, runId)
+      if (current && !repos.isRunTerminal(current.status)) {
+        finishRun(db, current, {
+          status: 'error',
+          reason: 'runner_error',
+          content: String(error.message)
+        })
+      }
+      cancelChildren(db, runId)
+      console.error('AGENT_RUN_FAILED', error)
+    })
+    .finally(() => {
+      active.delete(runId)
+      runQueue.release(db, runId)
+    })
+}
+
+function finishRun(db, run, { status, reason, content, stepsUsed, acceptanceStatus }) {
+  if (!repos.isRunTerminal(run.status)) {
+    transaction(db, () => {
+      transition(db, run.id, { status, stepsUsed, acceptanceStatus })
+      db.prepare('UPDATE agent_runs SET finished_reason=? WHERE id=?').run(reason || status, run.id)
+      repos.updateMessage(db, run.assistantMessageId, { content: content || '', status })
+      repos.touchConversation(db, run.conversationId)
+    })
+  } else {
+    status = run.status
+    content = repos.getMessage(db, run.assistantMessageId)?.content || ''
+  }
+  getHub().emit('run.end', { runId: run.id, conversationId: run.conversationId, status })
+  broadcast('chat:event', {
+    type: ['interrupted', 'stopped', 'error'].includes(status)
+      ? status === 'interrupted'
+        ? 'stopped'
+        : status
+      : 'done',
+    conversationId: run.conversationId,
+    msgId: run.assistantMessageId,
+    content,
+    status
+  })
+  broadcast('agent:event', {
+    type: 'done',
+    runId: run.id,
+    conversationId: run.conversationId,
+    assistantMsgId: run.assistantMessageId,
+    status,
+    content,
+    transferToRunId: run.transferToRunId
+  })
+}
+
+async function waitForChildren(db, runId, state, { runIds, timeoutMs }) {
+  const ids = Array.isArray(runIds) ? [...new Set(runIds)] : []
+  if (
+    !ids.length ||
+    ids.length > 2 ||
+    ids.some((id) => {
+      const child = repos.getRun(db, id)
+      return !child || child.parentRunId !== runId || child.controlMode !== 'delegated'
+    })
+  )
+    throw new Error('只能等待本任务直接派发的子任务')
+  if (state.stopped) throw new Error('任务已停止')
+  transaction(db, () => transition(db, runId, { status: 'waiting_child' }))
+  runQueue.release(db, runId)
+  const conversationId = repos.getRun(db, runId).conversationId
+  broadcast('agent:event', { type: 'state', runId, conversationId, status: 'waiting_child' })
+  try {
+    return await waitForRuns(db, { runIds: ids, timeoutMs, signal: state.ac.signal })
+  } finally {
+    if (!state.stopped && (await runQueue.acquire(db, runId, state.ac.signal))) {
+      transaction(db, () => transition(db, runId, { status: 'running' }))
+      broadcast('agent:event', { type: 'state', runId, conversationId, status: 'running' })
+    } else if (!state.stopped) {
+      stopRun(runId, 'app_quit')
+    }
+  }
 }
 
 async function doAgentRun({
@@ -350,7 +592,8 @@ async function doAgentRun({
   goal,
   state,
   acceptancePolicy,
-  settings: inherited
+  settings: inherited,
+  spec
 }) {
   const db = dbm.get()
   const settings = inherited || repos.getAllSettings(db)
@@ -385,12 +628,77 @@ async function doAgentRun({
     runId,
     state
   })
-  ctx.createSession = sessionBridge.createSession
-  ctx.sendToSession = sessionBridge.sendToSession
-  ctx.getSessionStatus = sessionBridge.getSessionStatus
-  ctx.waitForSession = sessionBridge.waitForSession
-  ctx.getSessionResult = sessionBridge.getSessionResult
-  ctx.listSessions = sessionBridge.listSessions
+  ctx.createSession = (opts) => {
+    if (opts.projectId && opts.projectId !== conv?.projectId) {
+      throw remoteError('INVALID_TARGET', '子会话必须属于当前项目', 400)
+    }
+    return sessionBridge.createSession(opts)
+  }
+  ctx.sendToSession = (opts) => {
+    if (opts.mode !== 'agent' && state.mandate) throw new Error('受限任务不能发起独立聊天请求')
+    assertSessionAccess(opts.conversationId)
+    return sessionBridge.sendToSession(opts)
+  }
+  const ownChild = (id) => {
+    const run = repos.getRun(db, id)
+    if (!run || run.parentRunId !== runId) throw new Error('目标任务不属于当前运行')
+    return run
+  }
+  const dispatch = (controlMode, { goal, conversationId: targetId, title }, callId) =>
+    startAgentRun({
+      parentRunId: runId,
+      controlMode,
+      goal,
+      conversationId: targetId,
+      title,
+      idempotencyKey: callId
+    })
+  ctx.runDispatch = (opts, callId) => dispatch('delegated', opts, callId)
+  ctx.runTransfer = (opts, callId) => dispatch('transferred', opts, callId)
+  ctx.runStatus = ({ runId: id }) => getRunStatus(db, ownChild(id).id)
+  ctx.runResult = ({ runId: id, maxChars }) => getRunResult(db, ownChild(id).id, maxChars)
+  ctx.runWait = (opts) => waitForChildren(db, runId, state, opts)
+  ctx.runCancel = ({ runId: id }) => {
+    const child = ownChild(id)
+    if (child.controlMode !== 'delegated') throw new Error('移交任务由接手方控制')
+    const target = followTransfer(db, child)
+    return { requested: stopRun(target.id), ...getRunStatus(db, target.id) }
+  }
+  const assertSessionAccess = (id) => {
+    const target = repos.getConversation(db, id)
+    if (
+      !target ||
+      target.projectId !== conv?.projectId ||
+      (target.id !== conversationId && target.parentId !== conversationId)
+    ) {
+      throw new Error('目标会话不属于当前运行')
+    }
+  }
+  ctx.getSessionStatus = (opts) => {
+    assertSessionAccess(opts.conversationId)
+    return sessionBridge.getSessionStatus(opts)
+  }
+  ctx.getSessionResult = (opts) => {
+    assertSessionAccess(opts.conversationId)
+    return sessionBridge.getSessionResult(opts)
+  }
+  ctx.waitForSession = async (opts) => {
+    assertSessionAccess(opts.conversationId)
+    if (opts.conversationId === conversationId) throw new Error('不能等待当前任务所在的会话')
+    const snapshot = sessionBridge.getSessionStatus(opts)
+    const target = snapshot.runId && repos.getRun(db, snapshot.runId)
+    if (target && target.parentRunId === runId && target.controlMode === 'delegated') {
+      const result = await ctx.runWait({ runIds: [target.id], timeoutMs: opts.timeoutMs })
+      return { ...snapshot, ...result.runs[0], timedOut: result.timedOut }
+    }
+    return sessionBridge.waitForSession({ ...opts, signal: state.ac.signal })
+  }
+  ctx.listSessions = (opts) => {
+    if (opts.parentId) assertSessionAccess(opts.parentId)
+    if (opts.parentId && opts.parentId !== conversationId)
+      throw new Error('只能列出当前会话的子会话')
+    return sessionBridge.listSessions(opts)
+  }
 
   // 钩子规则来自用户设置，模型无法改动；此处解析一次，运行内复用
   const hookRules = parseHooks(settings.agentHooks)
@@ -415,10 +723,13 @@ async function doAgentRun({
       role: 'system',
       content:
         '你是运行在用户 Windows 桌面上的 Agent。谨慎使用工具完成目标；写文件和执行命令前先用一句话说明计划。基于工具返回结果作答，不要臆造。' +
+        (state.parentRunId ? '\n你是被主 Agent 派出的子 Agent，请根据独立目标完成任务。' : '') +
+        (spec.systemPrompt ? '\n' + spec.systemPrompt : '') +
         permissionNote +
         clusterNote +
         (memoryText ? `\n\n以下是你的长期记忆（供参考，可按需更新）:\n${memoryText}` : '')
     },
+    ...(Array.isArray(spec.context) ? spec.context : []),
     { role: 'user', content: goal }
   ]
   const startedAt = Date.now()
@@ -431,7 +742,7 @@ async function doAgentRun({
   // 旧流隔离：Run 仍是本进程内当前活动的那一个，且未被停止。
   // 被 stopRun / 移交 / 替换后，任何迟到回调都不得写入或广播。
   const isCurrentRun = () => {
-    if (state.stopped) return false
+    if (state.stopped || state.transferred) return false
     const cur = active.get(runId)
     return !!cur && cur === state
   }
@@ -454,10 +765,17 @@ async function doAgentRun({
     }
   }
 
+  state.releaseSlot = () => runQueue.release(db, runId)
+  state.acquireSlot = () => runQueue.acquire(db, runId, state.ac.signal)
   const modelCallWith = (apiKey) => async (msgs) => {
-    if (!(await getControlRuntime(db).runs.checkpoint(runId, state))) return { content: '', toolCalls: [], stopped: true }
+    if (!(await getControlRuntime(db).runs.checkpoint(runId, state)))
+      return { content: '', toolCalls: [], stopped: true }
     const payload = { model, messages: msgs, stream: true, tools: toolSchemas(tools) }
-    if (Number(params.maxTokens)) payload.max_tokens = Number(params.maxTokens)
+    const tokenLimit = Math.min(
+      Number(params.maxTokens) || Infinity,
+      state.mandate?.limits.maxTokens || Infinity
+    )
+    if (Number.isFinite(tokenLimit)) payload.max_tokens = tokenLimit
     if (Number(params.temperature) >= 0) payload.temperature = Number(params.temperature)
     if (Number(params.topP) > 0) payload.top_p = Number(params.topP)
     const r = await chatStream(
@@ -528,19 +846,27 @@ async function doAgentRun({
       })
     }
     if (state.stopped) return settle({ allowed: false, confirmedBy: 'stopped' })
-    if (!(await getControlRuntime(db).runs.checkpoint(runId, state))) return settle({ allowed: false, confirmedBy: 'stopped' })
+    if (!(await getControlRuntime(db).runs.checkpoint(runId, state)))
+      return settle({ allowed: false, confirmedBy: 'stopped' })
     // 完整权限：用户已在输入区显式选择，不再逐次弹确认，但审计记录标记来源
     if (state.permission === 'full')
       return settle({ allowed: true, confirmedBy: 'permission:full' })
     if (risk === 'side_effect' && state.remember.has(name))
       return settle({ allowed: true, confirmedBy: 'session' })
-    const decision = await getControlRuntime(db).approvals.decide({ runId, conversationId, name, args, riskLevel: risk })
+    const decision = await getControlRuntime(db).approvals.decide({
+      runId,
+      conversationId,
+      name,
+      args,
+      riskLevel: risk
+    })
     return settle({
       allowed: !!decision.allowed,
-      confirmedBy: decision.confirmedBy || (decision.allow ? 'user' : decision.timedOut ? 'timeout' : 'denied')
+      confirmedBy:
+        decision.confirmedBy || (decision.allow ? 'user' : decision.timedOut ? 'timeout' : 'denied')
     })
   }
-  const execute = async (tool, args) => {
+  const execute = async (tool, args, callId) => {
     const t0 = Date.now()
     let resultText = ''
     let error = null
@@ -585,7 +911,7 @@ async function doAgentRun({
     }
 
     try {
-      const r = await tool.handler(args)
+      const r = await tool.handler(args, callId)
       resultText = typeof r === 'string' ? r : JSON.stringify(r)
     } catch (e) {
       error = String((e && e.message) || e)
@@ -623,58 +949,39 @@ async function doAgentRun({
   }
   const onEvent = (type, payload) => broadcast('agent:event', { type, runId, ...payload })
 
-  // 子 Agent：复用同一套确认/日志/广播管道，深度固定为 1（工具集去掉 spawn_agent）。
-  // 子 Agent 不参与会话派生：去掉 spawn_agent 与 session_*，否则会绕过嵌套深度限制
-  const subTools = tools.filter((t) => t.name !== 'spawn_agent' && !t.name.startsWith('session_'))
-  const subMap = Object.fromEntries(subTools.map((t) => [t.name, t]))
-  const runSubAgent = async (subGoal) => {
-    const sub = await withKeyRetry(db, provider, (apiKey) =>
-      runAgentLoop({
-        messages: [
-          {
-            role: 'system',
-            content:
-              '你是被主 Agent 派出的子 Agent，专注完成给定子任务，完成后用简洁的结论回复（不要寒暄）。'
-          },
-          { role: 'user', content: subGoal }
-        ],
-        maxSteps: Math.min(10, Number(settings.agentMaxSteps) || 15),
-        toolMap: subMap,
-        isStopped: () => state.stopped,
-        modelCall: modelCallWith(apiKey),
-        decide,
-        execute,
-        onEvent
-      })
+  ctx.spawnAgent = async ({ goal, goals }, callId) => {
+    const list = goals?.length ? goals : [goal]
+    const rows = registerRuns(
+      list.map((item) => ({ goal: item })),
+      {
+        parentRunId: runId,
+        controlMode: 'delegated',
+        idempotencyKey: callId
+      }
     )
-    return lastAssistantContent(sub.messages) || '(子 Agent 无输出)'
-  }
-  // 单任务：串行执行；集群开启时同一轮多个子任务并发执行（各自独立上下文）
-  ctx.spawnAgent = async ({ goal: subGoal, goals }) => {
-    const list = Array.isArray(goals) && goals.length ? goals : [subGoal]
-    if (!state.cluster && list.length > 1) {
-      throw new Error('未开启 Agent 集群，一次只能派生一个子 Agent')
-    }
-    if (list.length === 1) return runSubAgent(String(list[0] || '').trim())
-    const results = await Promise.all(
-      list.map((g) => runSubAgent(String(g || '').trim()).catch((e) => `子任务失败：${e.message}`))
+    const result = await ctx.runWait({ runIds: rows.map((row) => row.runId) })
+    const parts = result.runs.map((item) =>
+      item.status === 'done'
+        ? item.content
+        : `${item.status}（${item.runId}）：${item.content || item.finishedReason || '可用 run_status 查询'}`
     )
-    return results.map((r, i) => `【子任务 ${i + 1}】\n${r}`).join('\n\n')
+    return parts.length === 1
+      ? parts[0]
+      : parts.map((item, i) => `【子任务 ${i + 1}】\n${item}`).join('\n\n')
   }
 
   try {
-    const result = await withKeyRetry(db, provider, (apiKey) =>
-      runAgentLoop({
-        messages,
-        maxSteps: Number(settings.agentMaxSteps) || 15,
-        toolMap,
-        isStopped: () => state.stopped,
-        modelCall: modelCallWith(apiKey),
-        decide,
-        execute,
-        onEvent
-      })
-    )
+    const result = await runAgentLoop({
+      messages,
+      maxSteps: state.maxSteps,
+      toolMap,
+      isStopped: () => state.stopped,
+      isTransferred: () => !!state.transferred,
+      modelCall: (msgs) => withKeyRetry(db, provider, (apiKey) => modelCallWith(apiKey)(msgs)),
+      decide,
+      execute,
+      onEvent
+    })
     finalContent = lastAssistantContent(result.messages)
     stepsUsed = result.steps
     status = result.status === 'done' ? 'done' : result.status
@@ -703,39 +1010,15 @@ async function doAgentRun({
     })
   }
 
-  const runUpdate = repos.finalizeRunStatus(db, runId, {
-    status: finalStatus,
+  status = state.transferred ? 'transferred' : state.stopped ? 'stopped' : finalStatus
+  if (!state.transferred) cancelChildren(db, runId)
+  finishRun(db, repos.getRun(db, runId), {
+    status,
+    reason: state.stopReason,
+    content: finalContent,
     stepsUsed,
-    endedAt: Date.now(),
-    // 有验收策略时进入待验收；否则 not_required
-    acceptanceStatus: acceptancePolicy ? 'pending' : null
+    acceptanceStatus: acceptancePolicy && status === 'done' ? 'pending' : null
   })
-  if (!runUpdate.ok) {
-    // 终态已被其它路径写入：不覆盖，仅记录
-    getHub().emit('run.stale_update_ignored', {
-      runId,
-      traceId: state.traceId,
-      conversationId,
-      attempted: finalStatus,
-      reason: runUpdate.reason
-    })
-  }
-  // 委派关系收口：子 Run 终态后唤醒仍在 waiting_child 的父 Run。
-  // transferred 是终态移交，不应唤醒父任务。
-  const resumed = repos.resumeParentAfterChild(db, runId)
-  if (resumed.resumed) {
-    getHub().emit('run.parent_resumed', {
-      childRunId: runId,
-      parentRunId: resumed.parentRunId,
-      traceId: state.traceId
-    })
-  }
-  repos.updateMessage(db, assistantMsgId, {
-    content: finalContent || '(无输出)',
-    status: finalStatus === 'done' ? 'done' : finalStatus === 'error' ? 'error' : 'stopped'
-  })
-  if (finalStatus !== status) status = finalStatus
-  repos.touchConversation(db, conversationId)
   if (ctx._browser) {
     try {
       ctx._browser.close()
@@ -743,87 +1026,101 @@ async function doAgentRun({
       // 窗口可能已被销毁
     }
   }
-  active.delete(runId)
-  // run.end 钩子与事件：此时运行已落库，钩子可以安全地读结果
-  const ended = applyHooks(hookRules, 'run.end', { runId, conversationId, status }, hookSink)
-  getHub().emit('run.end', {
-    runId,
-    conversationId,
-    parentRunId: state.parentRunId,
-    status,
-    stepsUsed,
-    toolCalls: callCount,
-    durationMs: Date.now() - startedAt,
-    hookNotified: ended.notifications.length
-  })
-  broadcast('chat:event', {
-    type: status === 'error' ? 'error' : status === 'stopped' ? 'stopped' : 'done',
-    conversationId,
-    msgId: assistantMsgId,
-    content: finalContent || ''
-  })
-  broadcast('agent:event', {
-    type: 'done',
-    runId,
-    status,
-    content: finalContent,
-    assistantMsgId
-  })
+  applyHooks(
+    hookRules,
+    'run.end',
+    { runId, conversationId, status, durationMs: Date.now() - startedAt },
+    hookSink
+  )
 }
 
 function respondConfirm({ requestId, allow, remember }) {
   return getControlRuntime(dbm.get()).approvals.respond({
-    approvalId: requestId, decision: allow ? 'approved' : 'rejected', actor: 'desktop', reason: remember ? 'remember_not_supported' : ''
+    approvalId: requestId,
+    decision: allow ? 'approved' : 'rejected',
+    actor: 'desktop',
+    reason: remember ? 'remember_not_supported' : ''
   }).ok
 }
 
 function stopRun(runId, reason = 'user', context = {}) {
-  const st = active.get(runId)
-  if (!st) return false
-  st.stopped = true
-  st.stopReason = reason
-  st.ac.abort()
-  getControlRuntime(dbm.get()).approvals.cancelRun(runId, reason)
-  // 内部中止不得静默（方案四 §5.4）：记录原因与发起者
-  try {
-    const db = dbm.get()
-    // 只有用户取消才直接落 stopped；其余由各自路径处理
-    if (reason === 'user') {
-      repos.updateRunStatus(db, runId, { status: 'stopped', endedAt: Date.now() })
-    }
-    getHub().emit('run.abort_requested', {
-      runId,
-      traceId: st.traceId || null,
-      reason,
-      actor: context.actor || 'desktop'
-    })
-  } catch {
-    // 数据库未就绪时忽略，不影响中止
+  const db = dbm.get()
+  const run = repos.getRun(db, runId)
+  if (!run || repos.isRunTerminal(run.status)) return false
+  const state = active.get(runId)
+  if (state?.stopped) return true
+  if (state) {
+    state.stopped = true
+    state.stopReason = reason
+    state.ac.abort()
+    getControlRuntime(db).approvals.cancelRun(runId, reason)
+    const pending = [...state.confirms.keys()]
+    state.confirms.clear()
+    if (pending.length) broadcast('agent:confirmCancel', { runId, requestIds: pending })
+  } else if (run.status === 'queued') {
+    finishRun(db, run, { status: 'stopped', reason, content: '任务已停止。' })
+    runQueue.schedule(db)
+  } else {
+    return false
   }
-  const pending = [...st.confirms.keys()]
-  st.confirms.clear()
-  // 通知前端按 runId 清掉僵尸确认卡（含主窗隐藏时积压的请求）
-  if (pending.length) broadcast('agent:confirmCancel', { runId, requestIds: pending })
+  cancelChildren(db, runId)
+  getHub().emit('run.abort_requested', {
+    runId,
+    traceId: run.traceId,
+    reason,
+    actor: context.actor || 'desktop'
+  })
   return true
+}
+
+function cancelChildren(db, runId) {
+  for (const child of repos.listChildRuns(db, runId)) {
+    if (child.controlMode === 'delegated') {
+      stopRun(followTransfer(db, child).id, 'parent_finished')
+    }
+  }
+}
+
+function resumeQueuedRuns() {
+  runQueue.schedule(dbm.get())
 }
 
 function listActiveRuns() {
   return [...active.keys()]
 }
 
+async function stopAllRuns() {
+  const current = [...active.entries()]
+  for (const [runId] of current) stopRun(runId, 'app_quit', { actor: 'desktop' })
+  await Promise.allSettled(current.map(([, state]) => state.done))
+  // 只清理本次快照：退出期间新登记的运行不归这里管（入口已由 isShuttingDown 拦截）。
+  for (const [runId, state] of current) {
+    if (active.get(runId) === state) active.delete(runId)
+  }
+  controlRuntime = null
+}
+
 function getApprovalService() {
   return getControlRuntime(dbm.get()).approvals
 }
-function pauseRun(runId, actor = 'desktop') { return getControlRuntime(dbm.get()).runs.request(runId, 'pause', actor) }
-function resumeRun(runId, actor = 'desktop') { return getControlRuntime(dbm.get()).runs.request(runId, 'resume', actor) }
+function pauseRun(runId, actor = 'desktop') {
+  return getControlRuntime(dbm.get()).runs.request(runId, 'pause', actor)
+}
+function resumeRun(runId, actor = 'desktop') {
+  return getControlRuntime(dbm.get()).runs.request(runId, 'resume', actor)
+}
 
 module.exports = {
   startAgentRun,
+  resumeQueuedRuns,
+  getRunStatus: (id) => getRunStatus(dbm.get(), id),
+  getRunResult: (id, maxChars) => getRunResult(dbm.get(), id, maxChars),
   respondConfirm,
   getApprovalService,
   pauseRun,
   resumeRun,
   stopRun,
+  stopAllRuns,
   listActiveRuns,
   summarize,
   resolveWorkingDir,

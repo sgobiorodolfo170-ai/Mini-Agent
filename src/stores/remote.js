@@ -35,11 +35,19 @@ export const useRemoteStore = defineStore('remote', {
       try {
         this.apply(await window.api.remote.start(opts))
         await this.refreshQr()
-      } finally { this.loading = false }
+      } finally {
+        this.loading = false
+      }
     },
     async stop() {
       this.loading = true
-      try { await window.api.remote.stop(); this.status = 'stopped'; this.qrDataUrl = '' } finally { this.loading = false }
+      try {
+        await window.api.remote.stop()
+        this.status = 'stopped'
+        this.qrDataUrl = ''
+      } finally {
+        this.loading = false
+      }
     },
     async refreshQr() {
       if (!window.api.remote) return

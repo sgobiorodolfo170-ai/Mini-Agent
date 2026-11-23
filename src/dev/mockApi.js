@@ -47,6 +47,7 @@ function install() {
       chatListVisible: true,
       chatListWidth: 240,
       showBall: true,
+      closeToTray: true,
       agentAuthorizedDirs: [],
       agentMaxSteps: 15,
       webSearchProvider: 'auto',
@@ -314,6 +315,40 @@ function install() {
   ])
 
   const hooks = []
+  const logs = [
+    {
+      id: 'log-mock-1',
+      at: now() - 42000,
+      level: 'info',
+      scope: 'app',
+      message: '应用启动（浏览器预览）',
+      data: JSON.stringify({ version: '1.2.0-mock', platform: 'browser' })
+    },
+    {
+      id: 'log-mock-2',
+      at: now() - 30000,
+      level: 'info',
+      scope: 'event',
+      message: 'run.start',
+      data: JSON.stringify({ runId: 'run-mock-1', goal: '整理下载文件夹' })
+    },
+    {
+      id: 'log-mock-3',
+      at: now() - 18000,
+      level: 'warn',
+      scope: 'event',
+      message: 'tool.after',
+      data: JSON.stringify({ tool: 'web_search', error: '示例警告：搜索超时后已回退' })
+    },
+    {
+      id: 'log-mock-4',
+      at: now() - 6000,
+      level: 'error',
+      scope: 'console',
+      message: '示例错误：连接服务失败（浏览器预览数据）',
+      data: 'Error: mock network error\n    at preview (mockApi.js:1:1)'
+    }
+  ]
   const listeners = new Map()
   const timers = new Map()
 
@@ -574,7 +609,9 @@ function install() {
         const assistant = pushMessage(conversationId, 'assistant', '', { status: 'streaming' })
         // 与主进程一致：第一轮提示词优化后作为会话标题（mock 用轻量改写模拟优化结果）
         if (conv.title === '新会话' || !conv.title) {
-          const draft = String(content || '').trim().replace(/\s+/g, ' ')
+          const draft = String(content || '')
+            .trim()
+            .replace(/\s+/g, ' ')
           const optimized = draft ? `请处理任务：${draft.slice(0, 16)}` : ''
           conv.title = (optimized || '新会话').slice(0, 24)
           emit('chat:event', {
@@ -827,7 +864,9 @@ function install() {
           meta: { agentRunId: runId }
         })
         if (!conv.title || conv.title === '新会话') {
-          const draft = String(goal || '').trim().replace(/\s+/g, ' ')
+          const draft = String(goal || '')
+            .trim()
+            .replace(/\s+/g, ' ')
           conv.title = (draft ? `请处理任务：${draft.slice(0, 16)}` : '新会话').slice(0, 24)
           emit('chat:event', { type: 'conversationRenamed', conversationId, title: conv.title })
         }
@@ -970,6 +1009,38 @@ function install() {
       since: () => ({ events: [], seq: 0, truncated: false }),
       recent: () => [],
       stats: () => ({ seq: 0, size: 0, listeners: 0 })
+    },
+    logs: {
+      list: ({ level = 'all', search = '', limit = 500 } = {}) => {
+        const q = String(search || '')
+          .trim()
+          .toLowerCase()
+        return clone(
+          logs
+            .filter(
+              (e) =>
+                (level === 'all' || e.level === level) &&
+                (!q ||
+                  `${e.level} ${e.scope} ${e.message} ${e.data || ''}`.toLowerCase().includes(q))
+            )
+            .slice(0, Math.min(Number(limit) || 500, logs.length))
+        )
+      },
+      stats: () => ({
+        size: logs.length,
+        bytes: JSON.stringify(logs).length,
+        path: '（浏览器内存）',
+        dir: '',
+        maxEntries: 800
+      }),
+      clear: () => {
+        logs.length = 0
+        return true
+      },
+      openFolder: () => {
+        emit('app:notice', { level: 'info', message: '浏览器预览不支持打开日志目录' })
+        return false
+      }
     },
     hooks: {
       meta: () => ({

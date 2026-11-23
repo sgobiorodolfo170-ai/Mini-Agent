@@ -1,6 +1,7 @@
 // Minimal MCP (Model Context Protocol) stdio client: JSON-RPC 2.0 over newline-delimited stdin/stdout.
 // spawnFn is injectable for unit tests. Each session spawns its own server process.
 const { spawn } = require('child_process')
+const { processRegistry, terminateChild, waitForExit } = require('../lifecycle')
 
 const PROTOCOL_VERSION = '2024-11-05'
 
@@ -8,12 +9,15 @@ function createMcpClient({ command, args = [], spawnFn = spawn, timeoutMs = 1500
   let child = null
   let nextId = 1
   let buf = ''
+  let stopping = null
   const pending = new Map() // id -> { resolve, reject, timer }
 
   function start() {
     if (child) return child
+    if (stopping) throw new Error('MCP 会话正在关闭')
     if (!command) throw new Error('MCP 服务器未配置启动命令')
     child = spawnFn(command, args, { windowsHide: true })
+    processRegistry.track(child)
     child.stdout.setEncoding('utf8')
     child.stdout.on('data', (chunk) => {
       buf += chunk
@@ -114,16 +118,30 @@ function createMcpClient({ command, args = [], spawnFn = spawn, timeoutMs = 1500
       .join('\n')
   }
 
-  function stop() {
+  function stop({ graceMs = 500, killMs = 600 } = {}) {
+    if (stopping) return stopping
     failAll(new Error('MCP 会话已关闭'))
-    if (child) {
+    const current = child
+    child = null
+    if (!current) return Promise.resolve('exited')
+    stopping = (async () => {
       try {
-        child.kill()
+        // MCP 服务通常以 stdin EOF 作为正常退出信号；给一次优雅退出的机会。
+        if (current.stdin && !current.stdin.destroyed && !current.stdin.writableEnded) {
+          // 子进程可能已退出，end() 后的 EPIPE 属于预期噪音，先吞掉避免 unhandled 'error'。
+          current.stdin.once('error', () => {})
+          current.stdin.end()
+        }
+        if (await waitForExit(current, graceMs)) return 'closed'
+        return await terminateChild(current, { graceMs: 300, killMs })
       } catch {
-        // 进程可能已退出
+        return await terminateChild(current, { graceMs: 0, killMs })
+      } finally {
+        processRegistry.untrack(current)
+        stopping = null
       }
-      child = null
-    }
+    })()
+    return stopping
   }
 
   return { initialize, listTools, callTool, stop, _getChild: () => child }
@@ -136,7 +154,7 @@ async function withMcpServer(cfg, fn, opts = {}) {
     await client.initialize()
     return await fn(client)
   } finally {
-    client.stop()
+    await client.stop()
   }
 }
 

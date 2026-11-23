@@ -87,7 +87,7 @@ onMounted(async () => {
   })
   // 子会话看板：运行开始/结束与会话创建都刷新，保证「Agent 派生的会话」即时可见
   window.api.on('agent:event', (ev) => {
-    if (ev && (ev.type === 'started' || ev.type === 'done')) sessions.load()
+    if (ev && ['queued', 'started', 'state', 'done'].includes(ev.type)) sessions.load()
   })
   window.api.on('hotkeys:report', (rep) => {
     const bad = Object.entries(rep || {}).filter(([_k, v]) => !v.ok)
@@ -162,10 +162,10 @@ async function toggleMaximize() {
   }
 }
 
-// 关闭按钮即「隐藏到托盘」：主进程 close 拦截会 hide，与系统行为一致
-async function closeWindowToTray() {
+// 交给主进程按 closeToTray 设置决定隐藏到托盘或真正退出，避免绕过退出清理
+async function closeWindow() {
   try {
-    await window.api.window.hide()
+    await window.api.window.close()
   } catch (e) {
     onWindowControl(e)
   }
@@ -175,7 +175,7 @@ async function closeWindowToTray() {
 <template>
   <div class="h-full flex flex-col">
     <!-- 自绘标题栏：背景同左侧栏（bg-panel 浅灰白），可拖拽移动窗口；
-         右侧最小化/最大化/关闭均为 no-drag，关闭=隐藏到托盘（与系统关闭行为一致） -->
+         右侧最小化/最大化/关闭均为 no-drag，关闭行为由设置决定 -->
     <div
       data-testid="title-bar"
       class="h-10 shrink-0 flex items-center bg-panel select-none"
@@ -206,10 +206,11 @@ async function closeWindowToTray() {
           <UiIcon :name="isMaximized ? 'winRestore' : 'winMaximize'" :size="13" />
         </button>
         <button
+          data-testid="title-close"
           class="w-11 flex items-center justify-center text-ink-secondary hover:bg-red-500 hover:text-white"
-          title="关闭"
-          aria-label="关闭窗口（隐藏到托盘）"
-          @click="closeWindowToTray"
+          :title="settings.closeToTray ? '关闭窗口（隐藏到托盘）' : '关闭窗口（退出软件）'"
+          :aria-label="settings.closeToTray ? '关闭窗口（隐藏到托盘）' : '关闭窗口（退出软件）'"
+          @click="closeWindow"
         >
           <UiIcon name="close" :size="14" />
         </button>
@@ -217,105 +218,105 @@ async function closeWindowToTray() {
     </div>
 
     <div class="flex-1 min-h-0 flex">
-    <!-- 全局导航：64px，图标 + 12px 文字（F21），当前项有语义标记（F20） -->
-    <nav
-      class="w-16 shrink-0 flex flex-col items-center pt-4 pb-3 border-r border-line-subtle bg-panel"
-      aria-label="主导航"
-    >
-      <button
-        v-for="n in navs"
-        :key="n.key"
-        :data-testid="'nav-' + n.key"
-        class="w-12 h-[52px] rounded-xl flex flex-col items-center justify-center gap-0.5 text-xs font-medium leading-none"
-        :class="
-          ui.view === n.key
-            ? 'bg-panel text-brand-ink shadow-none'
-            : 'text-ink-muted hover:bg-surface hover:text-ink-primary'
-        "
-        :aria-current="ui.view === n.key ? 'page' : undefined"
-        @click="ui.view = n.key"
+      <!-- 全局导航：64px，图标 + 12px 文字（F21），当前项有语义标记（F20） -->
+      <nav
+        class="w-16 shrink-0 flex flex-col items-center pt-4 pb-3 border-r border-line-subtle bg-panel"
+        aria-label="主导航"
       >
-        <UiIcon :name="n.icon" :size="20" />
-        {{ n.label }}
-      </button>
-      <div class="flex-1" />
-      <button
-        class="icon-btn"
-        :title="'主题: ' + themeLabel[ui.theme]"
-        aria-label="切换主题"
-        @click="cycleTheme"
-      >
-        <UiIcon name="theme" :size="20" />
-      </button>
-      <!-- 更新入口：主题按钮下方，仅当 GitHub 上有本地没有的提交时出现。
-           用描边而非填充底色，避免与导航选中态（brand-soft 填充）混淆 -->
-      <button
-        v-if="updater.shouldShow"
-        class="relative mt-1.5 w-12 h-[52px] rounded-xl flex flex-col items-center justify-center gap-0.5 text-xs font-medium leading-none text-brand-ink border border-brand/45 hover:bg-brand-soft"
-        data-testid="nav-update"
-        :title="'GitHub 有新提交（' + updater.behindText + '），点击查看'"
-        aria-label="有可用更新"
-        @click="openUpdate"
-      >
-        <span class="relative">
-          <UiIcon name="download" :size="20" />
-          <span
-            class="absolute -right-1.5 -top-1 h-2 w-2 rounded-full bg-red-500 ring-2 ring-chrome"
-            aria-hidden="true"
-          />
-        </span>
-        更新
-      </button>
-    </nav>
-
-    <main class="flex-1 min-w-0 relative">
-      <ChatView v-show="ui.view === 'chat'" />
-      <KbView v-show="ui.view === 'kb'" />
-      <AgentView v-show="ui.view === 'agent'" />
-      <SettingsView v-show="ui.view === 'settings'" />
-      <RemotePanel v-if="ui.view === 'remote'" />
-    </main>
-
-    <ConfirmCard />
-    <UpdateDialog :open="updateOpen" @close="updateOpen = false" />
-    <ConfirmDialog
-      :open="!!ui.confirmState"
-      :title="ui.confirmState ? ui.confirmState.title : ''"
-      :message="ui.confirmState ? ui.confirmState.message : ''"
-      :impact="ui.confirmState ? ui.confirmState.impact : ''"
-      :confirm-text="ui.confirmState ? ui.confirmState.confirmText : '删除'"
-      :danger="ui.confirmState ? ui.confirmState.danger : true"
-      @confirm="ui.resolveConfirm(true)"
-      @cancel="ui.resolveConfirm(false)"
-    />
-
-    <!-- 通知区：不抢焦点，错误可手动关闭（F22），有播报语义（F20） -->
-    <div
-      class="fixed top-3 left-1/2 -translate-x-1/2 z-[80] space-y-2 pointer-events-none w-[min(420px,90vw)]"
-    >
-      <div
-        v-for="t in ui.toasts"
-        :key="t.id"
-        class="pointer-events-auto flex items-start gap-2 rounded-xl border px-3.5 py-2.5 text-xs shadow-menu"
-        :class="toastCls[t.level] || toastCls.info"
-        :role="t.level === 'error' ? 'alert' : 'status'"
-      >
-        <UiIcon
-          v-if="toastIcon[t.level]"
-          :name="toastIcon[t.level]"
-          :size="16"
-          class="mt-0.5 shrink-0"
-        />
-        <span class="flex-1 whitespace-pre-wrap">{{ t.message }}</span>
         <button
-          class="shrink-0 rounded p-0.5 opacity-70 hover:opacity-100"
-          aria-label="关闭提示"
-          @click="ui.dismissToast(t.id)"
+          v-for="n in navs"
+          :key="n.key"
+          :data-testid="'nav-' + n.key"
+          class="w-12 h-[52px] rounded-xl flex flex-col items-center justify-center gap-0.5 text-xs font-medium leading-none"
+          :class="
+            ui.view === n.key
+              ? 'bg-panel text-brand-ink shadow-none'
+              : 'text-ink-muted hover:bg-surface hover:text-ink-primary'
+          "
+          :aria-current="ui.view === n.key ? 'page' : undefined"
+          @click="ui.view = n.key"
         >
-          <UiIcon name="close" :size="14" />
+          <UiIcon :name="n.icon" :size="20" />
+          {{ n.label }}
         </button>
+        <div class="flex-1" />
+        <button
+          class="icon-btn"
+          :title="'主题: ' + themeLabel[ui.theme]"
+          aria-label="切换主题"
+          @click="cycleTheme"
+        >
+          <UiIcon name="theme" :size="20" />
+        </button>
+        <!-- 更新入口：主题按钮下方，仅当 GitHub 上有本地没有的提交时出现。
+           用描边而非填充底色，避免与导航选中态（brand-soft 填充）混淆 -->
+        <button
+          v-if="updater.shouldShow"
+          class="relative mt-1.5 w-12 h-[52px] rounded-xl flex flex-col items-center justify-center gap-0.5 text-xs font-medium leading-none text-brand-ink border border-brand/45 hover:bg-brand-soft"
+          data-testid="nav-update"
+          :title="'GitHub 有新提交（' + updater.behindText + '），点击查看'"
+          aria-label="有可用更新"
+          @click="openUpdate"
+        >
+          <span class="relative">
+            <UiIcon name="download" :size="20" />
+            <span
+              class="absolute -right-1.5 -top-1 h-2 w-2 rounded-full bg-red-500 ring-2 ring-chrome"
+              aria-hidden="true"
+            />
+          </span>
+          更新
+        </button>
+      </nav>
+
+      <main class="flex-1 min-w-0 relative">
+        <ChatView v-show="ui.view === 'chat'" />
+        <KbView v-show="ui.view === 'kb'" />
+        <AgentView v-show="ui.view === 'agent'" />
+        <SettingsView v-show="ui.view === 'settings'" />
+        <RemotePanel v-if="ui.view === 'remote'" />
+      </main>
+
+      <ConfirmCard />
+      <UpdateDialog :open="updateOpen" @close="updateOpen = false" />
+      <ConfirmDialog
+        :open="!!ui.confirmState"
+        :title="ui.confirmState ? ui.confirmState.title : ''"
+        :message="ui.confirmState ? ui.confirmState.message : ''"
+        :impact="ui.confirmState ? ui.confirmState.impact : ''"
+        :confirm-text="ui.confirmState ? ui.confirmState.confirmText : '删除'"
+        :danger="ui.confirmState ? ui.confirmState.danger : true"
+        @confirm="ui.resolveConfirm(true)"
+        @cancel="ui.resolveConfirm(false)"
+      />
+
+      <!-- 通知区：不抢焦点，错误可手动关闭（F22），有播报语义（F20） -->
+      <div
+        class="fixed top-3 left-1/2 -translate-x-1/2 z-[80] space-y-2 pointer-events-none w-[min(420px,90vw)]"
+      >
+        <div
+          v-for="t in ui.toasts"
+          :key="t.id"
+          class="pointer-events-auto flex items-start gap-2 rounded-xl border px-3.5 py-2.5 text-xs shadow-menu"
+          :class="toastCls[t.level] || toastCls.info"
+          :role="t.level === 'error' ? 'alert' : 'status'"
+        >
+          <UiIcon
+            v-if="toastIcon[t.level]"
+            :name="toastIcon[t.level]"
+            :size="16"
+            class="mt-0.5 shrink-0"
+          />
+          <span class="flex-1 whitespace-pre-wrap">{{ t.message }}</span>
+          <button
+            class="shrink-0 rounded p-0.5 opacity-70 hover:opacity-100"
+            aria-label="关闭提示"
+            @click="ui.dismissToast(t.id)"
+          >
+            <UiIcon name="close" :size="14" />
+          </button>
+        </div>
       </div>
-    </div>
     </div>
   </div>
 </template>

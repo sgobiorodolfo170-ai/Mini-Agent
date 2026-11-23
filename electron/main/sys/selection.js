@@ -1,4 +1,5 @@
 const { spawn } = require('child_process')
+const { processRegistry } = require('../lifecycle')
 
 // 划词 capture: simulate Ctrl+C on the focused window, then diff the clipboard.
 // `simulate` is injectable so tests can stub the keystroke.
@@ -15,6 +16,7 @@ function simulateCopy() {
         ],
         { windowsHide: true }
       )
+      processRegistry.track(p)
       p.on('error', () => resolve())
       p.on('close', () => resolve())
     } catch {

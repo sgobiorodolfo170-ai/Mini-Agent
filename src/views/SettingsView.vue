@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import UiDialog from '../components/UiDialog.vue'
 import UiIcon from '../components/UiIcon.vue'
@@ -16,7 +16,8 @@ const sections = [
   { key: 'hotkeys', label: '快捷键' },
   { key: 'agent', label: '智能任务' },
   { key: 'appearance', label: '外观' },
-  { key: 'data', label: '数据' }
+  { key: 'data', label: '数据' },
+  { key: 'logs', label: '运行日志' }
 ]
 // 当前分组持久在 ui.settingsSection
 const section = computed({
@@ -461,6 +462,18 @@ async function toggleBall(v) {
   await settings.set('showBall', v)
   ui.toast(v ? '已开启悬浮球（重启后生效）' : '已关闭悬浮球（重启后生效）')
 }
+async function toggleCloseToTray(v) {
+  const prev = settings.closeToTray
+  // 乐观更新：checkbox 的视觉状态跟随后端保存结果，失败时回滚。
+  settings.closeToTray = v
+  try {
+    await settings.set('closeToTray', v)
+    ui.toast(v ? '关闭窗口时将隐藏到托盘' : '关闭窗口时将退出软件')
+  } catch (e) {
+    settings.closeToTray = prev
+    ui.toast('关闭行为保存失败：' + String((e && e.message) || e), 'error')
+  }
+}
 
 // ---------- 数据 ----------
 async function exportData() {
@@ -498,6 +511,187 @@ function setModelParam(m, field, value) {
   if (!m) return
   const n = value === '' || value === null ? null : Number(value)
   m[field] = Number.isFinite(n) && n > 0 ? n : null
+}
+
+// ---------- 运行日志 ----------
+// 日志由主进程写入 userData/logs/runtime.log，这里只读最近 500 条；
+// 打开分组时拉取一次，自动刷新开启时每 2 秒轮询（只在当前分组运行）。
+const LOG_LIMIT = 500
+const logRows = ref([])
+const logLevel = ref('all')
+const logQuery = ref('')
+const logAutoRefresh = ref(true)
+const logLoading = ref(false)
+const logError = ref('')
+const logStats = ref({ size: 0, bytes: 0, path: '', dir: '' })
+const logExpanded = ref({})
+let logTimer = null
+
+const logLevelOptions = [
+  { value: 'all', label: '全部' },
+  { value: 'debug', label: '调试' },
+  { value: 'info', label: '信息' },
+  { value: 'warn', label: '警告' },
+  { value: 'error', label: '错误' }
+]
+const logLevelText = { debug: '调试', info: '信息', warn: '警告', error: '错误' }
+const logLevelClass = {
+  debug: 'bg-subtle text-ink-muted',
+  info: 'bg-hint text-hint-ink',
+  warn: 'bg-warn text-warn-ink',
+  error: 'bg-bad text-bad-ink'
+}
+// 事件中枢的内部事件名保留英文便于排查，同时给出中文语义。
+const eventLabels = {
+  'run.start': '任务开始',
+  'run.end': '任务结束',
+  'run.empty_result': '任务无输出',
+  'run.abort_requested': '请求中止任务',
+  'tool.before': '工具调用前',
+  'tool.after': '工具调用后',
+  'session.created': '子会话创建',
+  'session.send': '发送到会话',
+  'session.sent': '会话已发送',
+  'hook.fired': '钩子触发',
+  'mandate.denied': '授权拒绝',
+  stale_event_ignored: '忽略过期事件',
+  'chat:event': '对话事件',
+  'agent:event': '任务事件',
+  'keys:event': 'Key 事件',
+  'models:progress': '模型下载',
+  'kb:progress': '知识库进度',
+  'app:notice': '应用通知',
+  'updater:changed': '更新状态',
+  'remote:changed': '远程控制'
+}
+function logDisplayMessage(e) {
+  if (e.scope !== 'event') return e.message
+  const label = eventLabels[e.message]
+  return label ? `${label}（${e.message}）` : e.message
+}
+
+const filteredLogs = computed(() => {
+  const q = logQuery.value.trim().toLowerCase()
+  return logRows.value.filter((e) => {
+    if (logLevel.value !== 'all' && e.level !== logLevel.value) return false
+    if (!q) return true
+    return `${e.level} ${e.scope || ''} ${e.message || ''} ${e.data || ''}`
+      .toLowerCase()
+      .includes(q)
+  })
+})
+
+async function loadLogs() {
+  if (!window.api.logs || logLoading.value) return
+  logLoading.value = true
+  try {
+    const [rows, stats] = await Promise.all([
+      window.api.logs.list({ limit: LOG_LIMIT }),
+      window.api.logs.stats()
+    ])
+    logRows.value = Array.isArray(rows) ? rows : []
+    logStats.value = stats || {}
+    logError.value = ''
+  } catch (e) {
+    logError.value = String((e && e.message) || e)
+  } finally {
+    logLoading.value = false
+  }
+}
+
+function syncLogTimer() {
+  if (section.value === 'logs' && logAutoRefresh.value) {
+    if (!logTimer) logTimer = setInterval(loadLogs, 2000)
+  } else if (logTimer) {
+    clearInterval(logTimer)
+    logTimer = null
+  }
+}
+
+watch(section, (v) => {
+  if (v === 'logs') loadLogs()
+  syncLogTimer()
+})
+watch(logAutoRefresh, syncLogTimer)
+onMounted(() => {
+  if (section.value === 'logs') {
+    loadLogs()
+    syncLogTimer()
+  }
+})
+onBeforeUnmount(() => {
+  if (logTimer) clearInterval(logTimer)
+  logTimer = null
+})
+
+function formatLogTime(at) {
+  const d = new Date(Number(at) || 0)
+  if (Number.isNaN(d.getTime())) return ''
+  const pad = (n, len = 2) => String(n).padStart(len, '0')
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(
+    d.getMinutes()
+  )}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`
+}
+
+function formatLogBytes(n) {
+  const v = Number(n) || 0
+  if (v < 1024) return `${v} B`
+  if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} KB`
+  return `${(v / 1024 / 1024).toFixed(1)} MB`
+}
+
+function prettyLogData(raw) {
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2)
+  } catch {
+    return String(raw || '')
+  }
+}
+
+async function copyLogs() {
+  if (!filteredLogs.value.length) return
+  const text = filteredLogs.value
+    .map((e) =>
+      [formatLogTime(e.at), e.level, e.scope || '', e.message || '', e.data || '']
+        .filter(Boolean)
+        .join('  ')
+    )
+    .join('\n')
+  try {
+    await navigator.clipboard.writeText(text)
+    ui.toast('已复制当前日志', 'success')
+  } catch {
+    ui.toast('复制失败', 'error')
+  }
+}
+
+async function clearLogs() {
+  if (!window.api.logs) return
+  const ok = await ui.confirm({
+    title: '清空运行日志',
+    message: '将删除当前运行日志的全部记录。',
+    impact: '清空后不可恢复；不影响会话、知识库和任务数据。',
+    confirmText: '清空'
+  })
+  if (!ok) return
+  try {
+    await window.api.logs.clear()
+    logExpanded.value = {}
+    await loadLogs()
+    ui.toast('运行日志已清空', 'success')
+  } catch (e) {
+    ui.toast('清空失败：' + String((e && e.message) || e), 'error')
+  }
+}
+
+async function openLogFolder() {
+  if (!window.api.logs) return
+  try {
+    const ok = await window.api.logs.openFolder()
+    if (!ok) ui.toast('无法打开日志目录', 'warn')
+  } catch (e) {
+    ui.toast('打开失败：' + String((e && e.message) || e), 'error')
+  }
 }
 </script>
 
@@ -1134,6 +1328,20 @@ function setModelParam(m, field, value) {
           <!-- 外观 -->
           <section v-show="section === 'appearance'" class="space-y-4">
             <h2 class="text-base font-semibold">外观</h2>
+            <div class="flex items-center gap-2 text-sm">
+              <label class="flex items-center gap-2 cursor-pointer min-h-[36px]">
+                <input
+                  type="checkbox"
+                  data-testid="close-to-tray"
+                  :checked="settings.closeToTray"
+                  @change="toggleCloseToTray($event.target.checked)"
+                />
+                <span>关闭窗口时隐藏到托盘</span>
+              </label>
+            </div>
+            <p class="text-xs text-ink-muted -mt-2">
+              关闭此选项后，点击关闭按钮会退出软件；托盘菜单的「退出」始终真正退出。
+            </p>
             <div class="flex items-center gap-6 text-sm flex-wrap">
               <div class="flex items-center gap-4">
                 <span class="text-ink-secondary">主题</span>
@@ -1191,6 +1399,149 @@ function setModelParam(m, field, value) {
                 · 构建 {{ settings.info.commit.slice(0, 7) }}</span
               >
               · {{ settings.info.driver }} · 数据目录 {{ settings.info.dataDir }}
+            </div>
+          </section>
+
+          <!-- 运行日志：主进程控制台 + 事件中枢 + 显式业务日志 -->
+          <section v-show="section === 'logs'" class="space-y-4">
+            <div class="flex items-start justify-between gap-3 flex-wrap">
+              <div>
+                <h2 class="text-base font-semibold">运行日志</h2>
+                <p class="text-xs text-ink-muted mt-1">
+                  记录应用启动、任务与工具调用、后台事件和主进程告警。界面展示最近
+                  {{ LOG_LIMIT }} 条，完整日志按 JSONL 写入本地文件，敏感字段会脱敏。
+                </p>
+              </div>
+              <div class="flex items-center gap-2 flex-wrap">
+                <button
+                  class="btn-secondary !h-8 text-xs"
+                  data-testid="log-refresh"
+                  :disabled="logLoading"
+                  @click="loadLogs"
+                >
+                  刷新
+                </button>
+                <button
+                  class="btn-secondary !h-8 text-xs"
+                  data-testid="log-open-folder"
+                  @click="openLogFolder"
+                >
+                  打开日志目录
+                </button>
+                <button
+                  class="btn-secondary !h-8 text-xs"
+                  data-testid="log-copy"
+                  :disabled="!filteredLogs.length"
+                  @click="copyLogs"
+                >
+                  复制当前列表
+                </button>
+                <button
+                  class="btn-secondary !h-8 text-xs hover:!text-red-500"
+                  data-testid="log-clear"
+                  @click="clearLogs"
+                >
+                  清空
+                </button>
+              </div>
+            </div>
+
+            <div class="card overflow-hidden">
+              <div
+                class="flex flex-wrap items-center gap-2 px-3 py-2 border-b border-line-subtle bg-subtle"
+              >
+                <label class="flex items-center gap-1.5 text-xs text-ink-secondary">
+                  <input v-model="logAutoRefresh" type="checkbox" data-testid="log-auto-refresh" />
+                  自动刷新
+                </label>
+                <select
+                  v-model="logLevel"
+                  class="field-input !h-8 !w-24 text-xs"
+                  data-testid="log-level"
+                  aria-label="日志级别"
+                >
+                  <option v-for="o in logLevelOptions" :key="o.value" :value="o.value">
+                    {{ o.label }}
+                  </option>
+                </select>
+                <input
+                  v-model="logQuery"
+                  class="field-input !h-8 !w-64 text-xs"
+                  data-testid="log-search"
+                  placeholder="搜索级别 / 范围 / 内容"
+                  aria-label="搜索日志"
+                />
+                <span class="text-xs text-ink-muted ml-auto whitespace-nowrap">
+                  显示 {{ filteredLogs.length }} / {{ logRows.length }} 条 · 文件
+                  {{ formatLogBytes(logStats.bytes) }}
+                </span>
+              </div>
+
+              <div class="max-h-[560px] overflow-y-auto">
+                <div
+                  v-if="logLoading && !logRows.length"
+                  class="px-4 py-10 text-center text-xs text-ink-muted"
+                  role="status"
+                >
+                  正在加载运行日志…
+                </div>
+                <div
+                  v-else-if="!filteredLogs.length"
+                  class="px-4 py-10 text-center text-xs text-ink-muted"
+                >
+                  {{ logRows.length ? '没有匹配的日志' : '暂无运行日志' }}
+                </div>
+                <template v-else>
+                  <div
+                    v-for="e in filteredLogs"
+                    :key="e.id"
+                    class="px-3 py-2 border-b border-line-subtle last:border-b-0 font-code text-xs"
+                    data-testid="log-row"
+                  >
+                    <div class="flex items-start gap-2">
+                      <span
+                        class="shrink-0 text-ink-muted w-[148px]"
+                        :title="new Date(e.at).toLocaleString('zh-CN')"
+                        >{{ formatLogTime(e.at) }}</span
+                      >
+                      <span
+                        class="badge shrink-0"
+                        :class="logLevelClass[e.level] || logLevelClass.info"
+                        >{{ logLevelText[e.level] || e.level }}</span
+                      >
+                      <span class="shrink-0 text-ink-muted">{{ e.scope }}</span>
+                      <span
+                        class="min-w-0 flex-1 whitespace-pre-wrap break-words"
+                        :class="
+                          e.level === 'error'
+                            ? 'text-bad-ink'
+                            : e.level === 'warn'
+                              ? 'text-warn-ink'
+                              : 'text-ink-primary'
+                        "
+                        >{{ logDisplayMessage(e) }}</span
+                      >
+                      <button
+                        v-if="e.data"
+                        type="button"
+                        class="shrink-0 text-link hover:underline"
+                        @click="logExpanded[e.id] = !logExpanded[e.id]"
+                      >
+                        {{ logExpanded[e.id] ? '收起' : '详情' }}
+                      </button>
+                    </div>
+                    <pre
+                      v-if="e.data && logExpanded[e.id]"
+                      class="mt-1.5 p-2 rounded-lg bg-subtle overflow-x-auto max-h-64 whitespace-pre-wrap break-words"
+                      >{{ prettyLogData(e.data) }}</pre>
+                  </div>
+                </template>
+              </div>
+            </div>
+
+            <div class="flex items-center gap-2 text-xs text-ink-muted flex-wrap">
+              <span class="break-all">日志文件：{{ logStats.path || '（未初始化）' }}</span>
+              <span v-if="logError" class="text-bad-ink">{{ logError }}</span>
             </div>
           </section>
         </div>

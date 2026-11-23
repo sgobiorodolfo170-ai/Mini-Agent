@@ -11,6 +11,7 @@ const { searchKbVectors, invalidate } = require('./faiss-index')
 const { extractText } = require('./extract')
 const { decryptSecret } = require('../../store/keys')
 const { broadcast } = require('../notify')
+const { isShuttingDown } = require('../lifecycle')
 
 function chunkOpts(db) {
   return {
@@ -118,6 +119,10 @@ async function importDocs({ kbId, paths }) {
   const total = paths.length
   let done = 0
   for (const p of paths) {
+    if (isShuttingDown()) {
+      broadcast('kb:progress', { kbId, done: true, total, aborted: true })
+      return { done, aborted: true }
+    }
     try {
       const r = await processDoc(db, kb, p)
       done++
@@ -154,6 +159,10 @@ async function rebuildKb({ kbId }) {
   const total = docs.length
   let done = 0
   for (const d of docs) {
+    if (isShuttingDown()) {
+      broadcast('kb:progress', { kbId, done: true, total, aborted: true })
+      return { done, aborted: true }
+    }
     try {
       await processDoc(db, kb, d.path, { existingDocId: d.id })
     } catch (e) {

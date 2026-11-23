@@ -27,7 +27,9 @@ function request(method, urlPath, { body, cookie, headers = {} } = {}) {
         method,
         rejectUnauthorized: false,
         headers: {
-          ...(payload ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) } : {}),
+          ...(payload
+            ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) }
+            : {}),
           ...(cookie ? { cookie } : {}),
           ...headers
         }
@@ -37,7 +39,11 @@ function request(method, urlPath, { body, cookie, headers = {} } = {}) {
         res.on('data', (c) => (data += c))
         res.on('end', () => {
           let json = null
-          try { json = data ? JSON.parse(data) : null } catch { json = { raw: data } }
+          try {
+            json = data ? JSON.parse(data) : null
+          } catch {
+            json = { raw: data }
+          }
           resolve({ status: res.statusCode, body: json, headers: res.headers })
         })
       }
@@ -61,7 +67,9 @@ function connectWs(cookie) {
 }
 
 function nextMessage(ws) {
-  return new Promise((resolve) => ws.once('message', (data) => resolve(JSON.parse(data.toString()))))
+  return new Promise((resolve) =>
+    ws.once('message', (data) => resolve(JSON.parse(data.toString())))
+  )
 }
 
 async function pairDevice() {
@@ -103,7 +111,9 @@ describe('远程服务 HTTPS/WSS 集成', () => {
     expect(again.status).toBe(410)
     expect(manager.auth.listDevices().filter((d) => d.status === 'active')).toHaveLength(1)
 
-    const login = await request('POST', '/api/v1/auth/session', { body: { deviceId, deviceSecret } })
+    const login = await request('POST', '/api/v1/auth/session', {
+      body: { deviceId, deviceSecret }
+    })
     expect(login.status).toBe(200)
     const cookie = String(login.headers['set-cookie'][0]).split(';')[0]
     expect(cookie).toContain('miniagent_remote=')
@@ -127,18 +137,34 @@ describe('远程服务 HTTPS/WSS 集成', () => {
 
   it('WSS 同源 Cookie 认证、心跳与事件推送', async () => {
     const { deviceId, deviceSecret } = await pairDevice()
-    const login = await request('POST', '/api/v1/auth/session', { body: { deviceId, deviceSecret } })
+    const login = await request('POST', '/api/v1/auth/session', {
+      body: { deviceId, deviceSecret }
+    })
     const cookie = String(login.headers['set-cookie'][0]).split(';')[0]
 
     const ws = await connectWs(cookie)
     const hb = nextMessage(ws)
-    ws.send(JSON.stringify({ v: 1, id: 'h1', kind: 'command', type: 'device.heartbeat', request_id: 'hb-req-0001', payload: {} }))
+    ws.send(
+      JSON.stringify({
+        v: 1,
+        id: 'h1',
+        kind: 'command',
+        type: 'device.heartbeat',
+        request_id: 'hb-req-0001',
+        payload: {}
+      })
+    )
     const msg = await hb
     expect(msg.type).toBe('device.heartbeat')
 
     // 服务端产生一条该会话的事件，手机应收到
     const evt = nextMessage(ws)
-    manager.events.record({ type: 'run.status.changed', conversationId: conv.id, runId: 'r1', payload: { status: 'running' } })
+    manager.events.record({
+      type: 'run.status.changed',
+      conversationId: conv.id,
+      runId: 'r1',
+      payload: { status: 'running' }
+    })
     const received = await evt
     expect(received.type).toBe('run.status.changed')
     expect(received.conversation_id).toBe(conv.id)
@@ -148,7 +174,9 @@ describe('远程服务 HTTPS/WSS 集成', () => {
 
   it('WSS 错误 Origin 被拒绝', async () => {
     const { deviceId, deviceSecret } = await pairDevice()
-    const login = await request('POST', '/api/v1/auth/session', { body: { deviceId, deviceSecret } })
+    const login = await request('POST', '/api/v1/auth/session', {
+      body: { deviceId, deviceSecret }
+    })
     const cookie = String(login.headers['set-cookie'][0]).split(';')[0]
     const addr = manager.app.server.address()
     await expect(
@@ -165,7 +193,9 @@ describe('远程服务 HTTPS/WSS 集成', () => {
 
   it('设备撤销后旧 Cookie 与 WSS 命令失效', async () => {
     const { deviceId, deviceSecret } = await pairDevice()
-    const login = await request('POST', '/api/v1/auth/session', { body: { deviceId, deviceSecret } })
+    const login = await request('POST', '/api/v1/auth/session', {
+      body: { deviceId, deviceSecret }
+    })
     const cookie = String(login.headers['set-cookie'][0]).split(';')[0]
     const ws = await connectWs(cookie)
 
@@ -174,7 +204,9 @@ describe('远程服务 HTTPS/WSS 集成', () => {
     expect(after.status).toBe(401)
 
     // 旧 secret 也不能再换新会话
-    const relogin = await request('POST', '/api/v1/auth/session', { body: { deviceId, deviceSecret } })
+    const relogin = await request('POST', '/api/v1/auth/session', {
+      body: { deviceId, deviceSecret }
+    })
     expect(relogin.status).toBe(401)
     ws.close()
   })
