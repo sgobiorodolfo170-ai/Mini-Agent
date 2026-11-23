@@ -153,6 +153,30 @@ class RemoteCommandRouter {
       })
       return { status: 'accepted', runId: result.runId, reused: !!result.reused }
     }
+    if (c.type === 'agent.run.retry') {
+      const runId = p.runId || c.run_id
+      const run = repos.getRun(this.db, runId)
+      if (!run) throw remoteError('NOT_FOUND', '任务不存在', 404)
+      this.auth.requireGrant(auth, run.conversationId, 'operate')
+      const mode = p.mode === 'retry' ? 'retry' : 'continue'
+      const result =
+        mode === 'retry'
+          ? await agent.retryInterruptedRun(runId, {
+              actor: `remote:${auth.deviceId}`,
+              reason: p.reason,
+              idempotencyKey: `${auth.deviceId}:${c.request_id}`
+            })
+          : agent.resumeInterruptedRun(runId, {
+              actor: `remote:${auth.deviceId}`,
+              reason: p.reason
+            })
+      return {
+        status: 'accepted',
+        runId: result.runId,
+        mode,
+        retryOfRunId: result.retryOfRunId || (mode === 'retry' ? runId : null)
+      }
+    }
     if (['agent.run.pause', 'agent.run.resume', 'agent.run.stop'].includes(c.type)) {
       const runId = p.runId || c.run_id
       const run = repos.getRun(this.db, runId)

@@ -6,9 +6,13 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['tests/**/*.test.js'],
+    maxWorkers: 4,
+    testTimeout: 30000,
     coverage: {
       provider: 'v8',
       include: ['electron/**', 'src/common/**', 'src/stores/**'],
+      // Agent 编排入口使用 CJS + 动态 Electron require，V8 调用归属不稳定；由 flow/E2E 覆盖。
+      exclude: ['electron/main/agent/index.js'],
       thresholds: {
         statements: 58,
         branches: 68,

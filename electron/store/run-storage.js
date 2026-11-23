@@ -1,5 +1,5 @@
 const fs = require('fs')
-const { transaction } = require('../main/remote/protocol')
+const { transaction, canonicalJson } = require('../main/remote/protocol')
 const { redact } = require('../main/runtime-log')
 
 const MAX_CHECKPOINT_BYTES = 256 * 1024
@@ -112,12 +112,211 @@ function loadCheckpoint(db, runId) {
   }
 }
 
+function assessCheckpoint(db, runId, checkpoint) {
+  if (!checkpoint) return { ok: false, reason: 'checkpoint_missing' }
+  if (!checkpoint.messages.length) return { ok: false, reason: 'checkpoint_empty' }
+  if (checkpoint.phase !== 'model_done') {
+    if (!['before_model', 'tool_done'].includes(checkpoint.phase))
+      return { ok: false, reason: 'unsafe_checkpoint' }
+    if (checkpoint.pendingTools.length) return { ok: false, reason: 'pending_tools' }
+    return { ok: true, checkpoint, recoveredCalls: [] }
+  }
+
+  const messages = checkpoint.messages
+  const assistantIndex = messages.findLastIndex(
+    (message) => message.role === 'assistant' && Array.isArray(message.tool_calls)
+  )
+  if (assistantIndex < 0) return { ok: false, reason: 'model_done_batch_missing' }
+  const trailing = messages.slice(assistantIndex + 1)
+  if (trailing.some((message) => message.role !== 'tool'))
+    return { ok: false, reason: 'model_done_trailing_message' }
+  const calls = messages[assistantIndex].tool_calls
+  if (!calls.length) return { ok: false, reason: 'model_done_batch_empty' }
+  const ids = calls.map((call) => call && call.id)
+  if (ids.some((id) => typeof id !== 'string' || !id) || new Set(ids).size !== ids.length)
+    return { ok: false, reason: 'model_done_call_id_invalid' }
+
+  const existing = new Map()
+  for (const message of trailing) {
+    const id = message.tool_call_id
+    if (!ids.includes(id) || existing.has(id))
+      return { ok: false, reason: 'model_done_tool_message_conflict' }
+    existing.set(id, message)
+  }
+  const expectedPending = calls.slice(existing.size).map((call) => call.id)
+  const existingIds = [...existing.keys()]
+  if (
+    canonicalJson(existingIds) !==
+    canonicalJson(calls.slice(0, existing.size).map((call) => call.id))
+  )
+    return { ok: false, reason: 'model_done_tool_order_conflict' }
+  const pendingIds = checkpoint.pendingTools.map((call) => call && call.id)
+  if (canonicalJson(pendingIds) !== canonicalJson(expectedPending))
+    return { ok: false, reason: 'model_done_pending_mismatch' }
+
+  const recoveredCalls = []
+  for (let index = 0; index < calls.length; index++) {
+    const call = calls[index]
+    const message = existing.get(call.id)
+    let parsedArgs = null
+    try {
+      parsedArgs = JSON.parse((call.function && call.function.arguments) || '{}')
+    } catch {
+      return { ok: false, reason: 'model_done_args_invalid' }
+    }
+    const rows = db
+      .prepare(`SELECT * FROM agent_tool_calls WHERE run_id=? AND call_id=? ORDER BY id`)
+      .all(runId, call.id)
+    if (rows.length > 1) return { ok: false, reason: 'model_done_ledger_duplicate' }
+    const ledger = rows[0]
+    const name = call.function && call.function.name
+    if (ledger) {
+      if (!['done', 'failed'].includes(ledger.status) || !ledger.finished_at)
+        return { ok: false, reason: 'model_done_tool_unsettled' }
+      if (ledger.tool !== name) return { ok: false, reason: 'model_done_tool_mismatch' }
+      let ledgerArgs = null
+      try {
+        ledgerArgs = JSON.parse(ledger.args)
+      } catch {
+        return { ok: false, reason: 'model_done_ledger_args_invalid' }
+      }
+      if (canonicalJson(ledgerArgs) !== canonicalJson(parsedArgs))
+        return { ok: false, reason: 'model_done_args_mismatch' }
+      if (ledger.status === 'failed' && !ledger.error)
+        return { ok: false, reason: 'model_done_failure_incomplete' }
+    }
+    if (message) {
+      if (ledger) {
+        const expected = ledger.error
+          ? `工具执行失败: ${ledger.error}`
+          : String(ledger.result || '')
+        if (String(message.content || '') !== expected)
+          return { ok: false, reason: 'model_done_result_mismatch' }
+      }
+      continue
+    }
+    if (!ledger) return { ok: false, reason: 'model_done_tool_unsettled' }
+    const content = ledger.error ? `工具执行失败: ${ledger.error}` : String(ledger.result || '')
+    trailing.push({ role: 'tool', tool_call_id: call.id, content })
+    recoveredCalls.push({ callId: call.id, tool: name, status: ledger.status })
+  }
+
+  return {
+    ok: true,
+    checkpoint: {
+      ...checkpoint,
+      phase: 'tool_done',
+      messages: [...messages.slice(0, assistantIndex + 1), ...trailing],
+      pendingTools: []
+    },
+    recoveredCalls
+  }
+}
+
+function persistCheckpointRecovery(db, runId, assessment) {
+  if (!assessment.ok || !assessment.recoveredCalls.length) return true
+  return saveCheckpoint(db, runId, {
+    phase: assessment.checkpoint.phase,
+    step: assessment.checkpoint.step,
+    messages: assessment.checkpoint.messages,
+    pendingToolCalls: [],
+    stepsUsed: assessment.checkpoint.stepsUsed
+  })
+}
+
 function clearCheckpoint(db, runId) {
   try {
     db.prepare('DELETE FROM run_checkpoints WHERE run_id=?').run(runId)
   } catch {
     // 清理失败不影响终态
   }
+}
+
+function inspectInterruptedRun(db, runId) {
+  const row = db
+    .prepare(
+      `SELECT id, status, parent_run_id AS parentRunId, graph_id AS graphId, max_steps AS maxSteps,
+        workspace_json AS workspaceJson, run_spec_json AS runSpecJson
+       FROM agent_runs WHERE id=?`
+    )
+    .get(runId)
+  if (!row) return { exists: false, canResume: false, reason: 'not_found' }
+  const parent = row.parentRunId
+    ? db.prepare('SELECT status FROM agent_runs WHERE id=?').get(row.parentRunId)
+    : null
+  const checkpoint = row.runSpecJson ? loadCheckpoint(db, runId) : null
+  const assessment = checkpoint ? assessCheckpoint(db, runId, checkpoint) : null
+  const unfinishedTools = db
+    .prepare(
+      `SELECT id, tool, status, started_at AS startedAt
+       FROM agent_tool_calls WHERE run_id=? AND status IN ('started','unknown') ORDER BY id`
+    )
+    .all(runId)
+  let workspace = null
+  let workspaceInvalid = false
+  try {
+    workspace = row.workspaceJson ? JSON.parse(row.workspaceJson) : null
+  } catch {
+    workspaceInvalid = true
+    workspace = null
+  }
+  let reason = ''
+  if (row.status !== 'interrupted') reason = 'not_interrupted'
+  else if (!row.runSpecJson) reason = 'run_spec_missing'
+  else if (row.parentRunId && (!parent || !['running', 'waiting_child'].includes(parent.status)))
+    reason = 'parent_unavailable'
+  else if (workspaceInvalid) reason = 'workspace_invalid'
+  else if (!checkpoint) reason = 'checkpoint_missing'
+  else if (!assessment.ok) reason = assessment.reason
+  else if (unfinishedTools.length) reason = 'unfinished_tools'
+  else if (checkpoint.stepsUsed >= (Number(row.maxSteps) || 15)) reason = 'max_steps_reached'
+  else if (row.graphId) reason = 'graph_node_requires_retry'
+  else if (workspace && workspace.mode === 'worktree' && !fs.existsSync(workspace.path))
+    reason = 'workspace_missing'
+  return {
+    exists: true,
+    canResume: !reason,
+    reason: reason || null,
+    checkpoint:
+      assessment && assessment.ok
+        ? {
+            phase: assessment.checkpoint.phase,
+            step: assessment.checkpoint.step,
+            stepsUsed: assessment.checkpoint.stepsUsed,
+            pendingTools: assessment.checkpoint.pendingTools
+          }
+        : null,
+    recoveredCalls: assessment && assessment.ok ? assessment.recoveredCalls : [],
+    unfinishedTools,
+    workspace: workspace
+      ? { mode: workspace.mode, path: workspace.path || '', branch: workspace.branch || '' }
+      : null
+  }
+}
+
+function requeueInterruptedRun(db, runId) {
+  const inspection = inspectInterruptedRun(db, runId)
+  if (!inspection.canResume) return { ok: false, reason: inspection.reason }
+  const checkpoint = loadCheckpoint(db, runId)
+  const assessment = assessCheckpoint(db, runId, checkpoint)
+  if (!assessment.ok || !persistCheckpointRecovery(db, runId, assessment))
+    return { ok: false, reason: assessment.ok ? 'checkpoint_write_failed' : assessment.reason }
+  const row = db
+    .prepare('SELECT assistant_message_id AS assistantMessageId FROM agent_runs WHERE id=?')
+    .get(runId)
+  const info = db
+    .prepare(
+      `UPDATE agent_runs SET status='queued', finished_reason=NULL, ended_at=NULL, claimed_at=NULL,
+         resume_count=resume_count+1, version=version+1
+       WHERE id=? AND status='interrupted'`
+    )
+    .run(runId)
+  if (!info.changes) return { ok: false, reason: 'state_conflict' }
+  if (row && row.assistantMessageId) {
+    db.prepare("UPDATE messages SET status='pending' WHERE id=?").run(row.assistantMessageId)
+  }
+  recordRunState(db, runId)
+  return { ok: true }
 }
 
 // 只恢复安全边界：模型调用前或工具全部完成；未知副作用一律不重放。
@@ -134,9 +333,9 @@ function autoResumeRuns(db) {
     if (!row.runSpecJson) continue
     const cp = loadCheckpoint(db, row.id)
     if (!cp) continue
-    if (!['before_model', 'tool_done'].includes(cp.phase)) continue
-    if (!cp.messages.length || cp.pendingTools.length) continue
-    if (cp.stepsUsed >= (Number(row.maxSteps) || 15)) continue
+    const assessment = assessCheckpoint(db, row.id, cp)
+    if (!assessment.ok) continue
+    if (assessment.checkpoint.stepsUsed >= (Number(row.maxSteps) || 15)) continue
     const unfinished = db
       .prepare(
         "SELECT 1 FROM agent_tool_calls WHERE run_id=? AND status IN ('started','unknown') LIMIT 1"
@@ -150,6 +349,7 @@ function autoResumeRuns(db) {
       workspace = null
     }
     if (workspace && workspace.mode === 'worktree' && !fs.existsSync(workspace.path)) continue
+    if (!persistCheckpointRecovery(db, row.id, assessment)) continue
 
     const info = db
       .prepare(
@@ -283,6 +483,8 @@ module.exports = {
   saveCheckpoint,
   loadCheckpoint,
   clearCheckpoint,
+  inspectInterruptedRun,
+  requeueInterruptedRun,
   autoResumeRuns,
   blockOrphanDependents,
   recoverRuns

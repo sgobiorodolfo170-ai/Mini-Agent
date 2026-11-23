@@ -81,6 +81,27 @@ async function pairDevice() {
   return { ticket, deviceId: req.body.deviceId, deviceSecret: req.body.deviceSecret }
 }
 
+async function createCookieSession() {
+  const { deviceId, deviceSecret } = await pairDevice()
+  const login = await request('POST', '/api/v1/auth/session', {
+    body: { deviceId, deviceSecret }
+  })
+  expect(login.status).toBe(200)
+  expect(login.body.csrf).toEqual(expect.any(String))
+  expect(login.body.csrf.length).toBeGreaterThan(0)
+  return {
+    cookie: String(login.headers['set-cookie'][0]).split(';')[0],
+    csrf: login.body.csrf
+  }
+}
+
+function expectCsrfInvalid(res) {
+  expect(res.status).toBe(403)
+  expect(res.body).toEqual({
+    error: { code: 'CSRF_INVALID', message: '请求校验失败', retryable: false }
+  })
+}
+
 beforeEach(async () => {
   dbm.close()
   dbm.open(':memory:')
@@ -133,6 +154,56 @@ describe('远程服务 HTTPS/WSS 集成', () => {
     const me = await request('GET', '/api/v1/devices/me', { cookie })
     expect(me.body.deviceId).toBe(deviceId)
     expect(JSON.stringify(me.body)).not.toContain(deviceSecret)
+  })
+
+  it('Cookie 写请求缺少或使用错误 CSRF Token 时返回统一 403', async () => {
+    const { cookie, csrf } = await createCookieSession()
+    const body = { title: 'CSRF 测试会话' }
+
+    const missing = await request('POST', '/api/v1/conversations', { cookie, body })
+    expectCsrfInvalid(missing)
+
+    const wrong = await request('POST', '/api/v1/conversations', {
+      cookie,
+      body,
+      headers: { 'x-csrf-token': csrf + '-wrong' }
+    })
+    expectCsrfInvalid(wrong)
+    expect(wrong.body).toEqual(missing.body)
+
+    const valid = await request('POST', '/api/v1/conversations', {
+      cookie,
+      body,
+      headers: { 'x-csrf-token': csrf }
+    })
+    expect(valid.status).toBe(200)
+    expect(valid.body.conversation.title).toBe(body.title)
+  })
+
+  it('logout 必须携带正确 CSRF Token，拒绝请求不会撤销会话', async () => {
+    const { cookie, csrf } = await createCookieSession()
+
+    const missing = await request('POST', '/api/v1/auth/logout', { cookie, body: {} })
+    expectCsrfInvalid(missing)
+    expect((await request('GET', '/api/v1/auth/status', { cookie })).body.authenticated).toBe(true)
+
+    const wrong = await request('POST', '/api/v1/auth/logout', {
+      cookie,
+      body: {},
+      headers: { 'x-csrf-token': csrf + '-wrong' }
+    })
+    expectCsrfInvalid(wrong)
+    expect((await request('GET', '/api/v1/auth/status', { cookie })).body.authenticated).toBe(true)
+
+    const valid = await request('POST', '/api/v1/auth/logout', {
+      cookie,
+      body: {},
+      headers: { 'x-csrf-token': csrf }
+    })
+    expect(valid.status).toBe(200)
+    expect(valid.body).toEqual({ ok: true })
+    expect(String(valid.headers['set-cookie'][0])).toContain('miniagent_remote=')
+    expect((await request('GET', '/api/v1/auth/status', { cookie })).body.authenticated).toBe(false)
   })
 
   it('WSS 同源 Cookie 认证、心跳与事件推送', async () => {

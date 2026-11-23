@@ -11,6 +11,10 @@ function stubApi() {
       calls: vi.fn(async () => [{ id: 'call1', name: 'write_file' }]),
       stop: vi.fn(async () => ({})),
       respond: vi.fn(async () => ({})),
+      recovery: vi.fn(async () => ({ runId: 'r1', canResume: true })),
+      mutateGraph: vi.fn(async () => ({ graphId: 'g1', etag: 'e2', nodes: [] })),
+      resumeInterrupted: vi.fn(async () => ({ id: 'r1', status: 'queued' })),
+      retryInterrupted: vi.fn(async () => ({ runId: 'r2', retryOfRunId: 'r1' })),
       acceptanceDecide: vi.fn(async () => ({ id: 'r1', acceptance_status: 'accepted' }))
     }
   }
@@ -32,8 +36,10 @@ describe('agent store', () => {
 
   it('select 设置 activeRunId 并加载调用明细', async () => {
     const s = useAgentStore()
+    await s.loadRuns()
     await s.select('r1')
     expect(s.activeRunId).toBe('r1')
+    expect(s.activeRun).toEqual({ id: 'r1', status: 'done' })
     expect(s.calls).toEqual([{ id: 'call1', name: 'write_file' }])
   })
 
@@ -93,6 +99,36 @@ describe('agent store', () => {
     window.api.agent.stop.mockResolvedValueOnce(false)
     s.stopRun('r1')
     expect(s.confirms.map((c) => c.requestId)).toEqual(['q2'])
+  })
+
+  it('continueInterrupted 从安全检查点继续并刷新当前任务', async () => {
+    const s = useAgentStore()
+    await s.continueInterrupted('r1', '已核对')
+    expect(window.api.agent.resumeInterrupted).toHaveBeenCalledWith({
+      runId: 'r1',
+      reason: '已核对'
+    })
+    expect(s.activeRunId).toBe('r1')
+  })
+
+  it('retryInterrupted 创建关联任务并切换到新任务', async () => {
+    const s = useAgentStore()
+    const retry = await s.retryInterrupted('r1', '已核对台账')
+    expect(window.api.agent.retryInterrupted).toHaveBeenCalledWith({
+      runId: 'r1',
+      reason: '已核对台账'
+    })
+    expect(retry.retryOfRunId).toBe('r1')
+    expect(s.activeRunId).toBe('r2')
+  })
+
+  it('mutateGraph 提交重规划并更新本地图状态', async () => {
+    const s = useAgentStore()
+    const input = { graphId: 'g1', etag: 'e1', ops: [] }
+    const result = await s.mutateGraph(input)
+    expect(window.api.agent.mutateGraph).toHaveBeenCalledWith(input)
+    expect(result.etag).toBe('e2')
+    expect(s.graph.etag).toBe('e2')
   })
 
   it('done 事件清掉该运行遗留的确认卡（含停止/出错路径）', () => {

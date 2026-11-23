@@ -11,7 +11,7 @@ describe('schema + settings', () => {
   it('migrates to v10 and roundtrips settings', () => {
     const row = dbm.get().prepare('PRAGMA user_version').get()
     expect(row.user_version).toBe(dbm.SCHEMA_VERSION)
-    expect(dbm.SCHEMA_VERSION).toBe(10)
+    expect(dbm.SCHEMA_VERSION).toBe(13)
     repos.setSetting(dbm.get(), 'theme', 'dark')
     repos.setSetting(dbm.get(), 'agentAuthorizedDirs', ['C:\\a', 'C:\\b'])
     expect(repos.getSetting(dbm.get(), 'theme')).toBe('dark')
@@ -204,11 +204,17 @@ describe('conversations + messages', () => {
 describe('projects + conversation categorization', () => {
   it('manages projects and detaches sessions on delete', () => {
     const db = dbm.get()
-    const p1 = repos.createProject(db, { name: '项目A', path: 'C:\\a' })
+    const p1 = repos.createProject(db, {
+      name: '项目A',
+      path: 'C:\\a',
+      workspaceVerifyCommand: 'npm test'
+    })
     const p2 = repos.createProject(db, { name: '项目B', path: 'C:\\b' })
     expect(repos.listProjects(db).map((p) => p.name)).toEqual(['项目A', '项目B'])
-    const up = repos.updateProject(db, p1.id, { name: '项目A2' })
+    expect(p1.workspaceVerifyCommand).toBe('npm test')
+    const up = repos.updateProject(db, p1.id, { name: '项目A2', workspaceVerifyCommand: '' })
     expect(up.name).toBe('项目A2')
+    expect(up.workspaceVerifyCommand).toBe('')
     expect(up.path).toBe('C:\\a')
     const cid = repos.createConversation(db, { title: '归组会话', projectId: p1.id }).id
     expect(repos.getConversation(db, cid).projectId).toBe(p1.id)
@@ -227,6 +233,62 @@ describe('projects + conversation categorization', () => {
     repos.softDeleteProject(db, p2.id)
     expect(repos.listProjects(db).map((p) => p.id)).toEqual([p1.id])
     expect(repos.getConversation(db, cid2).projectId).toBeNull()
+  })
+
+  it('persists P8 project verification, retry links and tool ledger state', () => {
+    const db = dbm.get()
+    const project = repos.createProject(db, {
+      name: 'P8',
+      path: 'C:\\p8',
+      workspaceVerifyCommand: 'npm test',
+      workspaceConflictStrategy: 'theirs'
+    })
+    expect(repos.listProjects(db)[0].workspaceVerifyCommand).toBe('npm test')
+    expect(repos.listProjects(db)[0].workspaceConflictStrategy).toBe('theirs')
+    const conversation = repos.createConversation(db, { title: 'P8', projectId: project.id })
+    repos.updateConversation(db, conversation.id, { title: 'P8 updated' })
+    expect(repos.listConversations(db)[0].title).toBe('P8 updated')
+    expect(repos.countProjectSessions(db, project.id)).toBe(1)
+
+    const original = repos.createRunEx(db, {
+      conversationId: conversation.id,
+      goal: 'original',
+      status: 'interrupted'
+    })
+    const retry = repos.createRunEx(db, {
+      conversationId: conversation.id,
+      goal: 'retry',
+      status: 'queued',
+      retryOfRunId: original.id
+    })
+    repos.setRunWorkspace(db, retry.id, { mode: 'worktree', path: 'C:\\wt' })
+    repos.updateRunAcceptance(db, retry.id, { status: 'accepted', result: { verdict: 'accepted' } })
+    expect(repos.getRun(db, retry.id)).toMatchObject({
+      retryOfRunId: original.id,
+      acceptanceStatus: 'accepted',
+      workspaceJson: JSON.stringify({ mode: 'worktree', path: 'C:\\wt' })
+    })
+    expect(repos.listRuns(db).map((run) => run.id)).toContain(retry.id)
+
+    const callId = repos.startToolCall(db, {
+      runId: retry.id,
+      step: 1,
+      tool: 'write_file',
+      args: { path: 'a.txt' },
+      riskLevel: 'side_effect',
+      confirmedBy: 'desktop',
+      callId: 'p8-call'
+    })
+    expect(repos.hasUnfinishedToolCalls(db, retry.id)).toBe(true)
+    repos.finishToolCall(db, callId, { result: 'ok', durationMs: 1 })
+    expect(repos.hasUnfinishedToolCalls(db, retry.id)).toBe(false)
+    expect(repos.getToolCallByCallId(db, retry.id, 'p8-call').status).toBe('done')
+    expect(() =>
+      repos.updateProject(db, project.id, { workspaceConflictStrategy: 'invalid' })
+    ).toThrow(/冲突策略/)
+
+    repos.softDeleteProject(db, project.id)
+    expect(repos.getConversation(db, conversation.id).projectId).toBeNull()
   })
 })
 

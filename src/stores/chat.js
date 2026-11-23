@@ -8,7 +8,7 @@ export const useChatStore = defineStore('chat', {
     messages: [],
     selectedKbIds: [],
     // 权限四级：default（普通对话）/ readonly（只读任务，写入类直接拒绝）/
-    // autonomous（自主模式，逐次确认）/ full（完整权限，不再逐次确认）
+    // autonomous（自主模式，逐次确认）/ full（完整权限，命令仍逐次确认）
     permission: 'default',
     // Agent 集群：允许一次派发多个子 Agent 并行处理
     agentCluster: false,

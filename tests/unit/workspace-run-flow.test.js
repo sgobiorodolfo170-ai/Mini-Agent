@@ -4,13 +4,14 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import * as agent from '../../electron/main/agent'
 
 const require = createRequire(import.meta.url)
 const electronPath = require.resolve('electron')
 require('electron')
 const dbm = require('../../electron/store/db')
 const repos = require('../../electron/store/repos')
-const agent = require('../../electron/main/agent')
+const workspace = require('../../electron/main/agent/workspace')
 
 const hasGit = spawnSync('git', ['--version'], { windowsHide: true }).status === 0
 let originalElectron
@@ -18,6 +19,7 @@ let db
 let dir
 let repo
 let conversationId
+let projectId
 
 function git(cwd, ...args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', windowsHide: true })
@@ -62,6 +64,7 @@ beforeEach(() => {
     workspaceMode: 'worktree',
     workspaceAutoMerge: 1
   })
+  projectId = project.id
   const providerId = repos.saveProvider(db, {
     name: 'Mock',
     baseUrl: 'https://mock/v1',
@@ -93,6 +96,178 @@ afterEach(async () => {
 })
 
 it.skipIf(!hasGit)(
+  'inherits a completed graph dependency before the downstream model starts',
+  async () => {
+    let releaseA
+    let releaseB
+    const gateA = new Promise((resolve) => {
+      releaseA = resolve
+    })
+    const gateB = new Promise((resolve) => {
+      releaseB = resolve
+    })
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, opts) => {
+      const { messages } = JSON.parse(opts.body)
+      const last = messages.at(-1)
+      if (last.content === '任务A') {
+        await gateA
+        return response({ content: 'A result' })
+      }
+      if (last.content === '任务B') {
+        await gateB
+        return response({ content: 'B result' })
+      }
+      if (last.role !== 'tool') {
+        return response({
+          tool_calls: [
+            tool('run_plan', {
+              tasks: [
+                { key: 'a', goal: '任务A' },
+                { key: 'b', goal: '任务B', deps: ['a'] }
+              ]
+            })
+          ]
+        })
+      }
+      const output = JSON.parse(last.content)
+      if (last.tool_call_id === 'call-run_plan') {
+        return response({ tool_calls: [tool('run_wait', { graphId: output.graphId })] })
+      }
+      return response({ content: output.runs.map((run) => run.content).join(' / ') })
+    })
+
+    const parent = await agent.startAgentRun({
+      conversationId,
+      goal: '验证图节点成果继承',
+      permission: 'full'
+    })
+    let upstreamRun
+    await expect
+      .poll(
+        () => {
+          const graph = agent.getGraphForParent(parent.runId)
+          const node = graph && graph.nodes.find((item) => item.nodeKey === 'a')
+          upstreamRun = node && repos.getRun(db, node.runId)
+          return upstreamRun && upstreamRun.workspaceJson
+        },
+        { timeout: 15000 }
+      )
+      .toBeTruthy()
+
+    const upstreamWorkspace = JSON.parse(upstreamRun.workspaceJson)
+    fs.writeFileSync(path.join(upstreamWorkspace.path, 'from-a.txt'), 'from A\n')
+    const artifact = await workspace.sealArtifact({ workspace: upstreamWorkspace })
+    expect(artifact.status).toBe('sealed')
+    repos.setRunWorkspace(db, upstreamRun.id, { ...upstreamWorkspace, artifact })
+    releaseA()
+
+    let downstreamRun
+    await expect
+      .poll(
+        () => {
+          const graph = agent.getGraphForParent(parent.runId)
+          const node = graph && graph.nodes.find((item) => item.nodeKey === 'b')
+          downstreamRun = node && repos.getRun(db, node.runId)
+          if (!downstreamRun || !downstreamRun.workspaceJson) return null
+          const current = JSON.parse(downstreamRun.workspaceJson)
+          return current.inheritance && current.inheritance.status
+        },
+        { timeout: 15000 }
+      )
+      .toBeTruthy()
+    const downstreamWorkspace = JSON.parse(downstreamRun.workspaceJson)
+    expect(downstreamWorkspace.inheritance.reason).toBeUndefined()
+    expect(downstreamWorkspace.inheritance).toMatchObject({ status: 'ready' })
+    expect(
+      fs
+        .readFileSync(path.join(downstreamWorkspace.path, 'from-a.txt'), 'utf8')
+        .replace(/\r\n/g, '\n')
+    ).toBe('from A\n')
+    releaseB()
+
+    await expect
+      .poll(() => agent.getRunResult(parent.runId), { timeout: 15000 })
+      .toMatchObject({ status: 'done', content: 'A result / B result' })
+    await expect
+      .poll(
+        () => {
+          const current = JSON.parse(repos.getRun(db, parent.runId).workspaceJson || '{}')
+          return current.merge && current.merge.status
+        },
+        { timeout: 15000 }
+      )
+      .toBe('merged')
+    expect(JSON.parse(repos.getRun(db, upstreamRun.id).workspaceJson).artifact.status).toBe(
+      'sealed'
+    )
+  },
+  40000
+)
+
+it.skipIf(!hasGit)(
+  'requires confirmation for commands in full mode and blocks merge when verification fails',
+  async () => {
+    repos.updateProject(db, projectId, { workspaceVerifyCommand: 'exit 1' })
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, opts) => {
+      const { messages } = JSON.parse(opts.body)
+      const last = messages.at(-1)
+      if (last.role === 'tool') return response({ content: '命令已执行' })
+      return response({
+        tool_calls: [
+          tool('run_command', {
+            command: 'Set-Content -Path a.txt -Value unverified -Encoding utf8'
+          })
+        ]
+      })
+    })
+    const run = await agent.startAgentRun({
+      conversationId,
+      goal: '写入未通过验收的改动',
+      permission: 'full'
+    })
+    await expect
+      .poll(() => db.prepare("SELECT 1 FROM agent_approvals WHERE status='pending'").get(), {
+        timeout: 15000
+      })
+      .toBeTruthy()
+    const approval = db
+      .prepare("SELECT approval_id FROM agent_approvals WHERE status='pending'")
+      .get()
+    expect(agent.respondConfirm({ requestId: approval.approval_id, allow: true })).toBe(true)
+    await expect.poll(() => agent.getRunStatus(run.runId).status, { timeout: 20000 }).toBe('done')
+    await expect
+      .poll(
+        () => {
+          const current = JSON.parse(repos.getRun(db, run.runId).workspaceJson || '{}')
+          return current.merge && current.merge.status
+        },
+        { timeout: 15000 }
+      )
+      .toBe('failed')
+    const current = JSON.parse(repos.getRun(db, run.runId).workspaceJson)
+    expect(current.merge.reason).toBe('verify_command_failed')
+    expect(current.verification.checks).toContainEqual({ name: 'verify_command', ok: false })
+    expect(git(repo, 'show', 'HEAD:a.txt')).toContain('base')
+    expect(repos.getRunCalls(db, run.runId)[0].confirmed_by).toBe('desktop')
+  },
+  30000
+)
+
+it.skipIf(!hasGit)('stops instead of falling back when worktree isolation fails', async () => {
+  vi.spyOn(workspace, 'prepare').mockResolvedValue({ mode: 'error', reason: 'test_failure' })
+  const fetchSpy = vi.spyOn(globalThis, 'fetch')
+  const run = await agent.startAgentRun({
+    conversationId,
+    goal: '不应执行的任务',
+    permission: 'full'
+  })
+  await expect
+    .poll(() => agent.getRunStatus(run.runId))
+    .toMatchObject({ status: 'error', finishedReason: 'workspace_prepare_failed' })
+  expect(fetchSpy).not.toHaveBeenCalled()
+})
+
+it.skipIf(!hasGit)(
   'runs in a worktree and auto-merges successful changes',
   async () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, opts) => {
@@ -113,6 +288,15 @@ it.skipIf(!hasGit)(
       goal: '写 a.txt',
       permission: 'full'
     })
+    await expect
+      .poll(() => db.prepare("SELECT 1 FROM agent_approvals WHERE status='pending'").get(), {
+        timeout: 15000
+      })
+      .toBeTruthy()
+    const approval = db
+      .prepare("SELECT approval_id FROM agent_approvals WHERE status='pending'")
+      .get()
+    expect(agent.respondConfirm({ requestId: approval.approval_id, allow: true })).toBe(true)
     await expect.poll(() => agent.getRunStatus(run.runId).status, { timeout: 20000 }).toBe('done')
 
     const workspace = JSON.parse(agent.getRunStatus(run.runId).workspaceJson)

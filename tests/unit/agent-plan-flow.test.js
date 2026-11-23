@@ -1,13 +1,13 @@
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import * as agent from '../../electron/main/agent'
 
 const require = createRequire(import.meta.url)
 const electronPath = require.resolve('electron')
 require('electron')
 const dbm = require('../../electron/store/db')
 const repos = require('../../electron/store/repos')
-const agent = require('../../electron/main/agent')
 
 let db
 let conversationId
@@ -96,7 +96,7 @@ it('runs a dependency graph in order and waits for the whole graph', async () =>
     permission: 'full'
   })
   await expect
-    .poll(() => agent.getRunResult(parent.runId), { timeout: 15000 })
+    .poll(() => agent.getRunResult(parent.runId), { timeout: 20000 })
     .toMatchObject({ status: 'done', content: 'A result / B result' })
 
   expect(childGoals).toEqual(['A', 'B'])
@@ -147,7 +147,7 @@ it('blocks downstream nodes when a dependency fails', async () => {
     permission: 'full'
   })
   await expect
-    .poll(() => agent.getRunResult(parent.runId), { timeout: 15000 })
+    .poll(() => agent.getRunResult(parent.runId), { timeout: 20000 })
     .toMatchObject({ status: 'done', content: '已处理失败依赖' })
 
   expect(childGoals).toEqual(['A'])

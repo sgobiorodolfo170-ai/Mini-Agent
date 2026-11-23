@@ -23,6 +23,9 @@ export function createMockServer() {
     // 集群验证：主 Agent 第一次调用 spawn_agent 时派发多个子任务
     clusterSpawn: false,
     transferRun: false,
+    planRun: false,
+    planNodeDelayMs: 0,
+    agentDelayMs: 0,
     // 记录同时在途的子 Agent 数量峰值，用来证明「并发」而非串行
     subInFlight: 0,
     subPeak: 0
@@ -110,6 +113,7 @@ export function createMockServer() {
         if (isSubAgent) {
           state.subInFlight++
           state.subPeak = Math.max(state.subPeak, state.subInFlight)
+          const delay = state.planRun && msgs[1]?.content === '节点A' ? state.planNodeDelayMs : 120
           setTimeout(() => {
             state.subInFlight--
             sse(res, [
@@ -120,7 +124,7 @@ export function createMockServer() {
               }),
               JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })
             ])
-          }, 120)
+          }, delay)
           return
         }
         if (body.tools && state.transferRun && !hasToolResult) {
@@ -149,6 +153,77 @@ export function createMockServer() {
             JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })
           ])
           return
+        }
+        if (body.tools && state.planRun) {
+          const last = msgs.at(-1)
+          if (last?.role === 'tool' && last.tool_call_id === 'call-plan') {
+            const output = JSON.parse(last.content)
+            sse(res, [
+              JSON.stringify({
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: [
+                        {
+                          index: 0,
+                          id: 'call-wait',
+                          type: 'function',
+                          function: {
+                            name: 'run_wait',
+                            arguments: JSON.stringify({ graphId: output.graphId })
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }),
+              JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })
+            ])
+            return
+          }
+          if (last?.role === 'tool' && last.tool_call_id === 'call-wait') {
+            sse(res, [
+              JSON.stringify({
+                choices: [{ index: 0, delta: { content: '任务图执行完成。' } }]
+              }),
+              JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })
+            ])
+            return
+          }
+          if (!hasToolResult) {
+            sse(res, [
+              JSON.stringify({
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: [
+                        {
+                          index: 0,
+                          id: 'call-plan',
+                          type: 'function',
+                          function: {
+                            name: 'run_plan',
+                            arguments: JSON.stringify({
+                              tasks: [
+                                { key: 'a', goal: '节点A' },
+                                { key: 'b', goal: '节点B', deps: ['a'] },
+                                { key: 'c', goal: '节点C', deps: ['b'] }
+                              ]
+                            })
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }),
+              JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })
+            ])
+            return
+          }
         }
         if (body.tools && state.clusterSpawn) {
           // 已经收回子 Agent 结论 → 汇总收尾；否则派发一次批量 spawn
@@ -196,32 +271,35 @@ export function createMockServer() {
           return
         }
         if (body.tools && body.tools.length && !hasToolResult) {
-          sse(res, [
-            JSON.stringify({
-              choices: [
-                {
-                  index: 0,
-                  delta: {
-                    tool_calls: [
-                      {
-                        index: 0,
-                        id: 'call-1',
-                        type: 'function',
-                        function: {
-                          name: 'write_file',
-                          arguments: JSON.stringify({
-                            path: state.agentFile,
-                            content: 'E2E写入内容'
-                          })
+          const reply = () =>
+            sse(res, [
+              JSON.stringify({
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: [
+                        {
+                          index: 0,
+                          id: 'call-1',
+                          type: 'function',
+                          function: {
+                            name: 'write_file',
+                            arguments: JSON.stringify({
+                              path: state.agentFile,
+                              content: 'E2E写入内容'
+                            })
+                          }
                         }
-                      }
-                    ]
+                      ]
+                    }
                   }
-                }
-              ]
-            }),
-            JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })
-          ])
+                ]
+              }),
+              JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })
+            ])
+          if (state.agentDelayMs) setTimeout(reply, state.agentDelayMs)
+          else reply()
           return
         }
         if (hasToolResult) {

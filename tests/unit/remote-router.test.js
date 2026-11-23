@@ -68,6 +68,20 @@ describe('RemoteCommandRouter', () => {
     ).rejects.toThrow(/审批权限/)
   })
 
+  it('viewer 不能恢复或重试中断任务', async () => {
+    const runId = repos.createRun(db, {
+      conversationId: conv.id,
+      goal: '中断任务',
+      status: 'running'
+    })
+    repos.updateRunStatus(db, runId, { status: 'interrupted' })
+    db.prepare("UPDATE remote_devices SET role='viewer' WHERE device_id=?").run(device.device_id)
+    const authCtx = { deviceId: device.device_id, role: 'viewer' }
+    await expect(
+      router.execute(authCtx, cmd('agent.run.retry', { runId, mode: 'retry' }), 'tls')
+    ).rejects.toThrow(/操作权限/)
+  })
+
   it('明文模式拒绝 Agent 启动', async () => {
     const authCtx = { deviceId: device.device_id, role: 'operator' }
     await expect(

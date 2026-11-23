@@ -579,6 +579,12 @@ function install() {
           pinned: 0,
           workspaceMode: o.workspaceMode === 'shared' ? 'shared' : 'worktree',
           workspaceAutoMerge: o.workspaceAutoMerge === 0 ? 0 : 1,
+          workspaceVerifyCommand: String(o.workspaceVerifyCommand || '').trim(),
+          workspaceConflictStrategy: ['manual', 'ours', 'theirs'].includes(
+            o.workspaceConflictStrategy
+          )
+            ? o.workspaceConflictStrategy
+            : 'manual',
           createdAt: now(),
           updatedAt: now()
         }
@@ -1000,6 +1006,36 @@ function install() {
         return true
       },
       respond: () => true,
+      recovery: (runId) => {
+        const run = runs.find((r) => r.id === runId)
+        if (!run) throw new Error('任务不存在')
+        return {
+          runId,
+          status: run.status,
+          canResume: false,
+          reason: run.status === 'interrupted' ? 'unsafe_checkpoint' : 'not_interrupted',
+          checkpoint: null,
+          unfinishedTools: [],
+          workspace: null
+        }
+      },
+      resumeInterrupted: ({ runId } = {}) => {
+        const run = runs.find((r) => r.id === runId)
+        if (!run) throw new Error('任务不存在')
+        run.status = 'queued'
+        emit('agent:event', { type: 'queued', runId })
+        return clone(run)
+      },
+      retryInterrupted: ({ runId } = {}) => {
+        const original = runs.find((r) => r.id === runId)
+        if (!original) throw new Error('任务不存在')
+        const retry = api.agent.run({
+          conversationId: original.conversationId,
+          goal: original.goal,
+          permission: 'autonomous'
+        })
+        return { ...retry, retryOfRunId: runId }
+      },
       acceptanceDecide: ({ runId, decision, reason } = {}) => {
         const run = runs.find((r) => r.id === runId)
         if (!run) throw new Error('任务不存在')
@@ -1015,7 +1051,8 @@ function install() {
       },
       runs: () => clone(runs),
       calls: (runId) => clone(calls.get(runId) || []),
-      graph: () => null
+      graph: () => null,
+      mutateGraph: () => null
     },
     sessions: {
       status: ({ conversationId } = {}) => ({ conversationId, status: 'idle' }),

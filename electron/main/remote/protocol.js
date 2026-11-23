@@ -14,6 +14,7 @@ const COMMANDS = [
   'agent.run.start',
   'agent.run.pause',
   'agent.run.resume',
+  'agent.run.retry',
   'agent.run.stop',
   'approval.respond',
   'events.ack',

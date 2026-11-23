@@ -2,7 +2,7 @@ const fs = require('fs')
 const path = require('path')
 
 const { RUN_SCHEMA, recoverRuns } = require('./run-storage')
-const SCHEMA_VERSION = 10
+const SCHEMA_VERSION = 13
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS settings (
@@ -51,6 +51,8 @@ CREATE TABLE IF NOT EXISTS projects (
   path TEXT NOT NULL,
   pinned INTEGER NOT NULL DEFAULT 0,
   sort INTEGER NOT NULL DEFAULT 0,
+  workspace_verify_command TEXT,
+  workspace_conflict_strategy TEXT NOT NULL DEFAULT 'manual',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   deleted_at INTEGER
@@ -323,6 +325,36 @@ CREATE INDEX IF NOT EXISTS idx_agent_runs_graph ON agent_runs(graph_id);
 CREATE INDEX IF NOT EXISTS idx_run_deps_dep ON run_dependencies(depends_on_run_id);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_call ON agent_tool_calls(run_id, call_id);
 `)
+        db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
+      })
+    }
+    if (current < 11) {
+      const { transaction } = require('../main/remote/protocol')
+      transaction(db, () => {
+        if (!columnExists(db, 'projects', 'workspace_verify_command')) {
+          db.exec('ALTER TABLE projects ADD COLUMN workspace_verify_command TEXT')
+        }
+        db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
+      })
+    }
+    if (current < 12) {
+      const { transaction } = require('../main/remote/protocol')
+      transaction(db, () => {
+        if (!columnExists(db, 'agent_runs', 'retry_of_run_id')) {
+          db.exec('ALTER TABLE agent_runs ADD COLUMN retry_of_run_id TEXT')
+        }
+        db.exec('CREATE INDEX IF NOT EXISTS idx_agent_runs_retry_of ON agent_runs(retry_of_run_id)')
+        db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
+      })
+    }
+    if (current < 13) {
+      const { transaction } = require('../main/remote/protocol')
+      transaction(db, () => {
+        if (!columnExists(db, 'projects', 'workspace_conflict_strategy')) {
+          db.exec(
+            "ALTER TABLE projects ADD COLUMN workspace_conflict_strategy TEXT NOT NULL DEFAULT 'manual'"
+          )
+        }
         db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
       })
     }

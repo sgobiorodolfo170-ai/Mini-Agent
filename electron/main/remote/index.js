@@ -11,7 +11,7 @@ const QRCode = require('qrcode')
 const { RemoteAuthService } = require('./auth-service')
 const { RemoteEventStore } = require('./event-store')
 const { RemoteCommandRouter } = require('./router')
-const { parseEnvelope, remoteError } = require('./protocol')
+const { parseEnvelope, remoteError, secretEqual, tokenHash } = require('./protocol')
 const repos = require('../../store/repos')
 const certificates = require('./certificate-service')
 
@@ -206,6 +206,12 @@ class RemoteControlManager {
           req.url !== '/api/v1/auth/session'
         ) {
           req.remoteAuth = this.auth.authenticate(req.cookies.miniagent_remote, true)
+          if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+            const header = req.headers['x-csrf-token']
+            const supplied = typeof header === 'string' ? header : ''
+            if (!secretEqual(tokenHash(supplied, 'csrf'), req.remoteAuth.csrfHash))
+              throw remoteError('CSRF_INVALID', '请求校验失败', 403)
+          }
         }
       }
     })

@@ -1,6 +1,6 @@
 {
   "name": "miniagent",
-  "version": "1.2.0",
+  "version": "1.4.0",
   "description": "Windows 桌面个人 AI 助理（自用）",
   "main": "out/main/index.js",
   "author": "miniagent",
@@ -11,7 +11,7 @@
     "start": "electron-vite preview",
     "dist": "electron-vite build && electron-builder --win nsis",
     "test": "vitest run",
-    "test:coverage": "vitest run --coverage",
+    "test:coverage": "vitest run --coverage --no-file-parallelism",
     "test:e2e": "vitest run --config vitest.e2e.config.mjs",
     "test:e2e:mock": "vitest run --config vitest.e2e.config.mjs --exclude \"e2e/real-provider.spec.js\"",
     "lint": "eslint src electron tests --no-warn-ignored",

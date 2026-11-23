@@ -185,11 +185,19 @@ function listKeyEvents(db, limit = 100) {
 }
 
 // ---------- projects（项目工作目录） ----------
+const WORKSPACE_CONFLICT_STRATEGIES = ['manual', 'ours', 'theirs']
+function normalizeConflictStrategy(value) {
+  const strategy = String(value || 'manual')
+  if (!WORKSPACE_CONFLICT_STRATEGIES.includes(strategy)) throw new Error('非法的工作区冲突策略')
+  return strategy
+}
+
 function listProjects(db) {
   return db
     .prepare(
       `SELECT id, name, path, pinned, sort, workspace_mode AS workspaceMode,
-       workspace_auto_merge AS workspaceAutoMerge, created_at AS createdAt, updated_at AS updatedAt
+       workspace_auto_merge AS workspaceAutoMerge, workspace_verify_command AS workspaceVerifyCommand,
+       workspace_conflict_strategy AS workspaceConflictStrategy, created_at AS createdAt, updated_at AS updatedAt
        FROM projects WHERE deleted_at IS NULL ORDER BY pinned DESC, sort, created_at`
     )
     .all()
@@ -199,21 +207,33 @@ function getProject(db, id) {
   return db
     .prepare(
       `SELECT id, name, path, pinned, sort, workspace_mode AS workspaceMode,
-       workspace_auto_merge AS workspaceAutoMerge, created_at AS createdAt, updated_at AS updatedAt
+       workspace_auto_merge AS workspaceAutoMerge, workspace_verify_command AS workspaceVerifyCommand,
+       workspace_conflict_strategy AS workspaceConflictStrategy, created_at AS createdAt, updated_at AS updatedAt
        FROM projects WHERE id = ? AND deleted_at IS NULL`
     )
     .get(id)
 }
 
-function createProject(db, { name, path, workspaceMode = 'worktree', workspaceAutoMerge = 1 }) {
+function createProject(
+  db,
+  {
+    name,
+    path,
+    workspaceMode = 'worktree',
+    workspaceAutoMerge = 1,
+    workspaceVerifyCommand = '',
+    workspaceConflictStrategy = 'manual'
+  }
+) {
   const t = now()
   const id = uid()
   const sortRow = db
     .prepare('SELECT COALESCE(MAX(sort), 0) + 1 AS next FROM projects WHERE deleted_at IS NULL')
     .get()
   db.prepare(
-    `INSERT INTO projects(id, name, path, sort, workspace_mode, workspace_auto_merge, created_at, updated_at)
-     VALUES(?,?,?,?,?,?,?,?)`
+    `INSERT INTO projects(id, name, path, sort, workspace_mode, workspace_auto_merge,
+     workspace_verify_command, workspace_conflict_strategy, created_at, updated_at)
+     VALUES(?,?,?,?,?,?,?,?,?,?)`
   ).run(
     id,
     name,
@@ -221,6 +241,8 @@ function createProject(db, { name, path, workspaceMode = 'worktree', workspaceAu
     sortRow.next,
     workspaceMode === 'shared' ? 'shared' : 'worktree',
     workspaceAutoMerge ? 1 : 0,
+    String(workspaceVerifyCommand || '').trim(),
+    normalizeConflictStrategy(workspaceConflictStrategy),
     t,
     t
   )
@@ -232,7 +254,7 @@ function updateProject(db, id, patch) {
   if (!cur) return null
   db.prepare(
     `UPDATE projects SET name=?, path=?, pinned=?, workspace_mode=?, workspace_auto_merge=?,
-     updated_at=? WHERE id=?`
+     workspace_verify_command=?, workspace_conflict_strategy=?, updated_at=? WHERE id=?`
   ).run(
     patch.name !== undefined ? patch.name : cur.name,
     patch.path !== undefined ? patch.path : cur.path,
@@ -247,6 +269,12 @@ function updateProject(db, id, patch) {
         ? 1
         : 0
       : cur.workspaceAutoMerge,
+    patch.workspaceVerifyCommand !== undefined
+      ? String(patch.workspaceVerifyCommand || '').trim()
+      : cur.workspaceVerifyCommand,
+    patch.workspaceConflictStrategy !== undefined
+      ? normalizeConflictStrategy(patch.workspaceConflictStrategy)
+      : cur.workspaceConflictStrategy,
     now(),
     id
   )
@@ -707,7 +735,7 @@ const RUN_COLUMNS = `id, conversation_id AS conversationId, goal, status,
   claimed_at AS claimedAt, finished_reason AS finishedReason, user_message_id AS userMessageId,
   assistant_message_id AS assistantMessageId, transfer_to_run_id AS transferToRunId,
   run_spec_json AS runSpecJson, graph_id AS graphId, node_key AS nodeKey,
-  workspace_json AS workspaceJson, resume_count AS resumeCount`
+  workspace_json AS workspaceJson, resume_count AS resumeCount, retry_of_run_id AS retryOfRunId`
 
 function isRunTerminal(status) {
   return RUN_TERMINAL.includes(status)
@@ -732,6 +760,7 @@ function createRun(db, opts = {}) {
     idempotencyKey = null,
     graphId = null,
     nodeKey = null,
+    retryOfRunId = null,
     status = 'running'
   } = opts
 
@@ -753,8 +782,8 @@ function createRun(db, opts = {}) {
   db.prepare(
     `INSERT INTO agent_runs(id, conversation_id, goal, status, max_steps, steps_used,
       started_at, parent_run_id, control_mode, mandate_json, acceptance_policy,
-      trace_id, idempotency_key, graph_id, node_key, version)
-     VALUES(?,?,?,?,?,0,?,?,?,?,?,?,?,?,?,1)`
+      trace_id, idempotency_key, graph_id, node_key, retry_of_run_id, version)
+     VALUES(?,?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,1)`
   ).run(
     id,
     conversationId || null,
@@ -769,7 +798,8 @@ function createRun(db, opts = {}) {
     traceId,
     idempotencyKey,
     graphId,
-    nodeKey
+    nodeKey,
+    retryOfRunId
   )
   return id
 }

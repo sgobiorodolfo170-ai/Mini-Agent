@@ -62,6 +62,7 @@ interface DeviceInfo {
 const API_BASE = '/api/v1'
 const SS_ID = 'miniagent.remote.deviceId'
 const SS_SECRET = 'miniagent.remote.deviceSecret'
+const SS_CSRF = 'miniagent.remote.csrf'
 /** 客户端退避：1/2/4/8/16/30 秒封顶 + ±20% 抖动（§9.5） */
 const BACKOFF_MS = [1000, 2000, 4000, 8000, 16000, 30000]
 const BACKOFF_JITTER = 0.2
@@ -203,10 +204,14 @@ async function http<T = Record<string, unknown>>(
 ): Promise<T> {
   const headers: Record<string, string> = { accept: 'application/json', ...opts.headers }
   if (opts.body !== undefined) headers['content-type'] = 'application/json'
+  const method = (opts.method ?? (opts.body !== undefined ? 'POST' : 'GET')).toUpperCase()
+  const needsCsrf =
+    !['GET', 'HEAD'].includes(method) && path !== '/auth/session' && path !== '/pair/requests'
+  if (needsCsrf && credentials.csrf) headers['x-csrf-token'] = credentials.csrf
   let res: Response
   try {
     res = await fetch(API_BASE + path, {
-      method: opts.method ?? (opts.body !== undefined ? 'POST' : 'GET'),
+      method,
       headers,
       body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
       credentials: 'same-origin',
@@ -246,7 +251,7 @@ const streamEpoch = ref('')
 const lastSeq = ref(0)
 const serverAuth = reactive({ authenticated: false, role: '', authVersion: 0, epoch: '' })
 
-const credentials = reactive({ deviceId: '', deviceSecret: '' })
+const credentials = reactive({ deviceId: '', deviceSecret: '', csrf: '' })
 const device = reactive<DeviceInfo & Record<string, unknown>>({})
 const capability = computed(() => {
   const role =
@@ -300,30 +305,37 @@ function readStoredCreds(): boolean {
   try {
     credentials.deviceId = sessionStorage.getItem(SS_ID) || ''
     credentials.deviceSecret = sessionStorage.getItem(SS_SECRET) || ''
+    credentials.csrf = sessionStorage.getItem(SS_CSRF) || ''
   } catch {
     credentials.deviceId = ''
     credentials.deviceSecret = ''
+    credentials.csrf = ''
   }
   return Boolean(credentials.deviceId && credentials.deviceSecret)
 }
 
-function saveCreds(deviceId: string, secret: string): void {
+function saveCreds(deviceId: string, secret: string, csrf = ''): void {
   credentials.deviceId = deviceId
   credentials.deviceSecret = secret
+  credentials.csrf = csrf
   try {
     sessionStorage.setItem(SS_ID, deviceId)
     sessionStorage.setItem(SS_SECRET, secret)
+    if (csrf) sessionStorage.setItem(SS_CSRF, csrf)
+    else sessionStorage.removeItem(SS_CSRF)
   } catch {
-    pushToast('warn', '浏览器拒绝写入 sessionStorage，本次配对凭证仅保存在当前页面内存中')
+    pushToast('warn', '浏览器拒绝写入 sessionStorage，本次会话凭证仅保存在当前页面内存中')
   }
 }
 
 function clearCreds(): void {
   credentials.deviceId = ''
   credentials.deviceSecret = ''
+  credentials.csrf = ''
   try {
     sessionStorage.removeItem(SS_ID)
     sessionStorage.removeItem(SS_SECRET)
+    sessionStorage.removeItem(SS_CSRF)
   } catch {
     /* 隐私模式下忽略 */
   }
@@ -381,10 +393,16 @@ async function refreshAuthStatus(): Promise<boolean> {
 async function createSession(): Promise<boolean> {
   if (!credentials.deviceId || !credentials.deviceSecret) return false
   try {
-    await http('/auth/session', {
+    const data = await http<Record<string, unknown>>('/auth/session', {
       method: 'POST',
       body: { deviceId: credentials.deviceId, deviceSecret: credentials.deviceSecret }
     })
+    const csrf = text(field(data, ['csrf', 'csrfToken', 'csrf_token']), 128)
+    if (!csrf) {
+      pushToast('bad', '会话建立失败：服务端未返回安全凭证')
+      return false
+    }
+    saveCreds(credentials.deviceId, credentials.deviceSecret, csrf)
     return true
   } catch (e) {
     const err = toApiError(e)
@@ -446,7 +464,11 @@ async function boot(): Promise<void> {
   if (ticket) pair.ticket = ticket
   const hasCreds = readStoredCreds()
   let ok = await refreshAuthStatus()
-  if (!ok && hasCreds) {
+  if (ok && !credentials.csrf) {
+    // 兼容升级前已建立但尚未保存 CSRF Token 的会话；无设备凭证时重新配对。
+    ok = hasCreds ? await createSession() : false
+    if (ok) serverAuth.authenticated = true
+  } else if (!ok && hasCreds) {
     ok = await createSession() // 刷新后凭 sessionStorage 中的短期凭证恢复会话
     if (ok) serverAuth.authenticated = true
   }
@@ -755,6 +777,7 @@ const COMMAND_LABELS: Record<string, string> = {
   'agent.run.start': '启动任务',
   'agent.run.pause': '请求暂停',
   'agent.run.resume': '请求继续',
+  'agent.run.retry': '恢复中断任务',
   'agent.run.stop': '请求停止',
   'approval.respond': '提交审批决定'
 }
@@ -1357,6 +1380,34 @@ async function controlRun(run: Run, action: 'pause' | 'resume' | 'stop'): Promis
   pushToast('info', '控制请求已发送')
 }
 
+async function recoverRun(run: Run, mode: 'continue' | 'retry'): Promise<void> {
+  if (!capability.value.operator) {
+    pushToast('warn', '当前设备角色为只读，无法恢复任务')
+    return
+  }
+  const ok = await confirmAction({
+    title: mode === 'continue' ? '核对后续跑' : '关联新任务重试',
+    message:
+      mode === 'continue'
+        ? '仅从安全边界继续同一个任务，已完成的工具不会重放。'
+        : '保留原中断记录并创建关联新任务；未知副作用不会自动重放。',
+    confirmText: '确认',
+    danger: mode === 'retry'
+  })
+  if (!ok) return
+  const rid = sendCommand(
+    'agent.run.retry',
+    { run_id: run.id, runId: run.id, mode },
+    run.conversationId || null
+  )
+  if (!rid) {
+    pushToast('warn', '实时通道未连接')
+    connectSocket()
+    return
+  }
+  pushToast('info', '恢复请求已发送')
+}
+
 async function respondApproval(
   approval: Approval,
   decision: 'approved' | 'rejected'
@@ -1776,6 +1827,24 @@ onBeforeUnmount(() => {
                   @click="controlRun(r, 'stop')"
                 >
                   停止
+                </button>
+              </template>
+              <template v-else-if="r.status === 'interrupted'">
+                <button
+                  class="btn-ghost"
+                  type="button"
+                  :disabled="!capability.operator"
+                  @click="recoverRun(r, 'continue')"
+                >
+                  核对后续跑
+                </button>
+                <button
+                  class="btn-ghost"
+                  type="button"
+                  :disabled="!capability.operator"
+                  @click="recoverRun(r, 'retry')"
+                >
+                  关联重试
                 </button>
               </template>
               <a

@@ -81,11 +81,15 @@ function buildMain() {
       stop: (runId) => inv('agent:stop', runId),
       pause: (runId) => inv('agent:pause', runId),
       resume: (runId) => inv('agent:resume', runId),
+      recovery: (runId) => inv('agent:recovery', runId),
+      resumeInterrupted: (o) => inv('agent:recovery:continue', o),
+      retryInterrupted: (o) => inv('agent:recovery:retry', o),
       respond: (o) => inv('agent:respond', o),
       acceptanceDecide: (o) => inv('agent:acceptance:decide', o),
       runs: () => inv('agent:runs'),
       calls: (runId) => inv('agent:calls', runId),
-      graph: (runId) => inv('agent:graph', runId)
+      graph: (runId) => inv('agent:graph', runId),
+      mutateGraph: (o) => inv('agent:graph:mutate', o)
     },
     remote: {
       state: () => inv('remote:state'),

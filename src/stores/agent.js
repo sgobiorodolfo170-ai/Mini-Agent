@@ -1,4 +1,5 @@
 import { defineStore } from 'pinia'
+import { plain } from '../common/plain'
 
 export const useAgentStore = defineStore('agent', {
   state: () => ({
@@ -6,7 +7,8 @@ export const useAgentStore = defineStore('agent', {
     activeRunId: null,
     calls: [],
     confirms: [],
-    graph: null
+    graph: null,
+    recovery: null
   }),
   getters: {
     activeRun(state) {
@@ -21,10 +23,33 @@ export const useAgentStore = defineStore('agent', {
       this.activeRunId = id
       this.calls = await window.api.agent.calls(id)
       await this.loadGraph(id)
+      await this.loadRecovery(id)
+    },
+    async loadRecovery(id) {
+      this.recovery = window.api.agent.recovery && id ? await window.api.agent.recovery(id) : null
+      return this.recovery
+    },
+    async continueInterrupted(id, reason = '') {
+      const run = await window.api.agent.resumeInterrupted({ runId: id, reason })
+      await this.loadRuns()
+      await this.select(id)
+      return run
+    },
+    async retryInterrupted(id, reason = '') {
+      const run = await window.api.agent.retryInterrupted({ runId: id, reason })
+      await this.loadRuns()
+      await this.select(run.runId)
+      return run
     },
     async loadGraph(id) {
       this.graph = window.api.agent.graph && id ? await window.api.agent.graph(id) : null
       return this.graph
+    },
+    async mutateGraph(input) {
+      const graph = await window.api.agent.mutateGraph(plain(input))
+      this.graph = graph
+      await this.loadRuns()
+      return graph
     },
     stopRun(id) {
       // 本地先清掉该运行的确认卡：主进程随后会广播 confirmCancel，
@@ -58,6 +83,7 @@ export const useAgentStore = defineStore('agent', {
         this.loadRuns()
       if (['state', 'done', 'acceptance', 'graph'].includes(ev.type) && this.activeRunId)
         this.loadGraph(this.activeRunId)
+      if (ev.type === 'done' && this.activeRunId) this.loadRecovery(this.activeRunId)
       // 运行结束（含被停止/出错）时，该运行遗留的确认卡一律失效
       if (ev.type === 'done' && ev.runId) this.clearConfirms({ runId: ev.runId })
     }

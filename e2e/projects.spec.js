@@ -26,10 +26,25 @@ describe('项目工作目录', () => {
     await win.getByTestId('project-add').click()
     await win.getByTestId('project-name').fill('测试项目')
     await win.getByTestId('project-pick').click()
+    await win.getByTestId('project-verify-command').fill('npm test')
+    await win.getByTestId('project-conflict-strategy').selectOption('theirs')
+    await win.screenshot({ path: '.e2e-artifacts/p8-project-verify-dialog.png' })
     await win.getByTestId('project-confirm').click()
     await win
       .locator('[data-testid="project-item"]', { hasText: '测试项目' })
       .waitFor({ timeout: 10000 })
+    expect(
+      await win.evaluate(async () => {
+        const projects = await window.api.projects.list()
+        return projects.find((project) => project.name === '测试项目')?.workspaceVerifyCommand
+      })
+    ).toBe('npm test')
+    expect(
+      await win.evaluate(async () => {
+        const projects = await window.api.projects.list()
+        return projects.find((project) => project.name === '测试项目')?.workspaceConflictStrategy
+      })
+    ).toBe('theirs')
 
     // 项目内新建会话 → 会话归入项目分组（整表只有这一条会话）
     await win.locator('[data-testid="project-item"] [data-testid="project-new-conv"]').click()

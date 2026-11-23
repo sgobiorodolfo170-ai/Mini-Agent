@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import UiIcon from '../components/UiIcon.vue'
+import UiDialog from '../components/UiDialog.vue'
 import { useAgentStore } from '../stores/agent'
 import { useUiStore } from '../stores/ui'
 
@@ -13,6 +14,14 @@ const expandedResult = ref({})
 const isRunning = computed(
   () => agent.activeRun && ['queued', 'running', 'waiting_child'].includes(agent.activeRun.status)
 )
+const runRecovery = computed(() =>
+  agent.recovery && agent.recovery.runId === agent.activeRunId ? agent.recovery : null
+)
+const checkpointPhaseText = {
+  before_model: '模型调用前',
+  tool_done: '工具完成后',
+  model_done: '模型输出后（核对工具台账）'
+}
 
 const riskText = { side_effect: '副作用', destructive: '破坏性', read_only: '只读' }
 // 控制模式说明这条 Run 如何从父 Run 派生；验收状态与执行状态分开，避免把
@@ -56,6 +65,38 @@ async function decideAcceptance(decision) {
     ui.toast(String((e && e.message) || e), 'error')
   }
 }
+async function continueInterrupted() {
+  if (!agent.activeRun || !runRecovery.value?.canResume) return
+  const ok = await ui.confirm({
+    title: '继续中断任务',
+    message: '将从最后的安全检查点继续，已完成的工具不会重放。',
+    impact: '继续后任务会重新进入队列；如果外部状态已变化，请停止并选择关联新任务重试。',
+    confirmText: '继续执行'
+  })
+  if (!ok) return
+  try {
+    await agent.continueInterrupted(agent.activeRun.id)
+    ui.toast('任务已从安全检查点继续', 'success')
+  } catch (e) {
+    ui.toast(String((e && e.message) || e), 'error')
+  }
+}
+async function retryInterrupted() {
+  if (!agent.activeRun) return
+  const ok = await ui.confirm({
+    title: '关联新任务重试',
+    message: '原中断记录会保留，并创建一个关联的新任务。',
+    impact: '新任务会先检查执行台账；未知副作用不会自动重放。请确认已完成外部操作后再继续。',
+    confirmText: '创建重试任务'
+  })
+  if (!ok) return
+  try {
+    await agent.retryInterrupted(agent.activeRun.id)
+    ui.toast('已创建关联重试任务', 'success')
+  } catch (e) {
+    ui.toast(String((e && e.message) || e), 'error')
+  }
+}
 function graphDepKeys(runId) {
   if (!agent.graph) return []
   const keyById = new Map((agent.graph.nodes || []).map((n) => [n.runId, n.nodeKey]))
@@ -63,6 +104,71 @@ function graphDepKeys(runId) {
     .filter((d) => d.runId === runId)
     .map((d) => keyById.get(d.dependsOnRunId))
     .filter(Boolean)
+}
+const showGraphEditor = ref(false)
+const editingNodeId = ref(null)
+const editingGoal = ref('')
+const editingDeps = ref([])
+const graphBusy = ref(false)
+function openGraphEditor(node) {
+  if (!node.editable || !agent.graph || agent.graph.status !== 'running') return
+  editingNodeId.value = node.runId
+  editingGoal.value = node.goal
+  editingDeps.value = (agent.graph.dependencies || [])
+    .filter((edge) => edge.runId === node.runId)
+    .map((edge) => edge.dependsOnRunId)
+  showGraphEditor.value = true
+}
+async function saveGraphNode() {
+  if (!agent.graph || !editingNodeId.value || graphBusy.value) return
+  graphBusy.value = true
+  try {
+    await agent.loadGraph(agent.activeRunId)
+    await agent.mutateGraph({
+      graphId: agent.graph.graphId,
+      etag: agent.graph.etag,
+      ops: [
+        {
+          action: 'update',
+          runId: editingNodeId.value,
+          goal: editingGoal.value,
+          deps: editingDeps.value
+        }
+      ]
+    })
+    showGraphEditor.value = false
+    ui.toast('排队节点已更新', 'success')
+  } catch (e) {
+    ui.toast(String((e && e.message) || e), 'error')
+    await agent.loadGraph(agent.activeRunId)
+  } finally {
+    graphBusy.value = false
+  }
+}
+async function deleteGraphNode(node) {
+  if (!node.editable || !agent.graph || graphBusy.value) return
+  const ok = await ui.confirm({
+    title: '删除排队节点',
+    message: `删除节点「${node.nodeKey}」？`,
+    impact: '节点会停止并从任务图移除，其他节点对它的依赖会同时清除。',
+    confirmText: '删除节点'
+  })
+  if (!ok) return
+  graphBusy.value = true
+  try {
+    await agent.loadGraph(agent.activeRunId)
+    await agent.mutateGraph({
+      graphId: agent.graph.graphId,
+      etag: agent.graph.etag,
+      ops: [{ action: 'delete', runId: node.runId }]
+    })
+    ui.toast('排队节点已删除', 'success')
+  } catch (e) {
+    ui.toast(String((e && e.message) || e), 'error')
+    await agent.loadGraph(agent.activeRunId)
+  } finally {
+    graphBusy.value = false
+  }
 }
 function workspaceInfo(run) {
   try {
@@ -223,6 +329,49 @@ async function copyResult(c) {
         </header>
 
         <div
+          v-if="agent.activeRun.status === 'interrupted'"
+          class="shrink-0 px-5 pb-3 bg-surface"
+          data-testid="run-recovery-panel"
+        >
+          <div class="rounded-lg border border-warn bg-panel px-3 py-2 text-xs space-y-2">
+            <div class="flex items-center gap-2 flex-wrap">
+              <span class="font-medium text-warn-ink">任务因应用中断而停止</span>
+              <span v-if="runRecovery?.checkpoint" class="text-ink-muted">
+                检查点：{{
+                  checkpointPhaseText[runRecovery.checkpoint.phase] || runRecovery.checkpoint.phase
+                }}
+              </span>
+              <span v-if="runRecovery?.unfinishedTools?.length" class="text-bad-ink">
+                待核对工具 {{ runRecovery.unfinishedTools.length }} 项
+              </span>
+            </div>
+            <p class="text-ink-muted">
+              请先核对下方执行台账和工作区。只有安全边界允许原任务继续，其余情况请创建关联新任务。
+            </p>
+            <div v-if="runRecovery?.workspace?.path" class="text-ink-muted break-all">
+              工作区：{{ runRecovery.workspace.path }}
+            </div>
+            <div class="flex gap-2">
+              <button
+                class="btn-secondary !h-7 !px-2.5 text-xs"
+                data-testid="run-recovery-continue"
+                :disabled="!runRecovery?.canResume"
+                @click="continueInterrupted"
+              >
+                核对后续跑
+              </button>
+              <button
+                class="btn-secondary !h-7 !px-2.5 text-xs"
+                data-testid="run-recovery-retry"
+                @click="retryInterrupted"
+              >
+                关联新任务重试
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div
           v-if="acceptanceStatus(agent.activeRun)"
           class="shrink-0 px-5 pb-3 bg-surface"
           data-testid="run-acceptance-panel"
@@ -273,22 +422,57 @@ async function copyResult(c) {
           class="shrink-0 px-5 pb-3 bg-surface"
           data-testid="run-graph-panel"
         >
-          <div class="rounded-lg border border-line-subtle bg-panel px-3 py-2 text-xs space-y-1.5">
+          <div class="rounded-lg border border-line-subtle bg-panel px-3 py-2 text-xs space-y-2">
             <div class="flex items-center gap-2">
               <span class="text-ink-secondary">任务图</span>
               <span class="text-ink-muted">{{ agent.graph.status }}</span>
+              <span class="text-ink-muted">仅排队节点可编辑目标和依赖</span>
             </div>
-            <div
-              v-for="n in agent.graph.nodes"
-              :key="n.runId"
-              class="flex items-center gap-2 flex-wrap"
-            >
-              <span class="font-medium text-ink-primary">{{ n.nodeKey }}</span>
-              <StatusBadge :status="n.status" />
-              <span class="text-ink-muted truncate">{{ n.goal }}</span>
-              <span v-if="graphDepKeys(n.runId).length" class="text-ink-muted">
-                依赖 {{ graphDepKeys(n.runId).join(', ') }}
-              </span>
+            <div class="max-h-64 overflow-auto space-y-2">
+              <template v-for="(layer, layerIndex) in agent.graph.layers" :key="layerIndex">
+                <div class="flex flex-wrap items-start justify-center gap-2">
+                  <div
+                    v-for="node in layer"
+                    :key="node.runId"
+                    class="min-w-44 max-w-64 rounded-lg border border-line-subtle bg-surface p-2 space-y-1"
+                    :data-testid="`graph-node-${node.nodeKey}`"
+                  >
+                    <div class="flex items-center gap-2 flex-wrap">
+                      <span class="font-medium text-ink-primary">{{ node.nodeKey }}</span>
+                      <StatusBadge :status="node.status" />
+                    </div>
+                    <div class="text-ink-muted line-clamp-2">{{ node.goal }}</div>
+                    <div v-if="graphDepKeys(node.runId).length" class="text-ink-muted">
+                      依赖 {{ graphDepKeys(node.runId).join(', ') }}
+                    </div>
+                    <div
+                      v-if="node.editable && agent.graph.status === 'running'"
+                      class="flex gap-2 pt-1"
+                    >
+                      <button
+                        class="text-xs text-link hover:underline"
+                        data-testid="graph-node-edit"
+                        @click="openGraphEditor(node)"
+                      >
+                        编辑
+                      </button>
+                      <button
+                        class="text-xs text-bad-ink hover:underline"
+                        data-testid="graph-node-delete"
+                        @click="deleteGraphNode(node)"
+                      >
+                        删除
+                      </button>
+                    </div>
+                  </div>
+                </div>
+                <div
+                  v-if="layerIndex < agent.graph.layers.length - 1"
+                  class="text-center text-ink-muted"
+                >
+                  ↓
+                </div>
+              </template>
             </div>
           </div>
         </div>
@@ -382,5 +566,49 @@ async function copyResult(c) {
         </div>
       </div>
     </section>
+
+    <UiDialog :open="showGraphEditor" title="编辑排队节点" @close="showGraphEditor = false">
+      <div class="space-y-3">
+        <label class="block">
+          <span class="field-label">任务目标</span>
+          <textarea
+            v-model="editingGoal"
+            data-testid="graph-node-goal"
+            class="field-input min-h-24"
+            :maxlength="16000"
+          />
+        </label>
+        <fieldset class="space-y-2">
+          <legend class="field-label">前置依赖</legend>
+          <label
+            v-for="node in agent.graph?.nodes || []"
+            :key="node.runId"
+            class="flex items-center gap-2 text-sm"
+          >
+            <input
+              v-model="editingDeps"
+              type="checkbox"
+              :data-testid="`graph-dep-${node.nodeKey}`"
+              :value="node.runId"
+              :disabled="node.runId === editingNodeId"
+              class="accent-brand-ink"
+            />
+            <span>{{ node.nodeKey }}</span>
+            <StatusBadge :status="node.status" />
+          </label>
+        </fieldset>
+      </div>
+      <template #footer>
+        <button class="btn-secondary text-sm" @click="showGraphEditor = false">取消</button>
+        <button
+          class="btn-primary text-sm"
+          data-testid="graph-node-save"
+          :disabled="!editingGoal.trim() || graphBusy"
+          @click="saveGraphNode"
+        >
+          {{ graphBusy ? '保存中…' : '保存' }}
+        </button>
+      </template>
+    </UiDialog>
   </div>
 </template>

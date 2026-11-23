@@ -4,9 +4,13 @@ import os from 'os'
 import { _electron } from 'playwright-core'
 import { createMockServer } from './mock-server'
 
-export async function launchApp({ reuseUserData = null, env = {} } = {}) {
+export async function launchApp({
+  reuseUserData = null,
+  env = {},
+  mock: providedMock = null
+} = {}) {
   const userData = reuseUserData || fs.mkdtempSync(path.join(os.tmpdir(), 'miniagent-e2e-'))
-  const mock = await createMockServer()
+  const mock = providedMock || (await createMockServer())
   const executablePath = process.env.MINIAGENT_E2E_EXECUTABLE
   const packaged = process.env.MINIAGENT_E2E_PACKAGED === '1'
   const electronApp = await _electron.launch({
@@ -64,7 +68,7 @@ export async function closeApp(electronApp, mock) {
   } catch {
     /* ignore */
   }
-  await mock.close()
+  if (mock) await mock.close()
 }
 
 // Patch native dialogs in the main process (standard Playwright electron pattern).

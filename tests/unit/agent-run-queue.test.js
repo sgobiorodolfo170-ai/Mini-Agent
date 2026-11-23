@@ -35,6 +35,52 @@ function seed(status, parentRunId, controlMode, { graphId = null, nodeKey = null
   return id
 }
 
+it('exposes run snapshots, transfer results and event-driven waits', async () => {
+  const parent = seed('running')
+  const child = seed('transferred', parent, 'transferred')
+  const handoff = seed('done', child, 'transferred')
+  db.prepare('UPDATE agent_runs SET transfer_to_run_id=? WHERE id=?').run(handoff, child)
+  const message = repos.getMessage(db, repos.getRun(db, handoff).assistantMessageId)
+  repos.updateMessage(db, message.id, { content: 'handoff result', status: 'done' })
+
+  expect(runtime.getRunStatus(db, parent).id).toBe(parent)
+  expect(runtime.followTransfer(db, repos.getRun(db, child)).id).toBe(handoff)
+  expect(runtime.getRunResult(db, handoff).content).toBe('handoff result')
+  await expect(
+    runtime.waitForRuns(db, { runIds: [handoff], timeoutMs: 10 })
+  ).resolves.toMatchObject({
+    timedOut: false,
+    runs: [expect.objectContaining({ runId: handoff, content: 'handoff result' })]
+  })
+  await expect(
+    runtime.waitForRuns(db, { runIds: ['removed'], resolveRunIds: () => [], timeoutMs: 10 })
+  ).resolves.toEqual({ timedOut: false, runs: [] })
+})
+
+it('reset clears stale slots and invalidates a scheduled callback', async () => {
+  const first = seed('queued')
+  const launches = []
+  const queue = runtime.createRunQueue({
+    limit: 1,
+    shuttingDown: () => false,
+    launch(store, id) {
+      runtime.transition(store, id, { status: 'running' })
+      launches.push(id)
+    }
+  })
+  queue.schedule(db)
+  queue.reset()
+  await tick()
+  expect(launches).toEqual([])
+
+  repos.updateRunStatus(db, first, { status: 'stopped' })
+  const second = seed('queued')
+  queue.schedule(db)
+  await tick()
+  expect(launches).toEqual([second])
+  expect(repos.getRun(db, first).status).toBe('stopped')
+})
+
 it('restarts unclaimed handoffs and interrupts claimed work without replaying it', () => {
   const root = seed('transferred')
   const handoff = seed('queued', root, 'transferred')
@@ -108,8 +154,15 @@ it('only launches graph nodes whose dependencies are done', async () => {
   await tick()
   expect(launches).toEqual([a])
 
-  db.prepare("UPDATE agent_runs SET status='done' WHERE id=?").run(a)
+  db.prepare(
+    "UPDATE agent_runs SET status='done', acceptance_policy='{}', acceptance_status='pending' WHERE id=?"
+  ).run(a)
   queue.release(db, a)
+  await tick()
+  expect(launches).toEqual([a])
+
+  db.prepare("UPDATE agent_runs SET acceptance_status='accepted' WHERE id=?").run(a)
+  queue.schedule(db)
   await tick()
   expect(launches).toEqual([a, b])
 })

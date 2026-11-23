@@ -1,13 +1,13 @@
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import * as agent from '../../electron/main/agent'
 
 const require = createRequire(import.meta.url)
 const electronPath = require.resolve('electron')
 require('electron')
 const dbm = require('../../electron/store/db')
 const repos = require('../../electron/store/repos')
-const agent = require('../../electron/main/agent')
 const { getHub } = require('../../electron/main/events/hub')
 
 let db

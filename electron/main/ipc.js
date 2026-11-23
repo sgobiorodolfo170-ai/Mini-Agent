@@ -229,11 +229,18 @@ function registerIpc(ctx) {
     if (!dir) throw new Error('请选择项目工作目录')
     if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory())
       throw new Error('工作目录不存在或不是文件夹')
+    const verifyCommand = String((o && o.workspaceVerifyCommand) || '').trim()
+    if (verifyCommand.length > 500) throw new Error('验收命令不能超过 500 个字符')
+    const conflictStrategy = String((o && o.workspaceConflictStrategy) || 'manual')
+    if (!['manual', 'ours', 'theirs'].includes(conflictStrategy))
+      throw new Error('工作区冲突策略无效')
     const r = repos.createProject(dbm.get(), {
       name,
       path: dir,
       workspaceMode: o && o.workspaceMode,
-      workspaceAutoMerge: o && o.workspaceAutoMerge !== undefined ? o.workspaceAutoMerge : 1
+      workspaceAutoMerge: o && o.workspaceAutoMerge !== undefined ? o.workspaceAutoMerge : 1,
+      workspaceVerifyCommand: verifyCommand,
+      workspaceConflictStrategy: conflictStrategy
     })
     broadcast('projects:changed', {})
     return r
@@ -245,6 +252,16 @@ function registerIpc(ctx) {
       if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory())
         throw new Error('工作目录不存在或不是文件夹')
       patch = { ...patch, path: dir }
+    }
+    if (patch && patch.workspaceVerifyCommand !== undefined) {
+      const verifyCommand = String(patch.workspaceVerifyCommand || '').trim()
+      if (verifyCommand.length > 500) throw new Error('验收命令不能超过 500 个字符')
+      patch = { ...patch, workspaceVerifyCommand: verifyCommand }
+    }
+    if (patch && patch.workspaceConflictStrategy !== undefined) {
+      const strategy = String(patch.workspaceConflictStrategy || 'manual')
+      if (!['manual', 'ours', 'theirs'].includes(strategy)) throw new Error('工作区冲突策略无效')
+      patch = { ...patch, workspaceConflictStrategy: strategy }
     }
     const r = repos.updateProject(db, id, patch || {})
     if (!r) throw new Error('项目不存在')
@@ -370,11 +387,23 @@ function registerIpc(ctx) {
   h('agent:stop', (runId) => agent.stopRun(runId))
   h('agent:pause', (runId) => agent.pauseRun(runId))
   h('agent:resume', (runId) => agent.resumeRun(runId))
+  h('agent:recovery', (runId) => agent.getRunRecovery(runId))
+  h('agent:recovery:continue', (o) =>
+    agent.resumeInterruptedRun(o && o.runId, { actor: 'desktop', reason: o && o.reason })
+  )
+  h('agent:recovery:retry', (o) =>
+    agent.retryInterruptedRun(o && o.runId, {
+      actor: 'desktop',
+      reason: o && o.reason,
+      idempotencyKey: o && o.idempotencyKey
+    })
+  )
   h('agent:respond', (o) => agent.respondConfirm(o))
   h('agent:acceptance:decide', (o) => agent.decideAcceptance(o))
   h('agent:runs', () => repos.listRuns(dbm.get(), 50))
   h('agent:calls', (runId) => repos.getRunCalls(dbm.get(), runId))
   h('agent:graph', (runId) => agent.getGraphForParent(runId))
+  h('agent:graph:mutate', (o) => agent.mutateRunGraph(o || {}))
 
   // 局域网远程控制：管理接口仅暴露给主窗口，手机只能走受限网络协议。
   const remoteManager = () => ctx.remote && ctx.remote()

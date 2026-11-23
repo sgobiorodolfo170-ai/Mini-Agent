@@ -1,15 +1,15 @@
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import * as agent from '../../electron/main/agent'
+import storage from '../../electron/store/run-storage'
+import graph from '../../electron/main/agent/graph'
 
 const require = createRequire(import.meta.url)
 const electronPath = require.resolve('electron')
 require('electron')
 const dbm = require('../../electron/store/db')
 const repos = require('../../electron/store/repos')
-const storage = require('../../electron/store/run-storage')
-const graph = require('../../electron/main/agent/graph')
-const agent = require('../../electron/main/agent')
 
 let db
 let originalElectron
@@ -211,6 +211,190 @@ describe('检查点与恢复', () => {
     expect(bodies).toHaveLength(1)
     expect(bodies[0].messages.at(-1).role).toBe('tool')
     expect(storage.loadCheckpoint(db, runId)).toBeNull()
+  })
+
+  it('从 model_done 的完整台账补齐工具消息后继续，不重放工具', async () => {
+    const call = {
+      id: 'call-ledger',
+      type: 'function',
+      function: { name: 'read_file', arguments: '{"path":"a.txt"}' }
+    }
+    const { runId } = seedRun({
+      checkpoint: {
+        phase: 'model_done',
+        step: 2,
+        messages: [
+          { role: 'system', content: 'system' },
+          { role: 'user', content: '目标' },
+          { role: 'assistant', content: '', tool_calls: [call] }
+        ],
+        pendingToolCalls: [call],
+        stepsUsed: 2
+      }
+    })
+    const ledgerId = repos.startToolCall(db, {
+      runId,
+      step: 1,
+      tool: 'read_file',
+      args: { path: 'a.txt' },
+      riskLevel: 'readonly',
+      confirmedBy: 'auto',
+      callId: call.id
+    })
+    repos.finishToolCall(db, ledgerId, { result: '台账结果', durationMs: 1 })
+
+    expect(agent.getRunRecovery(runId)).toMatchObject({
+      canResume: true,
+      checkpoint: { phase: 'tool_done', pendingTools: [] },
+      recoveredCalls: [{ callId: call.id, status: 'done' }]
+    })
+    expect(storage.autoResumeRuns(db)).toEqual([runId])
+    expect(storage.loadCheckpoint(db, runId).messages.at(-1)).toEqual({
+      role: 'tool',
+      tool_call_id: call.id,
+      content: '台账结果'
+    })
+
+    const bodies = []
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, opts) => {
+      bodies.push(JSON.parse(opts.body))
+      return response({ content: '恢复完成' })
+    })
+    agent.resumeQueuedRuns()
+    await expect
+      .poll(() => agent.getRunStatus(runId), { timeout: 10000 })
+      .toMatchObject({ status: 'done', resumeCount: 1 })
+    expect(bodies).toHaveLength(1)
+    expect(bodies[0].messages.at(-1)).toMatchObject({
+      role: 'tool',
+      tool_call_id: call.id,
+      content: '台账结果'
+    })
+  })
+
+  it('model_done 的台账参数或结果冲突时保持人工恢复', () => {
+    const call = {
+      id: 'call-conflict',
+      type: 'function',
+      function: { name: 'read_file', arguments: '{"path":"a.txt"}' }
+    }
+    const { runId } = seedRun({
+      checkpoint: {
+        phase: 'model_done',
+        step: 1,
+        messages: [
+          { role: 'system', content: 'system' },
+          { role: 'user', content: '目标' },
+          { role: 'assistant', content: '', tool_calls: [call] },
+          { role: 'tool', tool_call_id: call.id, content: '消息结果' }
+        ],
+        pendingToolCalls: [],
+        stepsUsed: 1
+      }
+    })
+    const ledgerId = repos.startToolCall(db, {
+      runId,
+      step: 1,
+      tool: 'read_file',
+      args: { path: 'different.txt' },
+      riskLevel: 'readonly',
+      confirmedBy: 'auto',
+      callId: call.id
+    })
+    repos.finishToolCall(db, ledgerId, { result: '消息结果', durationMs: 1 })
+    expect(agent.getRunRecovery(runId)).toMatchObject({
+      canResume: false,
+      reason: 'model_done_args_mismatch'
+    })
+    expect(storage.autoResumeRuns(db)).toEqual([])
+  })
+
+  it('存储层直接核对并重新入队安全中断任务，拒绝损坏工作区配置', () => {
+    const safe = seedRun({
+      checkpoint: {
+        phase: 'before_model',
+        step: 1,
+        messages: SAFE_MESSAGES.slice(0, 2),
+        pendingToolCalls: [],
+        stepsUsed: 1
+      }
+    })
+    expect(storage.inspectInterruptedRun(db, safe.runId).canResume).toBe(true)
+    expect(storage.requeueInterruptedRun(db, safe.runId)).toEqual({ ok: true })
+    expect(repos.getRun(db, safe.runId).status).toBe('queued')
+
+    conversationId = repos.createConversation(db, {
+      title: '损坏工作区会话',
+      providerId,
+      model: 'm1'
+    }).id
+    const damaged = seedRun({
+      checkpoint: {
+        phase: 'before_model',
+        step: 1,
+        messages: SAFE_MESSAGES.slice(0, 2),
+        pendingToolCalls: [],
+        stepsUsed: 1
+      }
+    })
+    db.prepare('UPDATE agent_runs SET workspace_json=? WHERE id=?').run('{bad-json', damaged.runId)
+    expect(storage.inspectInterruptedRun(db, damaged.runId)).toMatchObject({
+      canResume: false,
+      reason: 'workspace_invalid'
+    })
+    expect(storage.requeueInterruptedRun(db, damaged.runId)).toEqual({
+      ok: false,
+      reason: 'workspace_invalid'
+    })
+  })
+
+  it('人工核对后可继续安全中断任务，并保留恢复次数', async () => {
+    const { runId } = seedRun({
+      checkpoint: {
+        phase: 'before_model',
+        step: 1,
+        messages: SAFE_MESSAGES.slice(0, 2),
+        pendingToolCalls: [],
+        stepsUsed: 1
+      }
+    })
+    db.prepare('UPDATE agent_runs SET resume_count=1 WHERE id=?').run(runId)
+    expect(agent.getRunRecovery(runId).canResume).toBe(true)
+    agent.resumeInterruptedRun(runId, { reason: '已核对工作区' })
+    expect(repos.getRun(db, runId)).toMatchObject({ status: 'queued', resumeCount: 2 })
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      response({ content: '人工恢复完成' })
+    )
+    agent.resumeQueuedRuns()
+    await expect
+      .poll(() => agent.getRunStatus(runId), { timeout: 10000 })
+      .toMatchObject({ status: 'done', resumeCount: 2 })
+  })
+
+  it('未知副作用任务禁止原样继续，但可创建关联新任务', async () => {
+    const { runId } = seedRun({
+      checkpoint: {
+        phase: 'model_done',
+        step: 1,
+        messages: SAFE_MESSAGES.slice(0, 3),
+        pendingToolCalls: [{ id: 'call-1' }],
+        stepsUsed: 1
+      }
+    })
+    expect(agent.getRunRecovery(runId)).toMatchObject({
+      canResume: false,
+      reason: 'model_done_tool_unsettled'
+    })
+    expect(() => agent.resumeInterruptedRun(runId)).toThrow(/不可继续/)
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => response({ content: '重试完成' }))
+    const retry = await agent.retryInterruptedRun(runId, { reason: '已核对工具台账' })
+    expect(repos.getRun(db, retry.runId).retryOfRunId).toBe(runId)
+    expect(repos.getRun(db, runId).status).toBe('interrupted')
+    await expect
+      .poll(() => agent.getRunStatus(retry.runId), { timeout: 10000 })
+      .toMatchObject({ status: 'done', retryOfRunId: runId })
   })
 
   it('超限裁剪检查点时保持工具调用与结果配对', () => {

@@ -59,7 +59,7 @@ function followTransfer(db, run) {
   return run
 }
 
-function waitForRuns(db, { runIds, timeoutMs, signal }) {
+function waitForRuns(db, { runIds, resolveRunIds, timeoutMs, signal }) {
   const timeout = Math.min(300000, Math.max(1, Number(timeoutMs) || 60000))
   return new Promise((resolve, reject) => {
     function cleanup() {
@@ -74,7 +74,8 @@ function waitForRuns(db, { runIds, timeoutMs, signal }) {
     }
     function check(timedOut = false) {
       try {
-        const runs = runIds.map((id) => {
+        const ids = typeof resolveRunIds === 'function' ? resolveRunIds() : runIds
+        const runs = ids.map((id) => {
           const run = followTransfer(db, repos.getRun(db, id))
           if (!run) throw new Error('任务不存在')
           return {
@@ -109,6 +110,7 @@ function createRunQueue({ launch, shuttingDown, limit = SLOT_LIMIT }) {
   const resumes = new Map()
   const activeGraphs = new Map()
   let scheduled = false
+  let generation = 0
 
   function trackGraph(db, id) {
     const run = repos.getRun(db, id)
@@ -136,11 +138,14 @@ function createRunQueue({ launch, shuttingDown, limit = SLOT_LIMIT }) {
   function dependenciesReady(db, id) {
     const deps = db
       .prepare(
-        `SELECT p.status FROM run_dependencies d
+        `SELECT p.status, p.acceptance_policy, p.acceptance_status FROM run_dependencies d
          JOIN agent_runs p ON p.id=d.depends_on_run_id WHERE d.run_id=?`
       )
       .all(id)
-    return deps.every((dep) => dep.status === 'done')
+    return deps.every(
+      (dep) =>
+        dep.status === 'done' && (!dep.acceptance_policy || dep.acceptance_status === 'accepted')
+    )
   }
 
   function pickQueued(db) {
@@ -160,7 +165,9 @@ function createRunQueue({ launch, shuttingDown, limit = SLOT_LIMIT }) {
   function schedule(db) {
     if (scheduled || shuttingDown()) return
     scheduled = true
+    const queuedGeneration = generation
     setImmediate(() => {
+      if (queuedGeneration !== generation) return
       scheduled = false
       if (shuttingDown()) return
       try {
@@ -218,7 +225,19 @@ function createRunQueue({ launch, shuttingDown, limit = SLOT_LIMIT }) {
     })
   }
 
-  return { schedule, release, acquire }
+  function isClaimed(id) {
+    return slots.has(id)
+  }
+
+  function reset() {
+    generation += 1
+    slots.clear()
+    resumes.clear()
+    activeGraphs.clear()
+    scheduled = false
+  }
+
+  return { schedule, release, acquire, isClaimed, reset }
 }
 
 module.exports = {

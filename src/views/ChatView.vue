@@ -207,12 +207,16 @@ const projectName = ref('')
 const projectPath = ref('')
 const projectWorktree = ref(true)
 const projectAutoMerge = ref(true)
+const projectVerifyCommand = ref('')
+const projectConflictStrategy = ref('manual')
 const savingProject = ref(false)
 function openProjectDialog() {
   projectName.value = ''
   projectPath.value = ''
   projectWorktree.value = true
   projectAutoMerge.value = true
+  projectVerifyCommand.value = ''
+  projectConflictStrategy.value = 'manual'
   showProjectDialog.value = true
 }
 async function pickProjectDir() {
@@ -230,7 +234,9 @@ async function submitProject() {
       name,
       path: dir,
       workspaceMode: projectWorktree.value ? 'worktree' : 'shared',
-      workspaceAutoMerge: projectAutoMerge.value
+      workspaceAutoMerge: projectAutoMerge.value,
+      workspaceVerifyCommand: projectVerifyCommand.value.trim(),
+      workspaceConflictStrategy: projectConflictStrategy.value
     })
     showProjectDialog.value = false
     collapsedProjects.value[p.id] = false
@@ -269,6 +275,65 @@ async function removeProject(p) {
   })
   if (ok) await projects.remove(p.id)
 }
+const showVerifyDialog = ref(false)
+const verifyProjectId = ref(null)
+const verifyCommand = ref('')
+const savingVerify = ref(false)
+function openVerifyDialog(p) {
+  verifyProjectId.value = p.id
+  verifyCommand.value = p.workspaceVerifyCommand || ''
+  showVerifyDialog.value = true
+}
+async function submitVerifyCommand() {
+  if (!verifyProjectId.value || savingVerify.value) return
+  savingVerify.value = true
+  try {
+    await projects.update(verifyProjectId.value, {
+      workspaceVerifyCommand: verifyCommand.value.trim()
+    })
+    showVerifyDialog.value = false
+    ui.toast('合并验收命令已更新', 'success')
+  } catch (e) {
+    ui.toast('保存验收命令失败：' + String((e && e.message) || e), 'error')
+  } finally {
+    savingVerify.value = false
+  }
+}
+
+const showConflictDialog = ref(false)
+const conflictProjectId = ref(null)
+const conflictStrategy = ref('manual')
+const savingConflict = ref(false)
+function openConflictDialog(p) {
+  conflictProjectId.value = p.id
+  conflictStrategy.value = p.workspaceConflictStrategy || 'manual'
+  showConflictDialog.value = true
+}
+async function submitConflictStrategy() {
+  if (!conflictProjectId.value || savingConflict.value) return
+  if (conflictStrategy.value !== 'manual') {
+    const ok = await ui.confirm({
+      title: '启用自动冲突解决',
+      message: `冲突时将选择「${conflictStrategy.value === 'ours' ? '当前目标侧' : '合并来源侧'}」。`,
+      impact: '这可能丢弃另一侧在同一文件上的改动；不影响项目是否开启自动合并。',
+      confirmText: '确认启用'
+    })
+    if (!ok) return
+  }
+  savingConflict.value = true
+  try {
+    await projects.update(conflictProjectId.value, {
+      workspaceConflictStrategy: conflictStrategy.value
+    })
+    showConflictDialog.value = false
+    ui.toast('工作区冲突策略已更新', 'success')
+  } catch (e) {
+    ui.toast('保存冲突策略失败：' + String((e && e.message) || e), 'error')
+  } finally {
+    savingConflict.value = false
+  }
+}
+
 // 项目标题行「…」菜单：置顶 / 删除
 function projectMenuItems(p) {
   return [
@@ -287,6 +352,21 @@ function projectMenuItems(p) {
       label: p.workspaceAutoMerge ? '关闭自动合并' : '开启自动合并',
       icon: 'check',
       onSelect: () => projects.update(p.id, { workspaceAutoMerge: p.workspaceAutoMerge ? 0 : 1 })
+    },
+    {
+      id: 'verify',
+      label: p.workspaceVerifyCommand ? '修改合并验收命令' : '设置合并验收命令',
+      icon: 'edit',
+      onSelect: () => openVerifyDialog(p)
+    },
+    {
+      id: 'conflict',
+      label:
+        p.workspaceConflictStrategy === 'manual'
+          ? '设置工作区冲突策略'
+          : `冲突策略：${p.workspaceConflictStrategy}`,
+      icon: 'edit',
+      onSelect: () => openConflictDialog(p)
     },
     {
       id: 'pin',
@@ -329,7 +409,7 @@ const composerHint = computed(() =>
       ? 'Enter 发送，Shift+Enter 换行；可调用工具，涉及写入的操作将请求确认'
       : 'Enter 发送，Shift+Enter 换行'
 )
-// 权限四级：默认权限（纯对话）/ 只读任务（仅只读工具）/ 自主模式（写操作逐次确认）/ 完整权限（不再逐次确认）
+// 权限四级：默认权限（纯对话）/ 只读任务（仅只读工具）/ 自主模式（写操作逐次确认）/ 完整权限（命令仍逐次确认）
 // 选中值写回 chat.permission（按会话持久化），真实决定 agent.run 的确认策略
 const PERMISSION_META = {
   default: { label: '默认权限', hint: '普通对话，不调用工具', icon: 'chat' },
@@ -345,7 +425,7 @@ const PERMISSION_META = {
   },
   full: {
     label: '完整权限',
-    hint: '可调用工具，非只读操作直接执行，不再逐次确认',
+    hint: '可调用工具，普通写操作直接执行；命令与破坏性操作仍逐次确认',
     icon: 'shield'
   }
 }
@@ -1074,7 +1154,7 @@ function startResize(e) {
                 data-testid="project-worktree"
                 class="accent-brand-ink"
               />
-              使用独立 Git 工作区（非 Git 目录自动回退共享目录）
+              使用独立 Git 工作区（仅 Git 仓库可用，隔离失败会中止任务）
             </label>
             <label class="flex items-center gap-2">
               <input
@@ -1087,6 +1167,32 @@ function startResize(e) {
             </label>
           </div>
         </label>
+        <label v-if="projectWorktree && projectAutoMerge" class="block">
+          <span class="field-label">合并验收命令（可选）</span>
+          <input
+            v-model="projectVerifyCommand"
+            data-testid="project-verify-command"
+            :maxlength="500"
+            placeholder="如：npm test"
+            class="field-input"
+          />
+          <p class="field-help mt-1">
+            自动合并前在独立工作区执行；命令失败或 diff 检查不通过时不合并
+          </p>
+        </label>
+        <label v-if="projectWorktree" class="block">
+          <span class="field-label">工作区冲突策略</span>
+          <select
+            v-model="projectConflictStrategy"
+            data-testid="project-conflict-strategy"
+            class="field-input"
+          >
+            <option value="manual">人工处理（保留冲突分支）</option>
+            <option value="ours">自动选择当前目标侧</option>
+            <option value="theirs">自动选择合并来源侧</option>
+          </select>
+          <p class="field-help mt-1">自动策略可能丢弃另一侧的同文件改动，默认保持人工处理</p>
+        </label>
       </div>
       <template #footer>
         <button class="btn-secondary text-sm" @click="showProjectDialog = false">取消</button>
@@ -1097,6 +1203,68 @@ function startResize(e) {
           @click="submitProject"
         >
           {{ savingProject ? '添加中…' : '添加' }}
+        </button>
+      </template>
+    </UiDialog>
+
+    <UiDialog :open="showVerifyDialog" title="合并验收命令" @close="showVerifyDialog = false">
+      <div class="space-y-3">
+        <label class="block">
+          <span class="field-label">PowerShell 命令（可选）</span>
+          <input
+            v-model="verifyCommand"
+            data-testid="project-verify-command-edit"
+            :maxlength="500"
+            placeholder="如：npm test"
+            class="field-input"
+            @keydown.enter="submitVerifyCommand"
+          />
+          <p class="field-help mt-1">
+            命令以当前 Windows 用户权限在独立工作区执行，最长 120 秒；留空则只做 diff
+            与冲突标记检查。
+          </p>
+        </label>
+      </div>
+      <template #footer>
+        <button class="btn-secondary text-sm" @click="showVerifyDialog = false">取消</button>
+        <button
+          class="btn-primary text-sm"
+          data-testid="project-verify-command-save"
+          :disabled="savingVerify"
+          @click="submitVerifyCommand"
+        >
+          {{ savingVerify ? '保存中…' : '保存' }}
+        </button>
+      </template>
+    </UiDialog>
+
+    <UiDialog :open="showConflictDialog" title="工作区冲突策略" @close="showConflictDialog = false">
+      <div class="space-y-3">
+        <label class="block">
+          <span class="field-label">冲突解决方式</span>
+          <select
+            v-model="conflictStrategy"
+            data-testid="project-conflict-strategy-edit"
+            class="field-input"
+          >
+            <option value="manual">人工处理（保留冲突分支）</option>
+            <option value="ours">自动选择当前目标侧</option>
+            <option value="theirs">自动选择合并来源侧</option>
+          </select>
+          <p class="field-help mt-1">
+            下游继承时当前目标侧是下游工作区；回并时是主分支。来源侧分别是前置成果或 Run 分支。
+          </p>
+        </label>
+      </div>
+      <template #footer>
+        <button class="btn-secondary text-sm" @click="showConflictDialog = false">取消</button>
+        <button
+          class="btn-primary text-sm"
+          data-testid="project-conflict-strategy-save"
+          :disabled="savingConflict"
+          @click="submitConflictStrategy"
+        >
+          {{ savingConflict ? '保存中…' : '保存' }}
         </button>
       </template>
     </UiDialog>

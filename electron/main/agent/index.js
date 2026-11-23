@@ -1,11 +1,14 @@
 const os = require('os')
+const fs = require('fs')
 const { createHash } = require('node:crypto')
 const { transaction, canonicalJson, remoteError } = require('../remote/protocol')
 const {
   recordRunState,
   saveCheckpoint,
   loadCheckpoint,
-  clearCheckpoint
+  clearCheckpoint,
+  inspectInterruptedRun,
+  requeueInterruptedRun
 } = require('../../store/run-storage')
 const {
   createRunQueue,
@@ -57,6 +60,35 @@ function getControlRuntime(db) {
 }
 
 const active = new Map() // runId -> { ac, stopped, remember:Set, confirms:Map }
+const pendingMerges = new Set()
+const projectMergeTails = new Map()
+
+function scheduleAutoMerge(db, runId) {
+  const task = maybeAutoMerge(db, runId)
+  pendingMerges.add(task)
+  task.then(
+    () => pendingMerges.delete(task),
+    () => pendingMerges.delete(task)
+  )
+  return task
+}
+
+async function withProjectMergeLock(projectPath, task) {
+  const key = path.resolve(projectPath).toLowerCase()
+  const previous = projectMergeTails.get(key) || Promise.resolve()
+  let release
+  const current = new Promise((resolve) => {
+    release = resolve
+  })
+  projectMergeTails.set(key, current)
+  await previous.catch(() => {})
+  try {
+    return await task()
+  } finally {
+    release()
+    if (projectMergeTails.get(key) === current) projectMergeTails.delete(key)
+  }
+}
 
 // 确认请求的最长等待时间：超时按拒绝处理，避免隐藏窗口里的任务永久挂起
 
@@ -228,7 +260,10 @@ function publishRegistration(db, row) {
   broadcast('agent:event', { type: 'queued', ...row })
 }
 
-function registerRuns(requests, { parentRunId, controlMode, idempotencyKey, plan = false } = {}) {
+function registerRuns(
+  requests,
+  { parentRunId, controlMode, idempotencyKey, plan = false, retryOfRunId = null } = {}
+) {
   const db = dbm.get()
   if (isShuttingDown()) throw new Error('应用正在退出，无法开始新的智能任务')
   const scope = parentRunId ? `parent:${parentRunId}` : 'root'
@@ -236,7 +271,8 @@ function registerRuns(requests, { parentRunId, controlMode, idempotencyKey, plan
     .update(
       canonicalJson({
         requests: JSON.parse(JSON.stringify(requests)),
-        controlMode: controlMode || null
+        controlMode: controlMode || null,
+        retryOfRunId: retryOfRunId || null
       })
     )
     .digest('hex')
@@ -268,6 +304,15 @@ function registerRuns(requests, { parentRunId, controlMode, idempotencyKey, plan
     const owner = parentRunId
       ? assertCanDelegate(db, parentRunId, controlMode, requests.length, { plan })
       : null
+    let retrySource = null
+    if (retryOfRunId) {
+      if (plan || requests.length !== 1 || owner) throw new Error('中断重试只能创建单个独立任务')
+      retrySource = repos.getRun(db, retryOfRunId)
+      if (!retrySource || retrySource.status !== 'interrupted')
+        throw remoteError('STATE_CONFLICT', '原任务不是可重试的中断状态', 409)
+      if (requests[0].conversationId !== retrySource.conversationId)
+        throw remoteError('INVALID_TARGET', '重试必须使用原任务会话', 400)
+    }
     const settings = repos.getAllSettings(db)
     const registered = requests.map((request) => {
       const goal = String(request.goal || '').trim()
@@ -345,9 +390,12 @@ function registerRuns(requests, { parentRunId, controlMode, idempotencyKey, plan
         controlMode,
         mandate,
         acceptancePolicy: request.acceptancePolicy,
-        traceId: owner ? owner.parent.traceId || parentRunId : request.traceId || repos.uid(),
+        traceId: owner
+          ? owner.parent.traceId || parentRunId
+          : retrySource?.traceId || request.traceId || repos.uid(),
         graphId,
-        nodeKey: request.key || null
+        nodeKey: request.key || null,
+        retryOfRunId
       })
       const first = repos.listMessages(db, conversationId).length === 0
       const user = repos.insertMessage(db, {
@@ -394,6 +442,20 @@ function registerRuns(requests, { parentRunId, controlMode, idempotencyKey, plan
         }),
         runId
       )
+      if (retrySource) {
+        const previousWorkspace = safeJson(retrySource.workspaceJson)
+        if (
+          previousWorkspace &&
+          previousWorkspace.mode === 'worktree' &&
+          previousWorkspace.path &&
+          fs.existsSync(previousWorkspace.path)
+        ) {
+          db.prepare('UPDATE agent_runs SET workspace_json=? WHERE id=?').run(
+            JSON.stringify(previousWorkspace),
+            runId
+          )
+        }
+      }
       repos.touchConversation(db, conversationId)
       recordRunState(db, runId)
       return {
@@ -441,14 +503,21 @@ function registerRuns(requests, { parentRunId, controlMode, idempotencyKey, plan
   return rows
 }
 
-async function startAgentRun({ parentRunId, controlMode, idempotencyKey, ...request }) {
+async function startAgentRun({
+  parentRunId,
+  controlMode,
+  idempotencyKey,
+  retryOfRunId,
+  ...request
+}) {
   if (parentRunId && !['delegated', 'transferred'].includes(controlMode))
     throw new Error('非法任务关系')
   if (!parentRunId && controlMode) throw new Error('任务派生必须指定父任务')
   return registerRuns([request], {
     parentRunId: parentRunId || null,
     controlMode: controlMode || null,
-    idempotencyKey
+    idempotencyKey,
+    retryOfRunId: retryOfRunId || null
   })[0]
 }
 
@@ -472,8 +541,33 @@ function registerPlan(tasks, { parentRunId, idempotencyKey } = {}) {
 
 function getGraphForParent(parentRunId) {
   const db = dbm.get()
-  const g = graph.getGraphForParent(db, parentRunId)
-  return g ? graph.summary(db, g.id) : null
+  const run = repos.getRun(db, parentRunId)
+  const g =
+    run && run.graphId ? graph.getGraph(db, run.graphId) : graph.getGraphForParent(db, parentRunId)
+  if (!g) return null
+  const result = graph.summary(db, g.id)
+  if (result)
+    result.nodes = result.nodes.map((node) => ({
+      ...node,
+      editable: node.editable && !runQueue.isClaimed(node.runId)
+    }))
+  return result
+}
+
+function mutateRunGraph(input) {
+  const db = dbm.get()
+  const result = transaction(db, () =>
+    graph.mutateGraph(db, {
+      graphId: input.graphId,
+      etag: input.etag,
+      ops: input.ops,
+      isClaimed: (runId) => runQueue.isClaimed(runId)
+    })
+  )
+  runQueue.schedule(db)
+  broadcast('agent:event', { type: 'graph', graphId: result.graphId, status: result.status })
+  getHub().emit('graph.updated', result)
+  return result
 }
 
 async function launchQueuedRun(db, runId) {
@@ -527,21 +621,76 @@ async function launchQueuedRunInner(db, runId) {
           projectPath: project.path,
           projectId: project.id,
           runId,
-          rootDir: path.join(electron.app.getPath('userData'), 'workspaces')
+          rootDir: path.join(electron.app.getPath('userData'), 'workspaces'),
+          strict: true
         })
       } catch (error) {
-        workspaceInfo = { mode: 'shared', reason: String((error && error.message) || error) }
+        workspaceInfo = { mode: 'error', reason: String((error && error.message) || error) }
+      }
+      if (workspaceInfo.mode === 'error') {
+        repos.setRunWorkspace(db, runId, workspaceInfo)
+        broadcast('agent:event', {
+          type: 'workspace',
+          runId,
+          conversationId,
+          status: 'failed',
+          reason: workspaceInfo.reason
+        })
+        finishRun(db, run, {
+          status: 'error',
+          reason: 'workspace_prepare_failed',
+          content: `独立工作区创建失败，任务未执行：${workspaceInfo.reason}`
+        })
+        runQueue.release(db, runId)
+        return
       }
       repos.setRunWorkspace(db, runId, workspaceInfo)
       broadcast('agent:event', {
         type: 'workspace',
         runId,
         conversationId,
-        status: workspaceInfo.mode === 'worktree' ? 'created' : 'fallback',
-        reason: workspaceInfo.reason || null,
+        status: 'created',
         path: workspaceInfo.path || null,
         branch: workspaceInfo.branch || null
       })
+    }
+  }
+
+  if (run.graphId && workspaceInfo && workspaceInfo.mode === 'worktree') {
+    const inheritance = workspaceInfo.inheritance
+    if (!inheritance || inheritance.status !== 'ready') {
+      const dependencies = graph.listDirectDependencies(db, runId).map((dependency) => ({
+        runId: dependency.id,
+        status: dependency.status,
+        workspace: safeJson(dependency.workspace_json)
+      }))
+      const inherited = await workspace.inheritArtifacts({
+        projectPath: workspaceInfo.projectPath,
+        workspace: workspaceInfo,
+        conflictStrategy: repos.getProject(db, workspaceInfo.projectId)?.workspaceConflictStrategy,
+        dependencies
+      })
+      workspaceInfo = { ...workspaceInfo, inheritance: inherited }
+      repos.setRunWorkspace(db, runId, workspaceInfo)
+      broadcast('agent:event', {
+        type: 'workspace',
+        runId,
+        conversationId,
+        status: inherited.status,
+        reason: inherited.reason || null,
+        inheritance: inherited.inheritance || []
+      })
+      if (inherited.status !== 'ready' && inherited.status !== 'skipped') {
+        finishRun(db, run, {
+          status: 'error',
+          reason: inherited.reason,
+          content: `前置任务成果继承失败，任务未执行：${inherited.reason}${
+            inherited.dependencyRunId ? `（${inherited.dependencyRunId}）` : ''
+          }`
+        })
+        runQueue.release(db, runId)
+        return
+      }
     }
   }
 
@@ -614,7 +763,7 @@ async function launchQueuedRunInner(db, runId) {
     acceptancePolicy: safeJson(run.acceptancePolicy),
     settings,
     spec,
-    workspace: workspaceInfo,
+    workspaceInfo,
     checkpoint
   })
     .catch((error) => {
@@ -636,30 +785,90 @@ async function launchQueuedRunInner(db, runId) {
 }
 
 async function maybeAutoMerge(db, runId) {
-  const run = repos.getRun(db, runId)
-  if (!run || run.status !== 'done') return null
-  const ws = safeJson(run.workspaceJson)
-  if (!ws || ws.mode !== 'worktree') return null
-  if (run.graphId) return null // 图节点并发分支无法安全自动合并，保留给人工
-  const project = ws.projectId ? repos.getProject(db, ws.projectId) : null
-  if (!project || !project.workspaceAutoMerge) return null
-  if (run.acceptancePolicy && run.acceptanceStatus !== 'accepted') return null
-  const merge = await workspace.autoMerge({
-    projectPath: ws.projectPath || project.path,
-    workspace: ws
+  const initial = repos.getRun(db, runId)
+  const initialWorkspace = initial && safeJson(initial.workspaceJson)
+  if (!initialWorkspace || initialWorkspace.mode !== 'worktree') return null
+  const projectPath = initialWorkspace.projectPath
+  if (!projectPath) return null
+  return withProjectMergeLock(projectPath, async () => {
+    const run = repos.getRun(db, runId)
+    if (!run || run.status !== 'done') return null
+    const ws = safeJson(run.workspaceJson)
+    if (!ws || ws.mode !== 'worktree') return null
+    if (run.graphId) return null
+    const project = ws.projectId ? repos.getProject(db, ws.projectId) : null
+    if (!project || !project.workspaceAutoMerge) return null
+    if (run.acceptancePolicy && run.acceptanceStatus !== 'accepted') return null
+    const targetPath = ws.projectPath || project.path
+    let merge
+    try {
+      const verification = await workspace.verifyWorkspace({
+        projectPath: targetPath,
+        workspace: ws,
+        command: project.workspaceVerifyCommand
+      })
+      repos.setRunWorkspace(db, runId, { ...ws, verification })
+      if (verification.status !== 'passed') {
+        merge = { status: 'failed', reason: verification.reason, at: Date.now() }
+      } else {
+        merge = await workspace.autoMerge({
+          projectPath: targetPath,
+          workspace: ws,
+          conflictStrategy: project.workspaceConflictStrategy
+        })
+      }
+    } catch (error) {
+      merge = {
+        status: 'failed',
+        reason: 'verification_error',
+        detail: String((error && error.message) || error).slice(0, 1000),
+        at: Date.now()
+      }
+    }
+    const current = repos.getRun(db, runId)
+    const currentWorkspace = safeJson(current && current.workspaceJson) || ws
+    repos.setRunWorkspace(db, runId, { ...currentWorkspace, merge })
+    broadcast('agent:event', {
+      type: 'workspace',
+      runId,
+      conversationId: run.conversationId,
+      status: merge.status,
+      reason: merge.reason || null,
+      branch: ws.branch || null,
+      path: ws.path || null
+    })
+    if (merge.status === 'merged') {
+      getHub().emit('workspace.merged', { runId, conversationId: run.conversationId, merge })
+    }
+    return merge
   })
-  repos.setRunWorkspace(db, runId, { ...ws, merge })
-  broadcast('agent:event', {
-    type: 'workspace',
-    runId,
-    conversationId: run.conversationId,
-    status: merge.status,
-    reason: merge.reason || null,
-    branch: ws.branch || null,
-    path: ws.path || null
-  })
-  getHub().emit('workspace.merged', { runId, conversationId: run.conversationId, merge })
-  return merge
+}
+
+function afterAcceptance(db, run, result) {
+  if (result && result.verdict === 'accepted') scheduleAutoMerge(db, run.id)
+  if (result && result.verdict === 'rejected' && run.graphId) {
+    for (const id of graph.blockedDependents(db, run.id)) {
+      const child = repos.getRun(db, id)
+      if (!child || repos.isRunTerminal(child.status)) continue
+      finishRun(db, child, {
+        status: 'stopped',
+        reason: 'dependency_rejected',
+        content: `前置任务 ${run.nodeKey || run.id} 未通过验收，已停止。`
+      })
+    }
+  }
+  if (run.graphId) {
+    const refreshed = graph.refreshGraph(db, run.graphId)
+    if (refreshed && refreshed.status !== 'running') {
+      getHub().emit('graph.finished', {
+        graphId: refreshed.id,
+        parentRunId: refreshed.parent_run_id,
+        status: refreshed.status
+      })
+      broadcast('agent:event', { type: 'graph', graphId: refreshed.id, status: refreshed.status })
+    }
+  }
+  runQueue.schedule(db)
 }
 
 function finishRun(db, run, { status, reason, content, stepsUsed, acceptanceStatus }) {
@@ -696,7 +905,7 @@ function finishRun(db, run, { status, reason, content, stepsUsed, acceptanceStat
     transferToRunId: run.transferToRunId
   })
   if (status === 'done' && !run.acceptancePolicy) {
-    void maybeAutoMerge(db, run.id)
+    scheduleAutoMerge(db, run.id)
   }
   clearCheckpoint(db, run.id)
   if (run.graphId) {
@@ -734,7 +943,12 @@ async function waitForIds(db, runId, state, ids, timeoutMs, extra = {}) {
   const conversationId = repos.getRun(db, runId).conversationId
   broadcast('agent:event', { type: 'state', runId, conversationId, status: 'waiting_child' })
   try {
-    const result = await waitForRuns(db, { runIds: ids, timeoutMs, signal: state.ac.signal })
+    const result = await waitForRuns(db, {
+      runIds: ids,
+      resolveRunIds: extra.resolveRunIds,
+      timeoutMs,
+      signal: state.ac.signal
+    })
     return { ...extra, ...result }
   } finally {
     if (!state.stopped && (await runQueue.acquire(db, runId, state.ac.signal))) {
@@ -765,7 +979,10 @@ async function waitForGraph(db, runId, state, { graphId, timeoutMs }) {
   if (!g || g.parent_run_id !== runId) throw new Error('任务图不属于当前任务')
   const ids = graph.listNodes(db, graphId).map((node) => node.id)
   if (!ids.length) throw new Error('任务图没有节点')
-  return waitForIds(db, runId, state, ids, timeoutMs, { graphId })
+  return waitForIds(db, runId, state, ids, timeoutMs, {
+    graphId,
+    resolveRunIds: () => graph.listNodes(db, graphId).map((node) => node.id)
+  })
 }
 
 async function doAgentRun({
@@ -779,7 +996,7 @@ async function doAgentRun({
   acceptancePolicy,
   settings: inherited,
   spec,
-  workspace: workspaceInfo,
+  workspaceInfo,
   checkpoint
 }) {
   const db = dbm.get()
@@ -930,7 +1147,7 @@ async function doAgentRun({
     state.permission === 'readonly'
       ? '\n\n当前权限为只读任务模式：仅可使用只读工具（读文件、列目录、搜索文件、内容检索、网页搜索/抓取、会话状态查询等）。写文件、改文件、执行命令、剪贴板、打开链接、更新待办与长期记忆等写入类操作会被直接拒绝，且不会请求用户确认。请只用只读方式完成任务，不要尝试写入操作。'
       : state.permission === 'full'
-        ? '\n\n当前权限为完整权限：非只读工具调用将直接执行，不再逐次请求用户确认；仍须严格遵守授权目录限制。'
+        ? '\n\n当前权限为完整权限：普通写操作直接执行；执行命令与破坏性操作仍逐次请求用户确认。工作区不是安全沙箱，命令以当前 Windows 用户权限运行，并须严格遵守授权目录限制。'
         : ''
   const systemMessage = {
     role: 'system',
@@ -1069,10 +1286,11 @@ async function doAgentRun({
     if (state.stopped) return settle({ allowed: false, confirmedBy: 'stopped' })
     if (!(await getControlRuntime(db).runs.checkpoint(runId, state)))
       return settle({ allowed: false, confirmedBy: 'stopped' })
-    // 完整权限：用户已在输入区显式选择，不再逐次弹确认，但审计记录标记来源
-    if (state.permission === 'full')
+    // 命令与破坏性操作即使用户选择完整权限，也必须在每次调用前确认。
+    const alwaysConfirm = name === 'run_command' || risk === 'destructive'
+    if (!alwaysConfirm && state.permission === 'full')
       return settle({ allowed: true, confirmedBy: 'permission:full' })
-    if (risk === 'side_effect' && state.remember.has(name))
+    if (!alwaysConfirm && risk === 'side_effect' && state.remember.has(name))
       return settle({ allowed: true, confirmedBy: 'session' })
     const decision = await getControlRuntime(db).approvals.decide({
       runId,
@@ -1239,9 +1457,50 @@ async function doAgentRun({
 
   status = state.transferred ? 'transferred' : state.stopped ? 'stopped' : finalStatus
   if (!state.transferred) cancelChildren(db, runId)
-  finishRun(db, repos.getRun(db, runId), {
+  const currentRun = repos.getRun(db, runId)
+  let artifactSealFailed = false
+  let verificationFailed = false
+  if (status === 'done' && currentRun.graphId && workspaceInfo?.mode === 'worktree') {
+    const project = conv.projectId ? repos.getProject(db, conv.projectId) : null
+    const verification = await workspace.verifyWorkspace({
+      projectPath: workspaceInfo.projectPath,
+      workspace: workspaceInfo,
+      command: project && project.workspaceVerifyCommand
+    })
+    workspaceInfo = { ...workspaceInfo, verification }
+    repos.setRunWorkspace(db, runId, workspaceInfo)
+    if (verification.status !== 'passed') {
+      status = 'error'
+      verificationFailed = true
+      finalContent = `${finalContent}\n\n> ⚠ 工作区验收失败：${verification.reason}`
+    }
+  }
+  if (status === 'done' && currentRun.graphId && workspaceInfo?.mode === 'worktree') {
+    const sealed = await workspace.sealArtifact({ workspace: workspaceInfo })
+    if (sealed.status !== 'sealed') {
+      status = 'error'
+      artifactSealFailed = true
+      finalContent = `${finalContent}\n\n> ⚠ 工作区成果封存失败：${sealed.reason}`
+    } else {
+      workspaceInfo = { ...workspaceInfo, artifact: sealed }
+      repos.setRunWorkspace(db, runId, workspaceInfo)
+      broadcast('agent:event', {
+        type: 'workspace',
+        runId,
+        conversationId,
+        status: 'sealed',
+        commit: sealed.commit,
+        branch: sealed.branch
+      })
+    }
+  }
+  finishRun(db, currentRun, {
     status,
-    reason: state.stopReason,
+    reason: verificationFailed
+      ? 'workspace_verification_failed'
+      : artifactSealFailed
+        ? 'artifact_seal_failed'
+        : state.stopReason,
     content: finalContent,
     stepsUsed,
     acceptanceStatus: acceptancePolicy && status === 'done' ? 'pending' : null
@@ -1257,9 +1516,7 @@ async function doAgentRun({
         resolveModel,
         broadcast,
         emit: (type, payload) => getHub().emit(type, payload),
-        onSettled: (updated, result) => {
-          if (result && result.verdict === 'accepted') void maybeAutoMerge(db, updated.id)
-        }
+        onSettled: (updated, result) => afterAcceptance(db, updated, result)
       },
       runId
     )
@@ -1296,9 +1553,7 @@ function decideAcceptance(input) {
       repos,
       broadcast,
       emit: (type, payload) => getHub().emit(type, payload),
-      onSettled: (updated, result) => {
-        if (result && result.verdict === 'accepted') void maybeAutoMerge(db, updated.id)
-      }
+      onSettled: (updated, result) => afterAcceptance(db, updated, result)
     },
     input
   )
@@ -1342,6 +1597,62 @@ function cancelChildren(db, runId) {
   }
 }
 
+function getRunRecovery(runId) {
+  const db = dbm.get()
+  const run = repos.getRun(db, runId)
+  if (!run) throw remoteError('NOT_FOUND', '任务不存在', 404)
+  return {
+    runId,
+    status: run.status,
+    finishedReason: run.finishedReason,
+    resumeCount: run.resumeCount,
+    retryOfRunId: run.retryOfRunId,
+    ...inspectInterruptedRun(db, runId)
+  }
+}
+
+function resumeInterruptedRun(runId, { actor = 'desktop', reason = '' } = {}) {
+  const db = dbm.get()
+  const result = transaction(db, () => requeueInterruptedRun(db, runId))
+  if (!result.ok) throw remoteError('STATE_CONFLICT', `当前任务不可继续：${result.reason}`, 409)
+  getHub().emit('run.recovery', { runId, action: 'continue', actor, reason })
+  runQueue.schedule(db)
+  return getRunStatus(db, runId)
+}
+
+async function retryInterruptedRun(
+  runId,
+  { actor = 'desktop', reason = '', idempotencyKey = null } = {}
+) {
+  const db = dbm.get()
+  const original = repos.getRun(db, runId)
+  if (!original) throw remoteError('NOT_FOUND', '任务不存在', 404)
+  if (original.status !== 'interrupted')
+    throw remoteError('STATE_CONFLICT', '原任务不是可重试的中断状态', 409)
+  const spec = safeJson(original.runSpecJson)
+  if (!spec || spec.version !== 1)
+    throw remoteError('STATE_CONFLICT', '原任务缺少可重试的执行规格', 409)
+  const recoveryNote = [
+    '',
+    `[中断重试] 原任务 ID：${original.id}。`,
+    reason ? `恢复说明：${String(reason).slice(0, 500)}` : '',
+    '先检查执行台账和当前工作区，确认哪些操作已经完成；不要重复未知副作用的工具调用。'
+  ]
+    .filter(Boolean)
+    .join('\n')
+  const retry = await startAgentRun({
+    conversationId: original.conversationId,
+    goal: `${original.goal}${recoveryNote}`,
+    permission: spec.permission,
+    cluster: spec.cluster,
+    acceptancePolicy: safeJson(original.acceptancePolicy),
+    idempotencyKey,
+    retryOfRunId: original.id
+  })
+  getHub().emit('run.recovery', { runId, action: 'retry', retryRunId: retry.runId, actor, reason })
+  return retry
+}
+
 function resumeQueuedRuns() {
   runQueue.schedule(dbm.get())
 }
@@ -1354,6 +1665,8 @@ async function stopAllRuns() {
   const current = [...active.entries()]
   for (const [runId] of current) stopRun(runId, 'app_quit', { actor: 'desktop' })
   await Promise.allSettled(current.map(([, state]) => state.done))
+  await Promise.allSettled([...pendingMerges])
+  runQueue.reset()
   // 只清理本次快照：退出期间新登记的运行不归这里管（入口已由 isShuttingDown 拦截）。
   for (const [runId, state] of current) {
     if (active.get(runId) === state) active.delete(runId)
@@ -1374,6 +1687,7 @@ function resumeRun(runId, actor = 'desktop') {
 module.exports = {
   startAgentRun,
   getGraphForParent,
+  mutateRunGraph,
   resumeQueuedRuns,
   getRunStatus: (id) => getRunStatus(dbm.get(), id),
   getRunResult: (id, maxChars) => getRunResult(dbm.get(), id, maxChars),
@@ -1382,6 +1696,9 @@ module.exports = {
   getApprovalService,
   pauseRun,
   resumeRun,
+  getRunRecovery,
+  resumeInterruptedRun,
+  retryInterruptedRun,
   stopRun,
   stopAllRuns,
   listActiveRuns,

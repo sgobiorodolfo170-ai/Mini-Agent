@@ -156,6 +156,7 @@ class RemoteAuthService {
     return {
       sessionHash: hash,
       sessionToken: session,
+      csrfHash: row.csrf_hash,
       deviceId: row.device_id,
       role: row.role,
       authVersion: row.auth_version,
