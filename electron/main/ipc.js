@@ -369,6 +369,7 @@ function registerIpc(ctx) {
   h('agent:acceptance:decide', (o) => agent.decideAcceptance(o))
   h('agent:runs', () => repos.listRuns(dbm.get(), 50))
   h('agent:calls', (runId) => repos.getRunCalls(dbm.get(), runId))
+  h('agent:graph', (runId) => agent.getGraphForParent(runId))
 
   // 局域网远程控制：管理接口仅暴露给主窗口，手机只能走受限网络协议。
   const remoteManager = () => ctx.remote && ctx.remote()

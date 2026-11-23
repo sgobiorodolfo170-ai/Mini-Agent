@@ -5,7 +5,8 @@ export const useAgentStore = defineStore('agent', {
     runs: [],
     activeRunId: null,
     calls: [],
-    confirms: []
+    confirms: [],
+    graph: null
   }),
   getters: {
     activeRun(state) {
@@ -19,6 +20,11 @@ export const useAgentStore = defineStore('agent', {
     async select(id) {
       this.activeRunId = id
       this.calls = await window.api.agent.calls(id)
+      await this.loadGraph(id)
+    },
+    async loadGraph(id) {
+      this.graph = window.api.agent.graph && id ? await window.api.agent.graph(id) : null
+      return this.graph
     },
     stopRun(id) {
       // 本地先清掉该运行的确认卡：主进程随后会广播 confirmCancel，
@@ -49,6 +55,8 @@ export const useAgentStore = defineStore('agent', {
     },
     handleEvent(ev) {
       if (['queued', 'started', 'state', 'done', 'acceptance'].includes(ev.type)) this.loadRuns()
+      if (['state', 'done', 'acceptance', 'graph'].includes(ev.type) && this.activeRunId)
+        this.loadGraph(this.activeRunId)
       // 运行结束（含被停止/出错）时，该运行遗留的确认卡一律失效
       if (ev.type === 'done' && ev.runId) this.clearConfirms({ runId: ev.runId })
     }

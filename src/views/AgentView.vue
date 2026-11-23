@@ -56,6 +56,14 @@ async function decideAcceptance(decision) {
     ui.toast(String((e && e.message) || e), 'error')
   }
 }
+function graphDepKeys(runId) {
+  if (!agent.graph) return []
+  const keyById = new Map((agent.graph.nodes || []).map((n) => [n.runId, n.nodeKey]))
+  return (agent.graph.dependencies || [])
+    .filter((d) => d.runId === runId)
+    .map((d) => keyById.get(d.dependsOnRunId))
+    .filter(Boolean)
+}
 
 function duration(r) {
   if (!r || !r.started_at) return ''
@@ -112,6 +120,7 @@ async function copyResult(c) {
             <span v-if="r.control_mode" class="text-[11px] text-ink-muted">
               · {{ r.control_mode === 'transferred' ? '接手' : '派发' }}
             </span>
+            <span v-if="r.node_key" class="text-[11px] text-ink-muted"> · {{ r.node_key }} </span>
             <span class="text-ink-muted ml-auto">{{
               new Date(r.started_at).toLocaleString('zh-CN')
             }}</span>
@@ -139,6 +148,13 @@ async function copyResult(c) {
                 data-testid="run-control-mode"
               >
                 {{ controlModeLabel(agent.activeRun) }}
+              </span>
+              <span
+                v-if="agent.activeRun.graph_id"
+                class="badge bg-subtle text-ink-secondary"
+                data-testid="run-graph"
+              >
+                任务图
               </span>
               <span
                 v-if="acceptanceStatus(agent.activeRun)"
@@ -217,6 +233,31 @@ async function copyResult(c) {
               >
                 拒绝
               </button>
+            </div>
+          </div>
+        </div>
+
+        <div
+          v-if="agent.graph && agent.graph.nodes?.length"
+          class="shrink-0 px-5 pb-3 bg-surface"
+          data-testid="run-graph-panel"
+        >
+          <div class="rounded-lg border border-line-subtle bg-panel px-3 py-2 text-xs space-y-1.5">
+            <div class="flex items-center gap-2">
+              <span class="text-ink-secondary">任务图</span>
+              <span class="text-ink-muted">{{ agent.graph.status }}</span>
+            </div>
+            <div
+              v-for="n in agent.graph.nodes"
+              :key="n.runId"
+              class="flex items-center gap-2 flex-wrap"
+            >
+              <span class="font-medium text-ink-primary">{{ n.nodeKey }}</span>
+              <StatusBadge :status="n.status" />
+              <span class="text-ink-muted truncate">{{ n.goal }}</span>
+              <span v-if="graphDepKeys(n.runId).length" class="text-ink-muted">
+                依赖 {{ graphDepKeys(n.runId).join(', ') }}
+              </span>
             </div>
           </div>
         </div>

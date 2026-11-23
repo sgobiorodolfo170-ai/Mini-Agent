@@ -29,6 +29,7 @@ const { parseHooks, applyHooks } = require('../events/hooks')
 const { normalizeMandate, defaultSubMandate, authorizeToolCall } = require('./mandate')
 const { createSessionBridge } = require('./session-bridge')
 const acceptance = require('./acceptance')
+const graph = require('./graph')
 const { createApprovalService } = require('../remote/approval-service')
 const { createRunControl } = require('../remote/run-control-service')
 const { isShuttingDown } = require('../lifecycle')
@@ -171,7 +172,7 @@ async function withKeyRetry(db, provider, fn) {
 
 // 沿 parent_run_id 链计算派生和移交的深度。
 // 集中在此处配置，禁止各模块硬编码不同值。
-const MAX_DELEGATION_DEPTH = 2
+const MAX_DELEGATION_DEPTH = 3
 
 function depthOfRun(db, runId) {
   let depth = 0
@@ -189,7 +190,7 @@ function depthOfRun(db, runId) {
 }
 
 // 校验能否把 childConversation 的任务挂到 parentRunId 之下
-function assertCanDelegate(db, parentRunId, controlMode, count) {
+function assertCanDelegate(db, parentRunId, controlMode, count, { plan = false } = {}) {
   const parent = repos.getRun(db, parentRunId)
   const state = active.get(parentRunId)
   if (!parent || parent.status !== 'running' || !state || state.stopped) {
@@ -197,6 +198,7 @@ function assertCanDelegate(db, parentRunId, controlMode, count) {
   }
   if (state.mandate && !state.mandate.canDelegate) throw new Error('父任务授权未包含派发权限')
   if (depthOfRun(db, parentRunId) >= MAX_DELEGATION_DEPTH) throw new Error('已达到任务派发深度上限')
+  if (plan) return { parent, state }
   const children = repos
     .listChildRuns(db, parentRunId)
     .filter((child) => child.controlMode === 'delegated')
@@ -220,7 +222,7 @@ function publishRegistration(db, row) {
   broadcast('agent:event', { type: 'queued', ...row })
 }
 
-function registerRuns(requests, { parentRunId, controlMode, idempotencyKey } = {}) {
+function registerRuns(requests, { parentRunId, controlMode, idempotencyKey, plan = false } = {}) {
   const db = dbm.get()
   if (isShuttingDown()) throw new Error('应用正在退出，无法开始新的智能任务')
   const scope = parentRunId ? `parent:${parentRunId}` : 'root'
@@ -232,6 +234,7 @@ function registerRuns(requests, { parentRunId, controlMode, idempotencyKey } = {
       })
     )
     .digest('hex')
+  const graphId = plan ? repos.uid() : null
   let transferParent
   const rows = transaction(db, () => {
     if (idempotencyKey) {
@@ -249,13 +252,15 @@ function registerRuns(requests, { parentRunId, controlMode, idempotencyKey } = {
             status: run.status,
             userMsgId: run.userMessageId,
             assistantMsgId: run.assistantMessageId,
+            graphId: run.graphId,
+            nodeKey: run.nodeKey,
             reused: true
           }
         })
       }
     }
     const owner = parentRunId
-      ? assertCanDelegate(db, parentRunId, controlMode, requests.length)
+      ? assertCanDelegate(db, parentRunId, controlMode, requests.length, { plan })
       : null
     const settings = repos.getAllSettings(db)
     const registered = requests.map((request) => {
@@ -324,7 +329,9 @@ function registerRuns(requests, { parentRunId, controlMode, idempotencyKey } = {
         controlMode,
         mandate,
         acceptancePolicy: request.acceptancePolicy,
-        traceId: owner ? owner.parent.traceId || parentRunId : request.traceId || repos.uid()
+        traceId: owner ? owner.parent.traceId || parentRunId : request.traceId || repos.uid(),
+        graphId,
+        nodeKey: request.key || null
       })
       const first = repos.listMessages(db, conversationId).length === 0
       const user = repos.insertMessage(db, {
@@ -378,9 +385,20 @@ function registerRuns(requests, { parentRunId, controlMode, idempotencyKey } = {
         conversationId,
         userMsgId: user.id,
         assistantMsgId: assistant.id,
-        status: 'queued'
+        status: 'queued',
+        graphId,
+        nodeKey: request.key || null
       }
     })
+    if (plan) {
+      db.prepare(
+        `INSERT INTO run_graphs(id, parent_run_id, conversation_id, status, created_at)
+         VALUES(?,?,?,'running',?)`
+      ).run(graphId, parentRunId, owner ? owner.parent.conversationId : null, Date.now())
+      const byKey = new Map()
+      requests.forEach((request, index) => byKey.set(request.key, registered[index].runId))
+      graph.addDependencies(db, requests, byKey)
+    }
     if (controlMode === 'transferred') {
       const target = registered[0]
       transition(db, parentRunId, { status: 'transferred' })
@@ -402,6 +420,7 @@ function registerRuns(requests, { parentRunId, controlMode, idempotencyKey } = {
   })
   if (transferParent) transferParent.transferred = true
   for (const row of rows) if (!row.reused) publishRegistration(db, row)
+  if (plan) rows.graphId = (rows[0] && rows[0].graphId) || graphId
   runQueue.schedule(db)
   return rows
 }
@@ -415,6 +434,30 @@ async function startAgentRun({ parentRunId, controlMode, idempotencyKey, ...requ
     controlMode: controlMode || null,
     idempotencyKey
   })[0]
+}
+
+function registerPlan(tasks, { parentRunId, idempotencyKey } = {}) {
+  const normalized = graph.validatePlan(tasks)
+  const requests = normalized.map((task) => ({
+    goal: task.goal,
+    key: task.key,
+    deps: task.deps,
+    conversationId: task.conversationId,
+    title: task.title
+  }))
+  const rows = registerRuns(requests, {
+    parentRunId,
+    controlMode: 'delegated',
+    idempotencyKey,
+    plan: true
+  })
+  return { graphId: rows.graphId || (rows[0] && rows[0].graphId) || null, runs: rows }
+}
+
+function getGraphForParent(parentRunId) {
+  const db = dbm.get()
+  const g = graph.getGraphForParent(db, parentRunId)
+  return g ? graph.summary(db, g.id) : null
 }
 
 function launchQueuedRun(db, runId) {
@@ -554,6 +597,51 @@ function finishRun(db, run, { status, reason, content, stepsUsed, acceptanceStat
     content,
     transferToRunId: run.transferToRunId
   })
+  if (run.graphId) {
+    if (status !== 'done') {
+      for (const id of graph.blockedDependents(db, run.id)) {
+        const child = repos.getRun(db, id)
+        if (!child || repos.isRunTerminal(child.status)) continue
+        finishRun(db, child, {
+          status: 'stopped',
+          reason: 'dependency_failed',
+          content: `前置任务 ${run.nodeKey || run.id} 未成功，已停止。`
+        })
+      }
+    }
+    const refreshed = graph.refreshGraph(db, run.graphId)
+    if (refreshed && refreshed.status !== 'running') {
+      getHub().emit('graph.finished', {
+        graphId: run.graphId,
+        parentRunId: refreshed.parent_run_id,
+        status: refreshed.status
+      })
+      broadcast('agent:event', {
+        type: 'graph',
+        graphId: run.graphId,
+        status: refreshed.status
+      })
+    }
+  }
+}
+
+async function waitForIds(db, runId, state, ids, timeoutMs, extra = {}) {
+  if (state.stopped) throw new Error('任务已停止')
+  transaction(db, () => transition(db, runId, { status: 'waiting_child' }))
+  runQueue.release(db, runId)
+  const conversationId = repos.getRun(db, runId).conversationId
+  broadcast('agent:event', { type: 'state', runId, conversationId, status: 'waiting_child' })
+  try {
+    const result = await waitForRuns(db, { runIds: ids, timeoutMs, signal: state.ac.signal })
+    return { ...extra, ...result }
+  } finally {
+    if (!state.stopped && (await runQueue.acquire(db, runId, state.ac.signal))) {
+      transaction(db, () => transition(db, runId, { status: 'running' }))
+      broadcast('agent:event', { type: 'state', runId, conversationId, status: 'running' })
+    } else if (!state.stopped) {
+      stopRun(runId, 'app_quit')
+    }
+  }
 }
 
 async function waitForChildren(db, runId, state, { runIds, timeoutMs }) {
@@ -567,21 +655,15 @@ async function waitForChildren(db, runId, state, { runIds, timeoutMs }) {
     })
   )
     throw new Error('只能等待本任务直接派发的子任务')
-  if (state.stopped) throw new Error('任务已停止')
-  transaction(db, () => transition(db, runId, { status: 'waiting_child' }))
-  runQueue.release(db, runId)
-  const conversationId = repos.getRun(db, runId).conversationId
-  broadcast('agent:event', { type: 'state', runId, conversationId, status: 'waiting_child' })
-  try {
-    return await waitForRuns(db, { runIds: ids, timeoutMs, signal: state.ac.signal })
-  } finally {
-    if (!state.stopped && (await runQueue.acquire(db, runId, state.ac.signal))) {
-      transaction(db, () => transition(db, runId, { status: 'running' }))
-      broadcast('agent:event', { type: 'state', runId, conversationId, status: 'running' })
-    } else if (!state.stopped) {
-      stopRun(runId, 'app_quit')
-    }
-  }
+  return waitForIds(db, runId, state, ids, timeoutMs)
+}
+
+async function waitForGraph(db, runId, state, { graphId, timeoutMs }) {
+  const g = graph.getGraph(db, graphId)
+  if (!g || g.parent_run_id !== runId) throw new Error('任务图不属于当前任务')
+  const ids = graph.listNodes(db, graphId).map((node) => node.id)
+  if (!ids.length) throw new Error('任务图没有节点')
+  return waitForIds(db, runId, state, ids, timeoutMs, { graphId })
 }
 
 async function doAgentRun({
@@ -654,12 +736,33 @@ async function doAgentRun({
       title,
       idempotencyKey: callId
     })
+  ctx.runPlan = (opts, callId) =>
+    registerPlan(opts.tasks, { parentRunId: runId, idempotencyKey: callId })
   ctx.runDispatch = (opts, callId) => dispatch('delegated', opts, callId)
   ctx.runTransfer = (opts, callId) => dispatch('transferred', opts, callId)
   ctx.runStatus = ({ runId: id }) => getRunStatus(db, ownChild(id).id)
   ctx.runResult = ({ runId: id, maxChars }) => getRunResult(db, ownChild(id).id, maxChars)
-  ctx.runWait = (opts) => waitForChildren(db, runId, state, opts)
-  ctx.runCancel = ({ runId: id }) => {
+  ctx.runWait = (opts) =>
+    opts && opts.graphId
+      ? waitForGraph(db, runId, state, opts)
+      : waitForChildren(db, runId, state, opts)
+  ctx.runCancel = ({ runId: id, graphId }) => {
+    if (graphId) {
+      const g = graph.getGraph(db, graphId)
+      if (!g || g.parent_run_id !== runId) throw new Error('任务图不属于当前任务')
+      let requested = false
+      for (const node of graph.listNodes(db, graphId)) {
+        if (repos.isRunTerminal(node.status)) continue
+        if (stopRun(node.id, 'user')) requested = true
+      }
+      const refreshed = graph.refreshGraph(db, graphId)
+      return {
+        requested,
+        graphId,
+        status: refreshed && refreshed.status,
+        ...graph.summary(db, graphId)
+      }
+    }
     const child = ownChild(id)
     if (child.controlMode !== 'delegated') throw new Error('移交任务由接手方控制')
     const target = followTransfer(db, child)
@@ -1140,6 +1243,7 @@ function resumeRun(runId, actor = 'desktop') {
 
 module.exports = {
   startAgentRun,
+  getGraphForParent,
   resumeQueuedRuns,
   getRunStatus: (id) => getRunStatus(dbm.get(), id),
   getRunResult: (id, maxChars) => getRunResult(dbm.get(), id, maxChars),

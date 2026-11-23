@@ -1012,7 +1012,8 @@ function install() {
         return clone(run)
       },
       runs: () => clone(runs),
-      calls: (runId) => clone(calls.get(runId) || [])
+      calls: (runId) => clone(calls.get(runId) || []),
+      graph: () => null
     },
     sessions: {
       status: ({ conversationId } = {}) => ({ conversationId, status: 'idle' }),

@@ -84,7 +84,8 @@ function buildMain() {
       respond: (o) => inv('agent:respond', o),
       acceptanceDecide: (o) => inv('agent:acceptance:decide', o),
       runs: () => inv('agent:runs'),
-      calls: (runId) => inv('agent:calls', runId)
+      calls: (runId) => inv('agent:calls', runId),
+      graph: (runId) => inv('agent:graph', runId)
     },
     remote: {
       state: () => inv('remote:state'),

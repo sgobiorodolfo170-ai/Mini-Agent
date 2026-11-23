@@ -1,6 +1,7 @@
 const repos = require('../../store/repos')
 const { recordRunState } = require('../../store/run-storage')
 const { getHub } = require('../events/hub')
+const graph = require('./graph')
 
 const SLOT_LIMIT = 4
 
@@ -76,7 +77,12 @@ function waitForRuns(db, { runIds, timeoutMs, signal }) {
         const runs = runIds.map((id) => {
           const run = followTransfer(db, repos.getRun(db, id))
           if (!run) throw new Error('任务不存在')
-          return { ...getRunResult(db, run.id), requestedRunId: id }
+          return {
+            ...getRunResult(db, run.id),
+            requestedRunId: id,
+            nodeKey: run.nodeKey,
+            graphId: run.graphId
+          }
         })
         const ready = runs.every((run) => repos.isRunTerminal(run.status))
         if (!ready && !timedOut) return
@@ -101,7 +107,54 @@ function waitForRuns(db, { runIds, timeoutMs, signal }) {
 function createRunQueue({ launch, shuttingDown, limit = SLOT_LIMIT }) {
   const slots = new Set()
   const resumes = new Map()
+  const activeGraphs = new Map()
   let scheduled = false
+
+  function trackGraph(db, id) {
+    const run = repos.getRun(db, id)
+    if (!run || !run.graphId) return
+    const active = activeGraphs.get(run.graphId) || new Set()
+    active.add(id)
+    activeGraphs.set(run.graphId, active)
+  }
+
+  function untrackGraph(id) {
+    for (const [graphId, active] of activeGraphs) {
+      if (!active.delete(id)) continue
+      if (!active.size) activeGraphs.delete(graphId)
+      return
+    }
+  }
+
+  function graphHasCapacity(db, id) {
+    const run = repos.getRun(db, id)
+    if (!run || !run.graphId) return true
+    const active = activeGraphs.get(run.graphId)
+    return !active || active.size < graph.MAX_CONCURRENCY
+  }
+
+  function dependenciesReady(db, id) {
+    const deps = db
+      .prepare(
+        `SELECT p.status FROM run_dependencies d
+         JOIN agent_runs p ON p.id=d.depends_on_run_id WHERE d.run_id=?`
+      )
+      .all(id)
+    return deps.every((dep) => dep.status === 'done')
+  }
+
+  function pickQueued(db) {
+    const rows = db
+      .prepare(
+        `SELECT id FROM agent_runs
+         WHERE status='queued' AND run_spec_json IS NOT NULL ORDER BY submitted_at,id`
+      )
+      .all()
+    for (const row of rows) {
+      if (dependenciesReady(db, row.id) && graphHasCapacity(db, row.id)) return row.id
+    }
+    return null
+  }
 
   function schedule(db) {
     if (scheduled || shuttingDown()) return
@@ -109,34 +162,41 @@ function createRunQueue({ launch, shuttingDown, limit = SLOT_LIMIT }) {
     setImmediate(() => {
       scheduled = false
       if (shuttingDown()) return
-      while (slots.size < limit) {
-        const pending = resumes.entries().next().value
-        if (pending) {
-          const [id, resume] = pending
-          resumes.delete(id)
-          if (resume()) slots.add(id)
-          continue
+      try {
+        while (slots.size < limit) {
+          const pending = resumes.entries().next().value
+          if (pending) {
+            const [id, resume] = pending
+            resumes.delete(id)
+            if (resume()) {
+              slots.add(id)
+              trackGraph(db, id)
+            }
+            continue
+          }
+          const queuedId = pickQueued(db)
+          if (!queuedId) return
+          slots.add(queuedId)
+          trackGraph(db, queuedId)
+          try {
+            launch(db, queuedId)
+          } catch (error) {
+            slots.delete(queuedId)
+            untrackGraph(queuedId)
+            throw error
+          }
         }
-        const queued = db
-          .prepare(
-            `SELECT id FROM agent_runs
-          WHERE status='queued' AND run_spec_json IS NOT NULL ORDER BY submitted_at,id LIMIT 1`
-          )
-          .get()
-        if (!queued) return
-        slots.add(queued.id)
-        try {
-          launch(db, queued.id)
-        } catch (error) {
-          slots.delete(queued.id)
-          throw error
-        }
+      } catch (error) {
+        // 应用退出/数据库已关闭时，后台调度不应产生未处理异常。
+        if (!shuttingDown()) console.error('RUN_QUEUE_SCHEDULE_FAILED', error)
       }
     })
   }
 
   function release(db, id) {
-    if (slots.delete(id)) schedule(db)
+    const had = slots.delete(id)
+    untrackGraph(id)
+    if (had) schedule(db)
   }
 
   async function acquire(db, id, signal) {

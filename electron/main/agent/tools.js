@@ -388,6 +388,29 @@ function defineTools(ctx) {
         ctx.runDispatch
       ],
       [
+        'run_plan',
+        'side_effect',
+        '按依赖图派发多个子任务；节点只在依赖成功后启动。用于有先后顺序的流水线。',
+        {
+          tasks: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                key: { type: 'string' },
+                goal: { type: 'string' },
+                deps: { type: 'array', items: { type: 'string' } },
+                conversationId: { type: 'string' },
+                title: { type: 'string' }
+              },
+              required: ['key', 'goal']
+            }
+          }
+        },
+        ['tasks'],
+        ctx.runPlan
+      ],
+      [
         'run_transfer',
         'side_effect',
         '原子移交给子任务，成功后当前任务立即退出。',
@@ -402,12 +425,13 @@ function defineTools(ctx) {
       [
         'run_wait',
         'readonly',
-        '暂停当前任务，等待指定的直属委派子任务。',
+        '暂停当前任务，等待指定的直属委派子任务或整张任务图。',
         {
           runIds: { type: 'array', items: { type: 'string' } },
+          graphId: { type: 'string' },
           timeoutMs: { type: 'number' }
         },
-        ['runIds'],
+        [],
         ctx.runWait
       ],
       [
@@ -434,11 +458,12 @@ function defineTools(ctx) {
       [
         'run_cancel',
         'side_effect',
-        '取消当前任务直接委派的子任务。',
+        '取消当前任务直接委派的子任务，或取消整张任务图。',
         {
-          runId: { type: 'string' }
+          runId: { type: 'string' },
+          graphId: { type: 'string' }
         },
-        ['runId'],
+        [],
         ctx.runCancel
       ]
     ]

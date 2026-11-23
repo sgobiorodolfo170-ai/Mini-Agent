@@ -59,11 +59,44 @@ function recoverRuns(db) {
       }
       recordRunState(db, row.id)
     }
+    // 依赖已失败的 queued 节点在重启后不能继续等：逐层收口，避免永久卡住。
+    for (let pass = 0; pass < 20; pass++) {
+      const blocked = db
+        .prepare(
+          `UPDATE agent_runs SET status='stopped', finished_reason='dependency_failed',
+             ended_at=COALESCE(ended_at,?), version=version+1
+           WHERE status='queued' AND id IN (
+             SELECT d.run_id FROM run_dependencies d
+             JOIN agent_runs p ON p.id=d.depends_on_run_id
+             WHERE p.status IN ('error','stopped','interrupted','max_steps','transferred')
+           )
+           RETURNING id, assistant_message_id AS assistantMessageId`
+        )
+        .all(Date.now())
+      if (!blocked.length) break
+      for (const row of blocked) {
+        if (row.assistantMessageId) {
+          db.prepare("UPDATE messages SET status='stopped' WHERE id=?").run(row.assistantMessageId)
+        }
+        recordRunState(db, row.id)
+      }
+    }
     db.prepare("UPDATE messages SET status='stopped' WHERE status='streaming'").run()
     db.prepare(
       "UPDATE agent_approvals SET status='cancelled', decision_reason='app_restarted' WHERE status='pending'"
     ).run()
   })
+  // 图状态按恢复后的节点重新汇总；失败节点已在上面的循环中收口。
+  try {
+    const graph = require('../main/agent/graph')
+    for (const row of db
+      .prepare('SELECT DISTINCT graph_id AS id FROM agent_runs WHERE graph_id IS NOT NULL')
+      .all()) {
+      graph.refreshGraph(db, row.id)
+    }
+  } catch {
+    // 图模块不可用时不影响启动恢复
+  }
 }
 
 module.exports = { RUN_SCHEMA, recordRunState, recoverRuns }
