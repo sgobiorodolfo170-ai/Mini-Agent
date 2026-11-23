@@ -229,7 +229,12 @@ function registerIpc(ctx) {
     if (!dir) throw new Error('请选择项目工作目录')
     if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory())
       throw new Error('工作目录不存在或不是文件夹')
-    const r = repos.createProject(dbm.get(), { name, path: dir })
+    const r = repos.createProject(dbm.get(), {
+      name,
+      path: dir,
+      workspaceMode: o && o.workspaceMode,
+      workspaceAutoMerge: o && o.workspaceAutoMerge !== undefined ? o.workspaceAutoMerge : 1
+    })
     broadcast('projects:changed', {})
     return r
   })

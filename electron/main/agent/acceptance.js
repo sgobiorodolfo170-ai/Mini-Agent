@@ -114,6 +114,13 @@ function settle(deps, db, run, status, result, type) {
   if (!updated) return null
   emit(deps, type, { runId: run.id, conversationId: run.conversationId, status, result })
   notify(deps, run.id, status, result)
+  if (typeof deps.onSettled === 'function') {
+    try {
+      deps.onSettled(updated, result)
+    } catch {
+      // 验收后的联动（例如自动合并）失败不影响验收结果
+    }
+  }
   return updated
 }
 
@@ -322,6 +329,13 @@ function decideAcceptance(deps, { runId, decision, reason = '', actor = 'desktop
     result
   })
   notify(deps, run.id, decision, result)
+  if (typeof deps.onSettled === 'function') {
+    try {
+      deps.onSettled(updated, result)
+    } catch {
+      // 人工改判后的联动失败不影响验收结果
+    }
+  }
   return updated
 }
 

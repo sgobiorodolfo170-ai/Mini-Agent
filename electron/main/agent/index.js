@@ -30,6 +30,7 @@ const { normalizeMandate, defaultSubMandate, authorizeToolCall } = require('./ma
 const { createSessionBridge } = require('./session-bridge')
 const acceptance = require('./acceptance')
 const graph = require('./graph')
+const workspace = require('./workspace')
 const { createApprovalService } = require('../remote/approval-service')
 const { createRunControl } = require('../remote/run-control-service')
 const { isShuttingDown } = require('../lifecycle')
@@ -308,6 +309,16 @@ function registerRuns(requests, { parentRunId, controlMode, idempotencyKey, plan
       const mandate = owner
         ? defaultSubMandate(owner.state.mandate)
         : normalizeMandate(request.mandate)
+      if (owner && mandate) {
+        if (!owner.state.mandate) {
+          const dirs = owner.state.authorizedDirs || []
+          mandate.authorizedDirs = { read: [...dirs], write: [...dirs] }
+        } else if (owner.state.workspacePath) {
+          const read = [...new Set([...mandate.authorizedDirs.read, owner.state.workspacePath])]
+          const write = [...new Set([...mandate.authorizedDirs.write, owner.state.workspacePath])]
+          mandate.authorizedDirs = { read, write }
+        }
+      }
       let permission =
         request.permission === 'readonly' || request.permission === 'full'
           ? request.permission
@@ -460,7 +471,24 @@ function getGraphForParent(parentRunId) {
   return g ? graph.summary(db, g.id) : null
 }
 
-function launchQueuedRun(db, runId) {
+async function launchQueuedRun(db, runId) {
+  try {
+    return await launchQueuedRunInner(db, runId)
+  } catch (error) {
+    const run = repos.getRun(db, runId)
+    if (run && !repos.isRunTerminal(run.status)) {
+      finishRun(db, run, {
+        status: 'error',
+        reason: 'launcher_error',
+        content: String((error && error.message) || error)
+      })
+    }
+    runQueue.release(db, runId)
+    console.error('AGENT_LAUNCH_FAILED', runId, error)
+  }
+}
+
+async function launchQueuedRunInner(db, runId) {
   const run = repos.getRun(db, runId)
   const { conversationId, assistantMessageId: assistantMsgId, goal } = run
   const spec = safeJson(run.runSpecJson)
@@ -483,6 +511,35 @@ function launchQueuedRun(db, runId) {
     runQueue.release(db, runId)
     return
   }
+
+  let workspaceInfo = safeJson(run.workspaceJson)
+  if (!workspaceInfo) {
+    const project = conv.projectId ? repos.getProject(db, conv.projectId) : null
+    if (project && project.workspaceMode === 'worktree') {
+      try {
+        const electron = require('electron')
+        workspaceInfo = await workspace.prepare({
+          projectPath: project.path,
+          projectId: project.id,
+          runId,
+          rootDir: path.join(electron.app.getPath('userData'), 'workspaces')
+        })
+      } catch (error) {
+        workspaceInfo = { mode: 'shared', reason: String((error && error.message) || error) }
+      }
+      repos.setRunWorkspace(db, runId, workspaceInfo)
+      broadcast('agent:event', {
+        type: 'workspace',
+        runId,
+        conversationId,
+        status: workspaceInfo.mode === 'worktree' ? 'created' : 'fallback',
+        reason: workspaceInfo.reason || null,
+        path: workspaceInfo.path || null,
+        branch: workspaceInfo.branch || null
+      })
+    }
+  }
+
   transaction(db, () => {
     transition(db, runId, { status: 'running' })
     db.prepare('UPDATE agent_runs SET claimed_at=?,started_at=? WHERE id=?').run(
@@ -493,6 +550,7 @@ function launchQueuedRun(db, runId) {
     repos.updateMessage(db, assistantMsgId, { status: 'streaming' })
   })
   const settings = repos.getAllSettings(db)
+  const baseDirs = settings.agentAuthorizedDirs || []
   const state = {
     ac: new AbortController(),
     stopped: false,
@@ -505,7 +563,12 @@ function launchQueuedRun(db, runId) {
     traceId: run.traceId,
     permission: spec.permission,
     cluster: spec.cluster,
-    maxSteps: run.maxSteps
+    maxSteps: run.maxSteps,
+    workspacePath: workspaceInfo && workspaceInfo.mode === 'worktree' ? workspaceInfo.path : null,
+    authorizedDirs:
+      workspaceInfo && workspaceInfo.mode === 'worktree'
+        ? [...baseDirs, workspaceInfo.path]
+        : baseDirs
   }
   active.set(runId, state)
   getHub().emit('run.start', {
@@ -544,7 +607,8 @@ function launchQueuedRun(db, runId) {
     state,
     acceptancePolicy: safeJson(run.acceptancePolicy),
     settings,
-    spec
+    spec,
+    workspace: workspaceInfo
   })
     .catch((error) => {
       const current = repos.getRun(db, runId)
@@ -562,6 +626,33 @@ function launchQueuedRun(db, runId) {
       active.delete(runId)
       runQueue.release(db, runId)
     })
+}
+
+async function maybeAutoMerge(db, runId) {
+  const run = repos.getRun(db, runId)
+  if (!run || run.status !== 'done') return null
+  const ws = safeJson(run.workspaceJson)
+  if (!ws || ws.mode !== 'worktree') return null
+  if (run.graphId) return null // 图节点并发分支无法安全自动合并，保留给人工
+  const project = ws.projectId ? repos.getProject(db, ws.projectId) : null
+  if (!project || !project.workspaceAutoMerge) return null
+  if (run.acceptancePolicy && run.acceptanceStatus !== 'accepted') return null
+  const merge = await workspace.autoMerge({
+    projectPath: ws.projectPath || project.path,
+    workspace: ws
+  })
+  repos.setRunWorkspace(db, runId, { ...ws, merge })
+  broadcast('agent:event', {
+    type: 'workspace',
+    runId,
+    conversationId: run.conversationId,
+    status: merge.status,
+    reason: merge.reason || null,
+    branch: ws.branch || null,
+    path: ws.path || null
+  })
+  getHub().emit('workspace.merged', { runId, conversationId: run.conversationId, merge })
+  return merge
 }
 
 function finishRun(db, run, { status, reason, content, stepsUsed, acceptanceStatus }) {
@@ -597,6 +688,9 @@ function finishRun(db, run, { status, reason, content, stepsUsed, acceptanceStat
     content,
     transferToRunId: run.transferToRunId
   })
+  if (status === 'done' && !run.acceptancePolicy) {
+    void maybeAutoMerge(db, run.id)
+  }
   if (run.graphId) {
     if (status !== 'done') {
       for (const id of graph.blockedDependents(db, run.id)) {
@@ -676,16 +770,23 @@ async function doAgentRun({
   state,
   acceptancePolicy,
   settings: inherited,
-  spec
+  spec,
+  workspace: workspaceInfo
 }) {
   const db = dbm.get()
   const settings = inherited || repos.getAllSettings(db)
   const conv = repos.getConversation(db, conversationId)
   const params = resolveAgentParams(settings, conv, provider, model)
   const electron = require('electron')
+  const worktreePath =
+    workspaceInfo && workspaceInfo.mode === 'worktree' ? workspaceInfo.path : null
+  const authorizedDirs = [
+    ...(settings.agentAuthorizedDirs || []),
+    ...(worktreePath ? [worktreePath] : [])
+  ]
   const ctx = {
-    authorizedDirs: settings.agentAuthorizedDirs || [],
-    workingDir: resolveWorkingDir(db, conversationId, settings),
+    authorizedDirs,
+    workingDir: worktreePath || resolveWorkingDir(db, conversationId, settings),
     clipboard: electron.clipboard,
     shell: electron.shell,
     todo: { seq: 0, items: [] },
@@ -827,6 +928,8 @@ async function doAgentRun({
       role: 'system',
       content:
         '你是运行在用户 Windows 桌面上的 Agent。谨慎使用工具完成目标；写文件和执行命令前先用一句话说明计划。基于工具返回结果作答，不要臆造。' +
+        `\n当前工作目录：${ctx.workingDir}` +
+        (worktreePath ? '（本次任务使用独立 Git 工作区）' : '') +
         (state.parentRunId ? '\n你是被主 Agent 派出的子 Agent，请根据独立目标完成任务。' : '') +
         (spec.systemPrompt ? '\n' + spec.systemPrompt : '') +
         permissionNote +
@@ -1133,7 +1236,10 @@ async function doAgentRun({
         decryptSecret,
         resolveModel,
         broadcast,
-        emit: (type, payload) => getHub().emit(type, payload)
+        emit: (type, payload) => getHub().emit(type, payload),
+        onSettled: (updated, result) => {
+          if (result && result.verdict === 'accepted') void maybeAutoMerge(db, updated.id)
+        }
       },
       runId
     )
@@ -1163,12 +1269,16 @@ function respondConfirm({ requestId, allow, remember }) {
 }
 
 function decideAcceptance(input) {
+  const db = dbm.get()
   return acceptance.decideAcceptance(
     {
-      db: dbm.get(),
+      db,
       repos,
       broadcast,
-      emit: (type, payload) => getHub().emit(type, payload)
+      emit: (type, payload) => getHub().emit(type, payload),
+      onSettled: (updated, result) => {
+        if (result && result.verdict === 'accepted') void maybeAutoMerge(db, updated.id)
+      }
     },
     input
   )

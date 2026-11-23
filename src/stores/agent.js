@@ -54,7 +54,8 @@ export const useAgentStore = defineStore('agent', {
       })
     },
     handleEvent(ev) {
-      if (['queued', 'started', 'state', 'done', 'acceptance'].includes(ev.type)) this.loadRuns()
+      if (['queued', 'started', 'state', 'done', 'acceptance', 'workspace'].includes(ev.type))
+        this.loadRuns()
       if (['state', 'done', 'acceptance', 'graph'].includes(ev.type) && this.activeRunId)
         this.loadGraph(this.activeRunId)
       // 运行结束（含被停止/出错）时，该运行遗留的确认卡一律失效

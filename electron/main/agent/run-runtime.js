@@ -151,6 +151,7 @@ function createRunQueue({ launch, shuttingDown, limit = SLOT_LIMIT }) {
       )
       .all()
     for (const row of rows) {
+      if (slots.has(row.id)) continue
       if (dependenciesReady(db, row.id) && graphHasCapacity(db, row.id)) return row.id
     }
     return null

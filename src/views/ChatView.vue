@@ -205,10 +205,14 @@ function toggleProject(id) {
 const showProjectDialog = ref(false)
 const projectName = ref('')
 const projectPath = ref('')
+const projectWorktree = ref(true)
+const projectAutoMerge = ref(true)
 const savingProject = ref(false)
 function openProjectDialog() {
   projectName.value = ''
   projectPath.value = ''
+  projectWorktree.value = true
+  projectAutoMerge.value = true
   showProjectDialog.value = true
 }
 async function pickProjectDir() {
@@ -222,7 +226,12 @@ async function submitProject() {
   if (!name || !dir) return
   savingProject.value = true
   try {
-    const p = await projects.create({ name, path: dir })
+    const p = await projects.create({
+      name,
+      path: dir,
+      workspaceMode: projectWorktree.value ? 'worktree' : 'shared',
+      workspaceAutoMerge: projectAutoMerge.value
+    })
     showProjectDialog.value = false
     collapsedProjects.value[p.id] = false
     ui.toast('项目已添加，新建会话将归入该项目', 'success')
@@ -264,6 +273,21 @@ async function removeProject(p) {
 function projectMenuItems(p) {
   return [
     { id: 'rename', label: '重命名项目', icon: 'edit', onSelect: () => startProjectRename(p) },
+    {
+      id: 'workspace',
+      label: p.workspaceMode === 'shared' ? '使用独立工作区' : '使用共享目录',
+      icon: 'folder',
+      onSelect: () =>
+        projects.update(p.id, {
+          workspaceMode: p.workspaceMode === 'shared' ? 'worktree' : 'shared'
+        })
+    },
+    {
+      id: 'autoMerge',
+      label: p.workspaceAutoMerge ? '关闭自动合并' : '开启自动合并',
+      icon: 'check',
+      onSelect: () => projects.update(p.id, { workspaceAutoMerge: p.workspaceAutoMerge ? 0 : 1 })
+    },
     {
       id: 'pin',
       label: p.pinned ? '取消置顶' : '置顶',
@@ -1042,6 +1066,26 @@ function startResize(e) {
             </button>
           </div>
           <p class="field-help mt-1">任务模式下，该项目内会话的命令将在此目录中执行</p>
+          <div class="mt-2 space-y-1.5 text-xs text-ink-secondary">
+            <label class="flex items-center gap-2">
+              <input
+                v-model="projectWorktree"
+                type="checkbox"
+                data-testid="project-worktree"
+                class="accent-brand-ink"
+              />
+              使用独立 Git 工作区（非 Git 目录自动回退共享目录）
+            </label>
+            <label class="flex items-center gap-2">
+              <input
+                v-model="projectAutoMerge"
+                type="checkbox"
+                data-testid="project-auto-merge"
+                class="accent-brand-ink"
+              />
+              任务成功后自动合并回当前分支（主目录有未提交改动时跳过）
+            </label>
+          </div>
         </label>
       </div>
       <template #footer>

@@ -64,6 +64,23 @@ function graphDepKeys(runId) {
     .map((d) => keyById.get(d.dependsOnRunId))
     .filter(Boolean)
 }
+function workspaceInfo(run) {
+  try {
+    return JSON.parse((run && run.workspace_json) || '{}') || {}
+  } catch {
+    return {}
+  }
+}
+const mergeStatusText = {
+  merged: '已自动合并',
+  conflict: '合并冲突，已保留分支',
+  skipped: '未自动合并',
+  failed: '合并失败'
+}
+function mergeStatus(run) {
+  const merge = workspaceInfo(run).merge
+  return (merge && mergeStatusText[merge.status]) || ''
+}
 
 function duration(r) {
   if (!r || !r.started_at) return ''
@@ -155,6 +172,13 @@ async function copyResult(c) {
                 data-testid="run-graph"
               >
                 任务图
+              </span>
+              <span
+                v-if="workspaceInfo(agent.activeRun).mode === 'worktree'"
+                class="badge bg-subtle text-ink-secondary"
+                data-testid="run-workspace"
+              >
+                独立工作区
               </span>
               <span
                 v-if="acceptanceStatus(agent.activeRun)"
@@ -259,6 +283,28 @@ async function copyResult(c) {
                 依赖 {{ graphDepKeys(n.runId).join(', ') }}
               </span>
             </div>
+          </div>
+        </div>
+
+        <div
+          v-if="workspaceInfo(agent.activeRun).mode === 'worktree'"
+          class="shrink-0 px-5 pb-3 bg-surface"
+          data-testid="run-workspace-panel"
+        >
+          <div class="rounded-lg border border-line-subtle bg-panel px-3 py-2 text-xs space-y-1">
+            <div class="flex items-center gap-2 flex-wrap">
+              <span class="text-ink-secondary">工作区</span>
+              <span class="badge bg-subtle text-ink-secondary">
+                {{ workspaceInfo(agent.activeRun).branch }}
+              </span>
+              <span v-if="mergeStatus(agent.activeRun)" class="text-ink-muted">
+                {{ mergeStatus(agent.activeRun) }}
+              </span>
+              <span v-if="workspaceInfo(agent.activeRun).merge?.reason" class="text-ink-muted">
+                {{ workspaceInfo(agent.activeRun).merge.reason }}
+              </span>
+            </div>
+            <div class="text-ink-muted break-all">{{ workspaceInfo(agent.activeRun).path }}</div>
           </div>
         </div>
 

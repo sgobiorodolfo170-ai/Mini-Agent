@@ -577,6 +577,8 @@ function install() {
           name: o.name || '未命名项目',
           path: o.path || '',
           pinned: 0,
+          workspaceMode: o.workspaceMode === 'shared' ? 'shared' : 'worktree',
+          workspaceAutoMerge: o.workspaceAutoMerge === 0 ? 0 : 1,
           createdAt: now(),
           updatedAt: now()
         }

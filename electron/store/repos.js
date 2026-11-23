@@ -831,6 +831,16 @@ function updateRunAcceptance(db, id, { status, result = null, expected = null } 
   return getRun(db, id)
 }
 
+function setRunWorkspace(db, id, workspace) {
+  const cur = getRun(db, id)
+  if (!cur) return null
+  db.prepare('UPDATE agent_runs SET workspace_json=?, version=version+1 WHERE id=?').run(
+    workspace ? JSON.stringify(workspace) : null,
+    id
+  )
+  return getRun(db, id)
+}
+
 // 兼容旧调用点：终止类状态走 CAS，失败只记录不抛（旧代码期望 void）。
 function updateRun(db, id, patch) {
   if (patch.status) {
@@ -998,6 +1008,7 @@ module.exports = {
   updateRun,
   updateRunStatus,
   updateRunAcceptance,
+  setRunWorkspace,
   finalizeRunStatus,
   resumeParentAfterChild,
   getRun,
