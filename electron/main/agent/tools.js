@@ -471,7 +471,8 @@ function defineTools(ctx) {
       },
       handler: async ({ conversationId, timeoutMs }) => {
         if (typeof ctx.waitForSession !== 'function') throw new Error('会话管理未启用')
-        return JSON.stringify(ctx.waitForSession({ conversationId, timeoutMs }))
+        // waitForSession 是异步有界轮询；漏掉 await 会把 Promise 序列化成 "{}"
+        return JSON.stringify(await ctx.waitForSession({ conversationId, timeoutMs }))
       }
     },
     {

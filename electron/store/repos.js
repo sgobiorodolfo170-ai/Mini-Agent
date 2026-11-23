@@ -782,6 +782,38 @@ function updateRun(db, id, patch) {
   return true
 }
 
+// 委派收口：delegated 子 Run 终态后，把仍在 waiting_child 的父 Run 唤醒。
+// transferred 是终态移交，父 Run 不应再恢复。
+function resumeParentAfterChild(db, childRunId) {
+  const child = getRun(db, childRunId)
+  if (!child || !child.parentRunId) return { resumed: false, reason: 'no_parent' }
+  if (child.controlMode !== 'delegated') return { resumed: false, reason: 'not_delegated' }
+  if (!isRunTerminal(child.status)) return { resumed: false, reason: 'child_not_terminal' }
+  const parent = getRun(db, child.parentRunId)
+  if (!parent) return { resumed: false, reason: 'parent_not_found' }
+  if (parent.status !== 'waiting_child') return { resumed: false, reason: 'parent_not_waiting' }
+  // 单活动子 Run 约束的兜底：还有别的活动子 Run 时不能提前唤醒父任务
+  if (listActiveChildRuns(db, parent.id).length) {
+    return { resumed: false, reason: 'other_children_active', parentRunId: parent.id }
+  }
+  const r = updateRunStatus(db, parent.id, { status: 'running' })
+  return r.ok
+    ? { resumed: true, parentRunId: parent.id }
+    : { resumed: false, reason: r.reason, parentRunId: parent.id }
+}
+
+// 终态收口：允许 waiting_child → running → 终态。
+// 用于父 Run 尚未等待子 Run 就自行结束的场景，避免状态永久卡在 waiting_child。
+function finalizeRunStatus(db, id, patch = {}) {
+  if (!isRunTerminal(patch.status)) return updateRunStatus(db, id, patch)
+  const first = updateRunStatus(db, id, patch)
+  if (first.ok) return first
+  if (first.reason !== `illegal_transition:waiting_child->${patch.status}`) return first
+  const resumed = updateRunStatus(db, id, { status: 'running' })
+  if (!resumed.ok) return first
+  return updateRunStatus(db, id, patch)
+}
+
 // 列出某父 Run 的活动子 Run（用于"同时最多一个活动子 Run"约束）
 function listActiveChildRuns(db, parentRunId) {
   const marks = RUN_ACTIVE.map(() => '?').join(',')
@@ -896,6 +928,8 @@ module.exports = {
   createRunEx,
   updateRun,
   updateRunStatus,
+  finalizeRunStatus,
+  resumeParentAfterChild,
   getRun,
   listActiveChildRuns,
   listChildRuns,

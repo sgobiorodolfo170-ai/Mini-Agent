@@ -128,3 +128,82 @@ describe('父状态更新失败时回滚子 Run（§6.2 末段）', () => {
     expect(repos.listChildRuns(db, parent)).toHaveLength(before)
   })
 })
+
+describe('waiting_child 生命周期收口', () => {
+  it('delegated 子 Run 终态后父 Run 恢复 running', () => {
+    const db = dbm.get()
+    const c = conv()
+    const parent = repos.createRun(db, { conversationId: c.id, goal: 'p' })
+    const child = spawnChild({ parentId: parent, conversationId: c.id, controlMode: 'delegated' })
+    repos.updateRunStatus(db, child, { status: 'done' })
+
+    const r = repos.resumeParentAfterChild(db, child)
+    expect(r).toMatchObject({ resumed: true, parentRunId: parent })
+    expect(repos.getRun(db, parent).status).toBe('running')
+  })
+
+  it('transferred 子 Run 不唤醒父 Run', () => {
+    const db = dbm.get()
+    const c = conv()
+    const parent = repos.createRun(db, { conversationId: c.id, goal: 'p' })
+    const child = spawnChild({ parentId: parent, conversationId: c.id, controlMode: 'transferred' })
+    repos.updateRunStatus(db, child, { status: 'done' })
+
+    expect(repos.resumeParentAfterChild(db, child).resumed).toBe(false)
+    expect(repos.getRun(db, parent).status).toBe('transferred')
+  })
+
+  it('子 Run 未到终态时不唤醒父 Run', () => {
+    const db = dbm.get()
+    const c = conv()
+    const parent = repos.createRun(db, { conversationId: c.id, goal: 'p' })
+    const child = spawnChild({ parentId: parent, conversationId: c.id, controlMode: 'delegated' })
+
+    expect(repos.resumeParentAfterChild(db, child)).toMatchObject({
+      resumed: false,
+      reason: 'child_not_terminal'
+    })
+    expect(repos.getRun(db, parent).status).toBe('waiting_child')
+  })
+
+  it('仍有其它活动子 Run 时不唤醒父 Run', () => {
+    const db = dbm.get()
+    const c = conv()
+    const parent = repos.createRun(db, { conversationId: c.id, goal: 'p' })
+    const first = spawnChild({ parentId: parent, conversationId: c.id, controlMode: 'delegated' })
+    repos.createRun(db, {
+      conversationId: c.id,
+      goal: 'second',
+      parentRunId: parent,
+      controlMode: 'delegated'
+    })
+    repos.updateRunStatus(db, first, { status: 'done' })
+
+    expect(repos.resumeParentAfterChild(db, first)).toMatchObject({
+      resumed: false,
+      reason: 'other_children_active'
+    })
+    expect(repos.getRun(db, parent).status).toBe('waiting_child')
+  })
+
+  it('父 Run 自行结束时可从 waiting_child 收口到 done', () => {
+    const db = dbm.get()
+    const c = conv()
+    const parent = repos.createRun(db, { conversationId: c.id, goal: 'p' })
+    spawnChild({ parentId: parent, conversationId: c.id, controlMode: 'delegated' })
+
+    const r = repos.finalizeRunStatus(db, parent, { status: 'done', stepsUsed: 3 })
+    expect(r.ok).toBe(true)
+    expect(repos.getRun(db, parent).status).toBe('done')
+    expect(repos.getRun(db, parent).stepsUsed).toBe(3)
+  })
+
+  it('finalizeRunStatus 不改变普通非法跃迁的拒绝语义', () => {
+    const db = dbm.get()
+    const c = conv()
+    const run = repos.createRun(db, { conversationId: c.id, goal: 'g', status: 'queued' })
+    const r = repos.finalizeRunStatus(db, run, { status: 'done' })
+    expect(r.ok).toBe(false)
+    expect(r.reason).toContain('illegal_transition:queued->done')
+  })
+})

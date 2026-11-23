@@ -19,6 +19,10 @@ const DEFAULT_WAIT_MS = 60000
 const MAX_WAIT_MS = 300000
 const POLL_MS = 500
 
+// 仍在推进中的状态：等待会话时不得当成终态。
+// 包含 Run 的 queued/waiting_child，以及消息的 streaming/pending。
+const ACTIVE_STATUSES = new Set(['queued', 'running', 'waiting_child', 'streaming', 'pending'])
+
 // 外部依赖的唯一接缝：默认指向真实实现，单测用 _setDeps 换成替身，
 // 从而不必依赖打包器对 CJS require 的 mock 行为。
 const deps = {
@@ -234,7 +238,7 @@ async function waitForSession({ conversationId, timeoutMs = DEFAULT_WAIT_MS, pol
   let last = null
   for (;;) {
     last = getSessionStatus({ conversationId })
-    if (last.status && !['running', 'streaming', 'pending'].includes(last.status)) {
+    if (last.status && !ACTIVE_STATUSES.has(last.status)) {
       return { ...last, waited: Date.now() - started, timedOut: false }
     }
     if (Date.now() - started >= limit) {

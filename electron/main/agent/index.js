@@ -16,6 +16,7 @@ const { parseMcpServers } = require('./mcp-client')
 const { getHub } = require('../events/hub')
 const { parseHooks, applyHooks } = require('../events/hooks')
 const { normalizeMandate, defaultSubMandate, authorizeToolCall } = require('./mandate')
+const { createSessionBridge } = require('./session-bridge')
 const { createApprovalService } = require('../remote/approval-service')
 const { createRunControl } = require('../remote/run-control-service')
 
@@ -373,33 +374,23 @@ async function doAgentRun({
     sessionPermission: state.permission,
     sessionCluster: state.cluster
   }
-  // 会话管理：子会话继承本运行的权限等级，不擅自提权
+  // 会话管理：子会话继承本运行的权限等级，不擅自提权。
+  // 参数透传与目标会话归属校验集中在 session-bridge，便于单测覆盖。
   const sessionApi = require('./sessions')
-  ctx.createSession = (opts) =>
-    sessionApi.createSession({
-      ...opts,
-      parentConversationId: conversationId,
-      runId
-    })
-  ctx.sendToSession = ({ conversationId: targetId, content, mode }) => {
-    // 只允许向「本运行派生的子会话」或本会话发送，避免跨会话乱发
-    const target = repos.getConversation(db, targetId)
-    if (!target) throw new Error('目标会话不存在')
-    const isChild = target.parentId === conversationId
-    const isSelf = target.id === conversationId
-    if (!isChild && !isSelf) throw new Error('只能向本会话或其派生的子会话发送提示词')
-    return sessionApi.sendToSession({
-      conversationId: targetId,
-      content,
-      permission: mode === 'agent' ? state.permission : 'default',
-      cluster: state.cluster,
-      runId
-    })
-  }
-  ctx.getSessionStatus = (opts) => sessionApi.getSessionStatus(opts)
-  ctx.waitForSession = (opts) => sessionApi.waitForSession(opts)
-  ctx.getSessionResult = (opts) => sessionApi.getSessionResult(opts)
-  ctx.listSessions = (opts) => sessionApi.listSessions({ ...opts, runId })
+  const sessionBridge = createSessionBridge({
+    db,
+    repos,
+    sessionsApi: sessionApi,
+    conversationId,
+    runId,
+    state
+  })
+  ctx.createSession = sessionBridge.createSession
+  ctx.sendToSession = sessionBridge.sendToSession
+  ctx.getSessionStatus = sessionBridge.getSessionStatus
+  ctx.waitForSession = sessionBridge.waitForSession
+  ctx.getSessionResult = sessionBridge.getSessionResult
+  ctx.listSessions = sessionBridge.listSessions
 
   // 钩子规则来自用户设置，模型无法改动；此处解析一次，运行内复用
   const hookRules = parseHooks(settings.agentHooks)
@@ -712,7 +703,7 @@ async function doAgentRun({
     })
   }
 
-  const runUpdate = repos.updateRunStatus(db, runId, {
+  const runUpdate = repos.finalizeRunStatus(db, runId, {
     status: finalStatus,
     stepsUsed,
     endedAt: Date.now(),
@@ -727,6 +718,16 @@ async function doAgentRun({
       conversationId,
       attempted: finalStatus,
       reason: runUpdate.reason
+    })
+  }
+  // 委派关系收口：子 Run 终态后唤醒仍在 waiting_child 的父 Run。
+  // transferred 是终态移交，不应唤醒父任务。
+  const resumed = repos.resumeParentAfterChild(db, runId)
+  if (resumed.resumed) {
+    getHub().emit('run.parent_resumed', {
+      childRunId: runId,
+      parentRunId: resumed.parentRunId,
+      traceId: state.traceId
     })
   }
   repos.updateMessage(db, assistantMsgId, {

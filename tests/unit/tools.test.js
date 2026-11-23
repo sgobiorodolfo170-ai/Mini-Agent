@@ -54,7 +54,11 @@ beforeAll(() => {
       msg: content
     }),
     getSessionStatus: ({ conversationId }) => ({ conversationId, status: 'done' }),
-    waitForSession: ({ conversationId }) => ({ conversationId, status: 'done', timedOut: false }),
+    waitForSession: async ({ conversationId }) => ({
+      conversationId,
+      status: 'done',
+      timedOut: false
+    }),
     getSessionResult: ({ conversationId }) => ({ conversationId, content: '结果正文' }),
     listSessions: () => [{ conversationId: 'c1', status: 'running' }]
   }
@@ -408,6 +412,68 @@ describe('会话管理工具（session_*）', () => {
     const list = JSON.parse(await map.session_list.handler({}))
     expect(Array.isArray(list)).toBe(true)
     expect(list[0].conversationId).toBe('c1')
+  })
+
+  it('session_wait 必须等待异步 waitForSession 完成后再返回', async () => {
+    let release
+    const gate = new Promise((resolve) => {
+      release = resolve
+    })
+    const local = Object.fromEntries(
+      defineTools({
+        todo: { seq: 0, items: [] },
+        waitForSession: async ({ conversationId }) => {
+          await gate
+          return { conversationId, status: 'done', timedOut: false }
+        }
+      }).map((t) => [t.name, t])
+    )
+
+    let settled = false
+    const pending = local.session_wait.handler({ conversationId: 'c1' }).then((r) => {
+      settled = true
+      return r
+    })
+    await Promise.resolve()
+    expect(settled).toBe(false)
+
+    release()
+    const r = JSON.parse(await pending)
+    expect(r).toMatchObject({ conversationId: 'c1', status: 'done', timedOut: false })
+  })
+
+  it('session_send 透传 controlMode 与 acceptanceCriteria 给桥接层', async () => {
+    const calls = []
+    const local = Object.fromEntries(
+      defineTools({
+        todo: { seq: 0, items: [] },
+        sendToSession: async (opts) => {
+          calls.push(opts)
+          return { mode: opts.mode }
+        }
+      }).map((t) => [t.name, t])
+    )
+
+    await local.session_send.handler({
+      conversationId: 'c1',
+      content: '把任务交出去',
+      mode: 'agent',
+      controlMode: 'transferred',
+      acceptanceCriteria: '回答中包含三项结论'
+    })
+
+    expect(calls[0]).toMatchObject({
+      conversationId: 'c1',
+      content: '把任务交出去',
+      mode: 'agent',
+      controlMode: 'transferred',
+      acceptancePolicy: {
+        schemaVersion: 1,
+        criteria: '回答中包含三项结论',
+        judge: 'parent',
+        onTimeout: 'escalate'
+      }
+    })
   })
 
   it('会话管理未注入时给出明确错误，而不是静默失败', async () => {

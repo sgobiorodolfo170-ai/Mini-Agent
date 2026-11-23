@@ -168,8 +168,15 @@ describe('session 发送', () => {
 
 describe('session 状态与结果', () => {
   function seedRun(convId, status = 'done', steps = 2) {
-    const runId = repos.createRun(dbm.get(), { conversationId: convId, goal: 'g', maxSteps: 10 })
-    repos.updateRun(dbm.get(), runId, { status, stepsUsed: steps, endedAt: Date.now() })
+    const runId = repos.createRun(dbm.get(), {
+      conversationId: convId,
+      goal: 'g',
+      maxSteps: 10
+    })
+    // running 是 createRun 默认值，重复写 running 会被状态机拒绝并污染 stderr
+    if (status !== 'running') {
+      repos.updateRun(dbm.get(), runId, { status, stepsUsed: steps, endedAt: Date.now() })
+    }
     return runId
   }
 
@@ -309,5 +316,19 @@ describe('session 状态与结果', () => {
     })
     expect(r.timedOut).toBe(false)
     expect(r.status).toBe('done')
+  })
+
+  it('wait 不把 waiting_child 当成终态', async () => {
+    const parent = seedParent()
+    const conv = await sessions.createSession({ parentConversationId: parent.id, title: 'T' })
+    const runId = seedRun(conv.id, 'running')
+    expect(repos.updateRunStatus(dbm.get(), runId, { status: 'waiting_child' }).ok).toBe(true)
+    const r = await sessions.waitForSession({
+      conversationId: conv.id,
+      timeoutMs: 1000,
+      pollMs: 200
+    })
+    expect(r.timedOut).toBe(true)
+    expect(r.status).toBe('waiting_child')
   })
 })
