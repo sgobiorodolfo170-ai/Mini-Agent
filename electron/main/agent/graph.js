@@ -61,6 +61,14 @@ function validatePlan(tasks) {
     }
   }
   if (order.length !== normalized.length) throw new Error('任务依赖存在环，无法执行')
+  const taskByKey = new Map(normalized.map((task) => [task.key, task]))
+  const depthByKey = new Map()
+  for (const key of order) {
+    const deps = taskByKey.get(key).deps
+    const depth = deps.length ? Math.max(...deps.map((dep) => depthByKey.get(dep))) + 1 : 1
+    if (depth > MAX_DEPTH) throw new Error(`任务依赖深度不能超过 ${MAX_DEPTH} 层`)
+    depthByKey.set(key, depth)
+  }
   return normalized
 }
 

@@ -35,11 +35,20 @@ function trimCheckpointMessages(messages) {
     ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {})
   }))
   let json = redact(JSON.stringify(list))
-  // 先丢最旧的工具结果，再丢更早的对话，保留 system 与最近上下文。
+  // 先丢最旧的工具结果，并同步移除对应调用，保留 system 与最近上下文。
   while (Buffer.byteLength(json) > MAX_CHECKPOINT_BYTES && list.length > 3) {
     const toolIndex = list.findIndex((m, index) => index > 0 && m.role === 'tool')
     if (toolIndex < 0) break
+    const toolCallId = list[toolIndex].tool_call_id
     list.splice(toolIndex, 1)
+    for (let index = list.length - 1; index >= 0; index--) {
+      const message = list[index]
+      if (!Array.isArray(message.tool_calls)) continue
+      message.tool_calls = message.tool_calls.filter((call) => call.id !== toolCallId)
+      if (!message.tool_calls.length) delete message.tool_calls
+      if (message.role === 'assistant' && !message.content && !message.tool_calls)
+        list.splice(index, 1)
+    }
     json = redact(JSON.stringify(list))
   }
   if (Buffer.byteLength(json) > MAX_CHECKPOINT_BYTES) return null
@@ -185,15 +194,12 @@ function blockOrphanDependents(db) {
   })
 }
 
-function recoverRuns(db) {
+function stopOrphanDependents(db) {
   transaction(db, () => {
-    const changed = db
+    const stopped = db
       .prepare(
         `
       WITH RECURSIVE lost(id) AS (
-        SELECT id FROM agent_runs WHERE status IN ('running','waiting_child')
-          OR (status='queued' AND run_spec_json IS NULL)
-        UNION
         SELECT child.id FROM agent_runs child JOIN agent_runs parent ON child.parent_run_id=parent.id
           WHERE child.status IN ('queued','transferred') AND child.control_mode='delegated'
             AND parent.status IN ('done','error','stopped','interrupted','max_steps')
@@ -208,6 +214,34 @@ function recoverRuns(db) {
           ELSE 'interrupted' END,
         ended_at=COALESCE(ended_at,?), version=version+1
       WHERE id IN (SELECT id FROM lost) AND status IN ('queued','running','waiting_child')
+      RETURNING id,assistant_message_id AS assistantMessageId,status
+    `
+      )
+      .all(Date.now())
+    for (const row of stopped) {
+      if (row.assistantMessageId) {
+        db.prepare('UPDATE messages SET status=? WHERE id=?').run(
+          row.status === 'interrupted' ? 'interrupted' : 'stopped',
+          row.assistantMessageId
+        )
+      }
+      recordRunState(db, row.id)
+    }
+  })
+}
+
+function recoverRuns(db) {
+  transaction(db, () => {
+    const changed = db
+      .prepare(
+        `
+      UPDATE agent_runs SET
+        finished_reason=CASE WHEN run_spec_json IS NULL THEN 'legacy_unrecoverable'
+          ELSE 'app_restarted' END,
+        status=CASE WHEN run_spec_json IS NULL THEN 'stopped' ELSE 'interrupted' END,
+        ended_at=COALESCE(ended_at,?), version=version+1
+      WHERE status IN ('running','waiting_child')
+        OR (status='queued' AND run_spec_json IS NULL)
       RETURNING id,assistant_message_id AS assistantMessageId,status
     `
       )
@@ -227,6 +261,7 @@ function recoverRuns(db) {
     ).run()
   })
   autoResumeRuns(db)
+  stopOrphanDependents(db)
   blockOrphanDependents(db)
   // 图状态按恢复后的节点重新汇总；失败节点已在上面的循环中收口。
   try {

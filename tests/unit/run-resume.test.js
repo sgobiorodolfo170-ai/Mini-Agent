@@ -8,6 +8,7 @@ require('electron')
 const dbm = require('../../electron/store/db')
 const repos = require('../../electron/store/repos')
 const storage = require('../../electron/store/run-storage')
+const graph = require('../../electron/main/agent/graph')
 const agent = require('../../electron/main/agent')
 
 let db
@@ -210,5 +211,81 @@ describe('检查点与恢复', () => {
     expect(bodies).toHaveLength(1)
     expect(bodies[0].messages.at(-1).role).toBe('tool')
     expect(storage.loadCheckpoint(db, runId)).toBeNull()
+  })
+
+  it('超限裁剪检查点时保持工具调用与结果配对', () => {
+    const runId = repos.createRun(db, { conversationId, goal: 'g' })
+    const calls = Array.from({ length: 20 }, (_, index) => ({
+      id: `call-${index}`,
+      type: 'function',
+      function: { name: 'read_file', arguments: '{}' }
+    }))
+    expect(
+      storage.saveCheckpoint(db, runId, {
+        phase: 'tool_done',
+        step: 1,
+        messages: [
+          { role: 'system', content: 'system' },
+          { role: 'user', content: '目标' },
+          { role: 'assistant', content: '', tool_calls: calls },
+          ...calls.map((call) => ({
+            role: 'tool',
+            tool_call_id: call.id,
+            content: 'x'.repeat(30000)
+          }))
+        ],
+        pendingToolCalls: [],
+        stepsUsed: 1
+      })
+    ).toBe(true)
+
+    const checkpoint = storage.loadCheckpoint(db, runId)
+    const callIds = checkpoint.messages.flatMap((message) =>
+      (message.tool_calls || []).map((call) => call.id)
+    )
+    const resultIds = checkpoint.messages
+      .filter((message) => message.role === 'tool')
+      .map((message) => message.tool_call_id)
+    expect(callIds.length).toBeGreaterThan(0)
+    expect(callIds.length).toBeLessThan(calls.length)
+    expect([...callIds].sort()).toEqual([...resultIds].sort())
+  })
+
+  it('恢复有安全检查点的父任务时保留排队图节点', () => {
+    const parent = seedRun({
+      status: 'waiting_child',
+      checkpoint: {
+        phase: 'before_model',
+        step: 1,
+        messages: SAFE_MESSAGES.slice(0, 2),
+        pendingToolCalls: [],
+        stepsUsed: 1
+      }
+    })
+    const graphId = graph.createGraph(db, { parentRunId: parent.runId, conversationId })
+    const nodeConversationId = repos.createConversation(db, { title: '图节点会话' }).id
+    const nodeRunId = repos.createRun(db, {
+      conversationId: nodeConversationId,
+      goal: '图节点',
+      status: 'queued',
+      parentRunId: parent.runId,
+      controlMode: 'delegated',
+      graphId,
+      nodeKey: 'node'
+    })
+    const nodeMessage = repos.insertMessage(db, {
+      conversationId: nodeConversationId,
+      role: 'assistant',
+      content: '',
+      status: 'pending'
+    })
+    db.prepare(
+      `UPDATE agent_runs SET run_spec_json='{"version":1}', assistant_message_id=?, submitted_at=? WHERE id=?`
+    ).run(nodeMessage.id, Date.now(), nodeRunId)
+
+    storage.recoverRuns(db)
+
+    expect(repos.getRun(db, parent.runId)).toMatchObject({ status: 'queued', resumeCount: 1 })
+    expect(repos.getRun(db, nodeRunId).status).toBe('queued')
   })
 })

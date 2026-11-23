@@ -47,12 +47,20 @@ describe('任务依赖图', () => {
     ).toThrow(/环/)
   })
 
-  it('限制节点数与深度常量', () => {
+  it('限制节点数与深度', () => {
     expect(graph.MAX_NODES).toBe(12)
     expect(graph.MAX_DEPTH).toBe(3)
     expect(graph.MAX_CONCURRENCY).toBe(4)
     const tooMany = Array.from({ length: 13 }, (_, i) => ({ key: `n${i}`, goal: `G${i}` }))
     expect(() => graph.validatePlan(tooMany)).toThrow(/12/)
+    const chain = (length) =>
+      Array.from({ length }, (_, i) => ({
+        key: `n${i}`,
+        goal: `G${i}`,
+        deps: i ? [`n${i - 1}`] : []
+      }))
+    expect(graph.validatePlan(chain(3))).toHaveLength(3)
+    expect(() => graph.validatePlan(chain(4))).toThrow(/深度/)
   })
 
   it('持久化依赖、查询下游并汇总图状态', () => {
