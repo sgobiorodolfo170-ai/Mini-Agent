@@ -47,7 +47,8 @@ function buildMain() {
       list: () => inv('projects:list'),
       create: (o) => inv('projects:create', o),
       update: (o) => inv('projects:update', o),
-      remove: (id) => inv('projects:delete', id)
+      remove: (id) => inv('projects:delete', id),
+      createIndex: (o) => inv('projects:index', o)
     },
     chat: {
       send: (o) => inv('chat:send', o),

@@ -196,8 +196,10 @@ async function startStream({ conversationId, assistantMsgId, kbIds, attachments 
     const warnings = []
     let kbBlocks = []
     let kbRefs = []
-    if (kbIds && kbIds.length) {
-      const r = await retrieveKbBlocks(db, kbIds, lastUserText(db, conversationId))
+    const projectKbId = conv?.projectId ? repos.getProjectKb(db, conv.projectId)?.id : null
+    const effectiveKbIds = [...new Set([...(kbIds || []), ...(projectKbId ? [projectKbId] : [])])]
+    if (effectiveKbIds.length) {
+      const r = await retrieveKbBlocks(db, effectiveKbIds, lastUserText(db, conversationId))
       kbBlocks = r.blocks
       kbRefs = r.refs
       warnings.push(...r.warnings)
@@ -625,6 +627,7 @@ module.exports = {
   resolveModel,
   modelParams,
   effectiveParams,
+  retrieveKbBlocks,
   msgOut,
   safeJson
 }

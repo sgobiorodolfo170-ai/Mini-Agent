@@ -541,7 +541,8 @@ function listKbs(db) {
   return db
     .prepare(
       `SELECT id, name, embed_source AS embedSource, embed_provider_id AS embedProviderId,
-       embed_model AS embedModel, embed_quant AS embedQuant, dim,
+       embed_model AS embedModel, embed_quant AS embedQuant, dim, project_id AS projectId,
+       kind, root_path AS rootPath,
        created_at AS createdAt, updated_at AS updatedAt FROM kbs WHERE deleted_at IS NULL ORDER BY name`
     )
     .all()
@@ -551,18 +552,32 @@ function getKb(db, id) {
   return db
     .prepare(
       `SELECT id, name, embed_source AS embedSource, embed_provider_id AS embedProviderId,
-       embed_model AS embedModel, embed_quant AS embedQuant, dim
+       embed_model AS embedModel, embed_quant AS embedQuant, dim, project_id AS projectId,
+       kind, root_path AS rootPath
        FROM kbs WHERE id = ? AND deleted_at IS NULL`
     )
     .get(id)
 }
 
-function createKb(db, { name, embedSource, embedProviderId, embedModel, embedQuant }) {
+function createKb(
+  db,
+  {
+    name,
+    embedSource,
+    embedProviderId,
+    embedModel,
+    embedQuant,
+    projectId = null,
+    kind = 'document',
+    rootPath = null
+  }
+) {
   const t = now()
   const id = uid()
+  const normalizedKind = kind === 'workspace' ? 'workspace' : 'document'
   db.prepare(
     `INSERT INTO kbs(id, name, embed_source, embed_provider_id, embed_model, embed_quant,
-     created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)`
+     project_id, kind, root_path, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     id,
     name,
@@ -570,10 +585,25 @@ function createKb(db, { name, embedSource, embedProviderId, embedModel, embedQua
     embedProviderId || null,
     embedModel || null,
     embedQuant || null,
+    normalizedKind === 'workspace' ? projectId : null,
+    normalizedKind,
+    normalizedKind === 'workspace' ? rootPath : null,
     t,
     t
   )
   return getKb(db, id)
+}
+
+function getProjectKb(db, projectId) {
+  if (!projectId) return null
+  return db
+    .prepare(
+      `SELECT id, name, embed_source AS embedSource, embed_provider_id AS embedProviderId,
+       embed_model AS embedModel, embed_quant AS embedQuant, dim, project_id AS projectId,
+       kind, root_path AS rootPath
+       FROM kbs WHERE project_id=? AND kind='workspace' AND deleted_at IS NULL`
+    )
+    .get(projectId)
 }
 
 function updateKb(db, id, patch) {
@@ -1062,6 +1092,7 @@ module.exports = {
   softDeleteMessage,
   listKbs,
   getKb,
+  getProjectKb,
   createKb,
   updateKb,
   softDeleteKb,

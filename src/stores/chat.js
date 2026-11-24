@@ -103,7 +103,8 @@ export const useChatStore = defineStore('chat', {
           conversationId: this.activeId,
           goal: content,
           permission: this.permission,
-          cluster: this.agentCluster
+          cluster: this.agentCluster,
+          kbIds: [...this.selectedKbIds]
         })
       }
       return window.api.chat.send({

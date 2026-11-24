@@ -9,6 +9,7 @@ class FakeWebContents extends EventEmitter {
     this.destroyed = false
     this.loads = []
     this.commands = []
+    this.loadError = ''
   }
 
   isDestroyed() {
@@ -23,12 +24,21 @@ class FakeWebContents extends EventEmitter {
     this.loads.push(url)
     this.url = url
     this.emit('did-start-loading')
+    if (this.loadError) {
+      this.emit('did-fail-load', {}, -105, this.loadError, url, true)
+      this.emit('did-stop-loading')
+      throw Object.assign(new Error(this.loadError), { code: -105 })
+    }
     this.emit('did-navigate', {}, url)
     this.emit('did-stop-loading')
   }
 
   setWindowOpenHandler(handler) {
     this.openHandler = handler
+  }
+
+  setUserAgent(agent) {
+    this.userAgent = agent
   }
 
   async executeJavaScript(code) {
@@ -108,6 +118,9 @@ class FakeSession extends EventEmitter {
   }
 
   async clearStorageData() {}
+  async resolveHost() {
+    return { endpoints: [{ address: '93.184.216.34', family: 'ipv4' }] }
+  }
   flushStorageData() {}
 }
 
@@ -172,6 +185,16 @@ describe('browser service', () => {
     service.close(tab.id)
     expect(service.getState().tabs).toHaveLength(0)
     expect(children).toHaveLength(0)
+  })
+
+  it('使用 Chromium DNS 解析器并给出可读的页面加载错误', async () => {
+    const { service, children, sessions } = harness()
+    const tab = service.open({ url: 'about:blank' })
+    children[0].webContents.loadError = 'ERR_NAME_NOT_RESOLVED'
+    await expect(service.navigate(tab.id, 'example.com')).rejects.toThrow(/ERR_NAME_NOT_RESOLVED/)
+    expect(service.getState().tabs[0].error).toContain('无法解析域名')
+    expect(children[0].webContents.userAgent).toContain('Chrome/')
+    expect(sessions.get('persist:miniagent-browser').resolveHost).toBeTypeOf('function')
   })
 
   it('isolates Agent runs and enforces human takeover', async () => {

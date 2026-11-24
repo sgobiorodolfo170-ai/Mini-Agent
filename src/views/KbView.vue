@@ -128,7 +128,7 @@ async function removeDoc(d) {
 const kbStats = computed(() => {
   const k = kb.activeKb
   if (!k || !k.stats) return ''
-  return `${k.stats.docs} 文档 · ${k.stats.chunks} 分块`
+  return `${k.stats.docs} 文档 · ${k.stats.chunks} 分块${k.kind === 'workspace' ? ' · 工作区索引' : ''}`
 })
 
 // 嵌入来源标识：本地 onnx 模型显示量化档位，远程显示模型名
@@ -213,12 +213,21 @@ const hasSearched = computed(() => !!kb.lastSearch && kb.lastSearch.kbId === kb.
             <div class="text-xs text-ink-muted">
               {{ kbStats }} · 向量 {{ embedLabel }} · 维度 {{ kb.activeKb.dim || '-' }}
             </div>
+            <div v-if="kb.activeKb.kind === 'workspace'" class="text-xs text-ink-muted truncate">
+              自动索引项目文件：{{ kb.activeKb.rootPath }}
+            </div>
           </div>
           <div class="flex-1" />
-          <button class="btn-primary !h-9" data-testid="kb-import" @click="importDocs">
+          <button
+            v-if="kb.activeKb.kind !== 'workspace'"
+            class="btn-primary !h-9"
+            data-testid="kb-import"
+            @click="importDocs"
+          >
             <UiIcon name="file" :size="16" />
             导入文档
           </button>
+          <span v-else class="text-xs text-ink-muted">项目文件自动维护</span>
           <button class="btn-secondary" @click="kb.rebuild()">
             <UiIcon name="refresh" :size="16" />
             重建索引
@@ -294,7 +303,12 @@ const hasSearched = computed(() => !!kb.lastSearch && kb.lastSearch.kbId === kb.
                     还没有文档，点击「导入文档」添加 pdf / docx / md / txt
                   </td>
                 </tr>
-                <tr v-for="d in kb.docs" :key="d.id" class="border-t border-line-subtle">
+                <tr
+                  v-for="d in kb.docs"
+                  :key="d.id"
+                  data-testid="kb-doc-row"
+                  class="border-t border-line-subtle"
+                >
                   <td class="px-3 py-2.5 max-w-[280px]">
                     <span class="truncate block" :title="d.path">{{ d.title }}</span>
                   </td>

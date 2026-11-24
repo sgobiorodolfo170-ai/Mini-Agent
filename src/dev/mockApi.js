@@ -236,6 +236,37 @@ function install() {
     ]
   ])
 
+  const createMockWorkspaceIndex = (project, rebuild = false) => {
+    let kb = kbs.find((item) => item.projectId === project.id && item.kind === 'workspace')
+    if (!kb) {
+      kb = {
+        id: uid('kb'),
+        name: `${project.name} · 工作区索引`,
+        embedSource: 'local',
+        embedProviderId: null,
+        embedModel: 'bge-small-zh-v1.5',
+        embedQuant: 'int8',
+        dim: 512,
+        projectId: project.id,
+        kind: 'workspace',
+        rootPath: project.path,
+        createdAt: now(),
+        updatedAt: now()
+      }
+      kbs.push(kb)
+      docs.set(kb.id, [])
+    }
+    emit('kb:changed', { kbId: kb.id, projectId: project.id })
+    emit('kb:progress', {
+      kbId: kb.id,
+      projectId: project.id,
+      workspace: true,
+      done: true,
+      total: 0
+    })
+    return { started: true, kbId: kb.id, rebuilt: rebuild }
+  }
+
   const modelPackages = [
     {
       id: 'bge-small-zh-int8',
@@ -567,9 +598,12 @@ function install() {
     projects: {
       list: () =>
         clone(
-          [...projects].sort(
-            (a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || a.createdAt - b.createdAt
-          )
+          [...projects]
+            .sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || a.createdAt - b.createdAt)
+            .map((p) => ({
+              ...p,
+              workspaceIndexKbId: kbs.find((kb) => kb.projectId === p.id)?.id || null
+            }))
         ),
       create: (o = {}) => {
         const p = {
@@ -589,8 +623,9 @@ function install() {
           updatedAt: now()
         }
         projects.push(p)
+        const workspaceIndex = o.createWorkspaceIndex ? createMockWorkspaceIndex(p) : null
         emit('projects:changed', {})
-        return clone(p)
+        return clone(workspaceIndex ? { ...p, workspaceIndex } : p)
       },
       update: ({ id, patch } = {}) => {
         const p = projects.find((x) => x.id === id)
@@ -606,6 +641,13 @@ function install() {
         for (const c of conversations) if (c.projectId === id) c.projectId = null
         emit('projects:changed', {})
         return true
+      },
+      createIndex: ({ projectId, rebuild = true } = {}) => {
+        const p = projects.find((item) => item.id === projectId)
+        if (!p) throw new Error('项目不存在')
+        const result = createMockWorkspaceIndex(p, rebuild)
+        emit('projects:changed', {})
+        return clone(result)
       }
     },
     chat: {
@@ -748,6 +790,9 @@ function install() {
           embedProviderId: o.embedProviderId || null,
           embedModel: o.embedModel || null,
           embedQuant: o.embedQuant || 'fp32',
+          projectId: o.projectId || null,
+          kind: o.kind || 'document',
+          rootPath: o.rootPath || null,
           dim: 512,
           createdAt: now(),
           updatedAt: now()

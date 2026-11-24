@@ -1,14 +1,62 @@
 const fs = require('fs')
 const path = require('path')
 
-// Extract plain text from supported document types: .md/.txt/.docx/.pdf
+const TEXT_EXTENSIONS = new Set([
+  '.md',
+  '.markdown',
+  '.txt',
+  '.js',
+  '.jsx',
+  '.mjs',
+  '.cjs',
+  '.ts',
+  '.tsx',
+  '.vue',
+  '.py',
+  '.java',
+  '.go',
+  '.rs',
+  '.c',
+  '.h',
+  '.cpp',
+  '.hpp',
+  '.cs',
+  '.rb',
+  '.php',
+  '.swift',
+  '.kt',
+  '.kts',
+  '.scala',
+  '.sh',
+  '.ps1',
+  '.bat',
+  '.cmd',
+  '.sql',
+  '.html',
+  '.css',
+  '.scss',
+  '.less',
+  '.json',
+  '.yaml',
+  '.yml',
+  '.toml',
+  '.ini',
+  '.xml',
+  '.gradle',
+  '.properties'
+])
+
+const TEXT_FILENAMES = new Set(['README', 'LICENSE', 'Dockerfile', 'Makefile'])
+
+// Extract plain text from supported documents and source files.
 async function extractText(filePath) {
   const ext = path.extname(filePath).toLowerCase()
-  if (!['.md', '.markdown', '.txt', '.docx', '.pdf'].includes(ext)) {
+  const plainText = TEXT_EXTENSIONS.has(ext) || TEXT_FILENAMES.has(path.basename(filePath))
+  if (!plainText && !['.docx', '.pdf'].includes(ext)) {
     throw new Error(`不支持的文件类型: ${ext || '(无扩展名)'}`)
   }
   const buf = fs.readFileSync(filePath)
-  if (ext === '.md' || ext === '.markdown' || ext === '.txt') {
+  if (plainText) {
     return { text: buf.toString('utf8'), mime: 'text/plain' }
   }
   if (ext === '.docx') {
@@ -45,4 +93,4 @@ async function extractText(filePath) {
   throw new Error(`不支持的文件类型: ${ext || '(无扩展名)'}`)
 }
 
-module.exports = { extractText }
+module.exports = { extractText, TEXT_EXTENSIONS, TEXT_FILENAMES }

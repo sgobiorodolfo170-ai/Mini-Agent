@@ -102,6 +102,14 @@ describe('旧库迁移', () => {
     expect(run.node_key).toBeNull()
     expect(run.workspace_json).toBeNull()
     expect(run.resume_count).toBe(0)
+    const kb = db.prepare('SELECT * FROM kbs LIMIT 1').get()
+    expect(kb).toBeUndefined()
+    expect(
+      db
+        .prepare('PRAGMA table_info(kbs)')
+        .all()
+        .map((column) => column.name)
+    ).toEqual(expect.arrayContaining(['project_id', 'kind', 'root_path']))
 
     const indexes = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'")

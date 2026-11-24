@@ -62,7 +62,13 @@ onMounted(async () => {
     // 项目增删改会改变会话归属（删除项目时会话回归「最近」），两边列表都要刷新
     await Promise.all([chat.loadConversations(), projects.load()])
   })
-  window.api.on('kb:progress', (p) => kb.handleProgress(p))
+  window.api.on('kb:progress', (p) => {
+    kb.handleProgress(p)
+    if (p && p.workspace && p.error) ui.toast('工作区索引失败：' + p.error, 'error')
+  })
+  window.api.on('kb:changed', async () => {
+    await Promise.all([kb.load(), projects.load()])
+  })
   if (window.api.models) window.api.on('models:progress', (p) => settings.handleModelsProgress(p))
   window.api.on('agent:event', (ev) => agent.handleEvent(ev))
   window.api.on('browser:event', (ev) => browser.handleEvent(ev))

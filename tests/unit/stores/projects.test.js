@@ -12,6 +12,7 @@ function stubApi(overrides = {}) {
       create: vi.fn(async (o) => ({ id: 1, ...o })),
       update: vi.fn(async ({ id, patch }) => ({ id, ...patch })),
       remove: vi.fn(async () => true),
+      createIndex: vi.fn(async (o) => ({ started: true, kbId: 'kb1', ...o })),
       ...overrides
     }
   }
@@ -80,6 +81,13 @@ describe('projects store', () => {
     expect(api.projects.remove).toHaveBeenCalledWith(2)
     expect(list).toHaveBeenCalled()
     expect(s.projects).toEqual([{ id: 1, name: 'A' }])
+  })
+
+  it('createIndex 传递项目与重建标记', async () => {
+    const api = stubApi()
+    const s = useProjectsStore()
+    await expect(s.createIndex(3, true)).resolves.toMatchObject({ started: true, kbId: 'kb1' })
+    expect(api.projects.createIndex).toHaveBeenCalledWith({ projectId: 3, rebuild: true })
   })
 
   it('底层抛错时不吞异常（调用方可以提示用户）', async () => {

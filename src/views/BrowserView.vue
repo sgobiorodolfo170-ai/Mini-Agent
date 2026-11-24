@@ -14,9 +14,13 @@ let observer = null
 let attachFrame = 0
 
 const activeTab = computed(() => browser.activeTab)
-const pageError = computed(
-  () => localError.value || (activeTab.value && activeTab.value.error) || ''
-)
+const pageError = computed(() => {
+  const value = (activeTab.value && activeTab.value.error) || localError.value || ''
+  return String(value).replace(
+    /^(?:Error invoking remote method '[^']+':\s*|(?:BrowserPolicyError|BrowserError|Error):\s*)/,
+    ''
+  )
+})
 
 watch(
   () => activeTab.value && activeTab.value.url,
@@ -315,7 +319,15 @@ onBeforeUnmount(async () => {
         data-testid="browser-error"
       >
         <UiIcon name="warn" :size="13" />
-        <span class="truncate" :title="pageError">{{ pageError }}</span>
+        <span class="flex-1 truncate" :title="pageError">{{ pageError }}</span>
+        <button
+          class="btn-compact !h-6 !px-2 text-xs"
+          data-testid="browser-retry"
+          :disabled="busy || !address.trim()"
+          @click="submitAddress"
+        >
+          重试
+        </button>
       </div>
 
       <div ref="viewport" class="flex-1 min-h-0 relative bg-white" data-testid="browser-viewport">

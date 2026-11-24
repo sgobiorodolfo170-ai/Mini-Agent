@@ -11,6 +11,9 @@ import {
 describe('browser URL policy', () => {
   it('normalizes http(s) URLs and only allows internal about:blank', () => {
     expect(normalizeBrowserUrl(' https://example.com/a ')).toBe('https://example.com/a')
+    expect(normalizeBrowserUrl('example.com/docs?q=1')).toBe('https://example.com/docs?q=1')
+    expect(normalizeBrowserUrl('localhost:5173/app')).toBe('https://localhost:5173/app')
+    expect(normalizeBrowserUrl('//example.com/path')).toBe('https://example.com/path')
     expect(normalizeBrowserUrl('about:blank')).toBe('about:blank')
     expect(() => normalizeBrowserUrl('javascript:alert(1)')).toThrow(/http/)
     expect(() => normalizeBrowserUrl('file:///C:/secret.txt')).toThrow(/http/)
@@ -58,6 +61,24 @@ describe('browser URL policy', () => {
     await expect(
       assertBrowserUrlAllowed('http://127.0.0.1:3000/', { allowPrivateNetwork: true })
     ).resolves.toBe('http://127.0.0.1:3000/')
+  })
+
+  it('可以使用 Chromium 解析器校验 DNS，避免 Electron Node 解析差异', async () => {
+    await expect(
+      assertHostnameAllowed('example.com', {
+        resolveHost: async () => ({
+          endpoints: [
+            { address: '93.184.216.34', family: 'ipv4' },
+            { address: '2606:4700:4700::1111', family: 'ipv6' }
+          ]
+        })
+      })
+    ).resolves.toBe('example.com')
+    await expect(
+      assertHostnameAllowed('example.com', {
+        resolveHost: async () => ({ endpoints: [{ address: '127.0.0.1', family: 'ipv4' }] })
+      })
+    ).rejects.toThrow(/内网/)
   })
 
   it('sanitizes download filenames', () => {

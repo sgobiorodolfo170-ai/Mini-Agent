@@ -10,9 +10,19 @@ class BrowserPolicyError extends Error {
 }
 
 function normalizeBrowserUrl(raw, { allowBlank = true } = {}) {
-  const value = String(raw || '').trim()
+  let value = String(raw || '').trim()
   if (!value) throw new BrowserPolicyError('URL 不能为空')
   if (allowBlank && value === 'about:blank') return value
+  const hostPattern =
+    /^(?:localhost|(?:\d{1,3}\.){3}\d{1,3}|[a-z\d](?:[a-z\d-]*[a-z\d])?(?:\.[a-z\d](?:[a-z\d-]*[a-z\d])?)+)(?::\d+)?(?:[/?#].*)?$/i
+  const scheme = value.match(/^([a-z][a-z\d+.-]*):/i)
+  const hasScheme = !!scheme && !hostPattern.test(scheme[1])
+  if (!hasScheme) {
+    if (value.startsWith('//')) value = `https:${value}`
+    else if (hostPattern.test(value) || /^\[[0-9a-f:]+\](?::\d+)?(?:[/?#].*)?$/i.test(value)) {
+      value = `https://${value}`
+    }
+  }
 
   let url
   try {
@@ -84,7 +94,7 @@ function isPrivateIp(ip) {
 
 async function assertHostnameAllowed(
   hostname,
-  { allowPrivateNetwork = false, lookup = dns.lookup } = {}
+  { allowPrivateNetwork = false, lookup = dns.lookup, resolveHost = null } = {}
 ) {
   const host = String(hostname || '')
     .toLowerCase()
@@ -92,22 +102,35 @@ async function assertHostnameAllowed(
   if (!host) throw new BrowserPolicyError('URL 缺少主机名')
   if (allowPrivateNetwork) return host
   if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) {
-    throw new BrowserPolicyError('默认禁止访问本地或内网地址')
+    throw new BrowserPolicyError(
+      '默认禁止访问本地或内网地址；如为可信服务，可在「设置 → 内置浏览器」中开启'
+    )
   }
   if (net.isIP(host)) {
-    if (isPrivateIp(host)) throw new BrowserPolicyError('默认禁止访问本地或内网地址')
+    if (isPrivateIp(host)) {
+      throw new BrowserPolicyError(
+        '默认禁止访问本地或内网地址；如为可信服务，可在「设置 → 内置浏览器」中开启'
+      )
+    }
     return host
   }
 
   let addresses
   try {
-    const result = await lookup(host, { all: true, verbatim: true })
-    addresses = Array.isArray(result) ? result : [result]
+    if (resolveHost) {
+      const result = await resolveHost(host)
+      addresses = Array.isArray(result?.endpoints) ? result.endpoints : []
+    } else {
+      const result = await lookup(host, { all: true, verbatim: true })
+      addresses = Array.isArray(result) ? result : [result]
+    }
   } catch {
     throw new BrowserPolicyError('无法解析域名，已阻止导航')
   }
   if (!addresses.length || addresses.some((entry) => isPrivateIp(entry && entry.address))) {
-    throw new BrowserPolicyError('域名解析到本地或内网地址，已阻止导航')
+    throw new BrowserPolicyError(
+      '域名解析到本地或内网地址，已阻止导航；如为可信服务，可在「设置 → 内置浏览器」中开启'
+    )
   }
   return host
 }

@@ -11,6 +11,31 @@ const {
 const USER_PARTITION = 'persist:miniagent-browser'
 const DEFAULT_LOAD_TIMEOUT_MS = 30000
 const DEFAULT_MAX_TABS = 6
+const USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36'
+
+function navigationErrorMessage(error, code, desc) {
+  if (error instanceof BrowserError) return error.message
+  const match = String((error && error.message) || '').match(/ERR_[A-Z_]+/)
+  const key = String((match && match[0]) || code || '')
+  const messages = {
+    ERR_NAME_NOT_RESOLVED: '无法解析域名，请检查网络或 DNS',
+    ERR_NAME_RESOLUTION_FAILED: '无法解析域名，请检查网络或 DNS',
+    ERR_INTERNET_DISCONNECTED: '网络连接已断开，请检查网络',
+    ERR_CONNECTION_REFUSED: '目标服务器拒绝连接',
+    ERR_CONNECTION_TIMED_OUT: '连接目标服务器超时',
+    ERR_CONNECTION_RESET: '与目标服务器的连接已重置',
+    ERR_ADDRESS_UNREACHABLE: '目标服务器地址不可达',
+    ERR_CERT_AUTHORITY_INVALID: '网站证书验证失败，已阻止访问',
+    ERR_CERT_DATE_INVALID: '网站证书已过期或尚未生效',
+    ERR_CERT_COMMON_NAME_INVALID: '网站证书与域名不匹配',
+    ERR_SSL_PROTOCOL_ERROR: '网站 TLS 协议不受支持',
+    ERR_EMPTY_RESPONSE: '目标服务器未返回有效响应',
+    ERR_HTTP_RESPONSE_CODE_FAILURE: '目标服务器返回错误响应'
+  }
+  const message = messages[key] || String(desc || (error && error.message) || '页面加载失败')
+  return key ? `${message} (${key})` : message
+}
 
 class BrowserError extends Error {
   constructor(message, code) {
@@ -274,7 +299,10 @@ function createBrowserService(options = {}) {
     const onTitle = (_event, title) => updateTab(tab, { title: String(title || '') })
     const onFail = (_event, code, desc, url, isMainFrame) => {
       if (!isMainFrame || code === -3) return
-      updateTab(tab, { loading: false, error: `${desc || '页面加载失败'} (${code})` })
+      updateTab(tab, {
+        loading: false,
+        error: navigationErrorMessage(null, code, desc)
+      })
     }
     const onGone = (_event, details) => {
       updateTab(tab, {
@@ -349,6 +377,7 @@ function createBrowserService(options = {}) {
     const wc = view.webContents
     if (!wc || wc.isDestroyed())
       throw new BrowserError('浏览器视图不可用', 'BROWSER_VIEW_UNAVAILABLE')
+    wc.setUserAgent(USER_AGENT)
     const tab = {
       id: idFactory(),
       kind,
@@ -377,10 +406,19 @@ function createBrowserService(options = {}) {
   }
 
   async function navigateTab(tab, rawUrl) {
-    const url = await assertBrowserUrlAllowed(rawUrl, {
-      allowBlank: true,
-      allowPrivateNetwork: allowPrivateNetwork()
-    })
+    let url
+    try {
+      const session = electronApi.session.fromPartition(partitionFor(tab.kind, tab.runId))
+      url = await assertBrowserUrlAllowed(rawUrl, {
+        allowBlank: true,
+        allowPrivateNetwork: allowPrivateNetwork(),
+        resolveHost:
+          typeof session.resolveHost === 'function' ? session.resolveHost.bind(session) : null
+      })
+    } catch (error) {
+      updateTab(tab, { loading: false, error: navigationErrorMessage(error) })
+      throw error
+    }
     if (tab.destroyed || tab.webContents.isDestroyed()) {
       throw new BrowserError('浏览器标签已关闭', 'BROWSER_TAB_NOT_FOUND')
     }
@@ -407,6 +445,7 @@ function createBrowserService(options = {}) {
           // 页面可能已经退出
         }
       }
+      updateTab(tab, { loading: false, error: navigationErrorMessage(error) })
       throw error
     } finally {
       if (timer) clearTimeout(timer)

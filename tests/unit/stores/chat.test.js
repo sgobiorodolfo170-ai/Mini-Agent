@@ -202,12 +202,14 @@ describe('chat store 发送路径', () => {
     const s = useChatStore()
     await s.select('c1')
     s.permission = 'autonomous'
+    s.selectedKbIds = ['kb-project']
     await s.send('帮我建个文件')
     expect(window.api.agent.run).toHaveBeenCalledWith({
       conversationId: 'c1',
       goal: '帮我建个文件',
       permission: 'autonomous',
-      cluster: false
+      cluster: false,
+      kbIds: ['kb-project']
     })
     expect(window.api.chat.send).not.toHaveBeenCalled()
   })

@@ -374,6 +374,34 @@ function defineTools(ctx) {
         return upsertMemoryFile(ctx.memoryPath, name, content)
       }
     },
+    ...(typeof ctx.searchWorkspaceIndex === 'function'
+      ? [
+          {
+            name: 'search_workspace_index',
+            risk: 'readonly',
+            description:
+              '检索当前项目的工作区索引，返回与问题相关的源码或文档片段。需要补充项目背景、定位实现或核对细节时使用。',
+            parameters: {
+              type: 'object',
+              properties: {
+                query: { type: 'string', description: '完整的自然语言检索问题' },
+                k: { type: 'number', description: '返回片段数量，默认 5，最多 10' }
+              },
+              required: ['query']
+            },
+            handler: async ({ query, k }) => {
+              const text = String(query || '').trim()
+              if (!text) throw new Error('检索问题不能为空')
+              const result = await ctx.searchWorkspaceIndex(text, {
+                k: Math.min(10, Math.max(1, Number(k) || 5))
+              })
+              return JSON.stringify(
+                result || { blocks: [], refs: [], warning: '当前项目未启用工作区索引' }
+              )
+            }
+          }
+        ]
+      : []),
     ...[
       [
         'run_dispatch',

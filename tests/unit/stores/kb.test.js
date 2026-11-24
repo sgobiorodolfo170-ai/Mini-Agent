@@ -11,7 +11,7 @@ function stubApi() {
   const list = [kb1, kb2]
   const api = {
     kb: {
-      list: vi.fn(async () => [...list]),
+      list: vi.fn(async () => list.map((kb) => ({ ...kb }))),
       create: vi.fn(async () => {
         const kb = { id: 'kbNew', name: '新库' }
         list.push(kb)
@@ -19,7 +19,7 @@ function stubApi() {
       }),
       update: vi.fn(async () => {}),
       remove: vi.fn(async () => {}),
-      docs: vi.fn(async () => [{ id: 'd1', name: 'doc.md' }]),
+      docs: vi.fn(async () => [{ id: 'd1', name: 'doc.md', chunkCount: 3 }]),
       removeDoc: vi.fn(async () => ({})),
       import: vi.fn(async () => ({})),
       rebuild: vi.fn(async () => ({})),
@@ -51,8 +51,9 @@ describe('kb store 知识库操作', () => {
     await s.load()
     await s.select('kb1')
     expect(s.activeKbId).toBe('kb1')
-    expect(s.docs).toEqual([{ id: 'd1', name: 'doc.md' }])
+    expect(s.docs).toEqual([{ id: 'd1', name: 'doc.md', chunkCount: 3 }])
     expect(s.activeKb.name).toBe('知识库一')
+    expect(s.activeKb.stats).toEqual({ docs: 1, chunks: 3 })
   })
 
   it('create 新建后刷新列表并选中新库', async () => {

@@ -2,7 +2,7 @@ const fs = require('fs')
 const path = require('path')
 
 const { RUN_SCHEMA, recoverRuns } = require('./run-storage')
-const SCHEMA_VERSION = 13
+const SCHEMA_VERSION = 14
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS settings (
@@ -96,6 +96,9 @@ CREATE TABLE IF NOT EXISTS kbs (
   embed_model TEXT,
   embed_quant TEXT,
   dim INTEGER,
+  project_id TEXT,
+  kind TEXT NOT NULL DEFAULT 'document',
+  root_path TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   deleted_at INTEGER
@@ -358,10 +361,25 @@ CREATE INDEX IF NOT EXISTS idx_tool_calls_call ON agent_tool_calls(run_id, call_
         db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
       })
     }
+    if (current < 14) {
+      const { transaction } = require('../main/remote/protocol')
+      transaction(db, () => {
+        if (!columnExists(db, 'kbs', 'project_id')) {
+          db.exec('ALTER TABLE kbs ADD COLUMN project_id TEXT')
+        }
+        if (!columnExists(db, 'kbs', 'kind')) {
+          db.exec("ALTER TABLE kbs ADD COLUMN kind TEXT NOT NULL DEFAULT 'document'")
+        }
+        if (!columnExists(db, 'kbs', 'root_path')) {
+          db.exec('ALTER TABLE kbs ADD COLUMN root_path TEXT')
+        }
+        db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_kbs_project_workspace
+          ON kbs(project_id) WHERE project_id IS NOT NULL AND kind='workspace' AND deleted_at IS NULL`)
+        db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
+      })
+    }
   }
 }
-
-// Singleton DB handle. Backed by globalThis so the instance survives module
 // duplication in test runners (vite-node externalization) — in production the
 // main process is a single realm anyway.
 function open(dbPath) {

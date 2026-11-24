@@ -218,9 +218,11 @@ function registerIpc(ctx) {
   // projects（项目工作目录：会话分类 + Agent 命令执行目录）
   h('projects:list', () => {
     const db = dbm.get()
-    return repos
-      .listProjects(db)
-      .map((p) => ({ ...p, sessionCount: repos.countProjectSessions(db, p.id) }))
+    return repos.listProjects(db).map((p) => ({
+      ...p,
+      sessionCount: repos.countProjectSessions(db, p.id),
+      workspaceIndexKbId: repos.getProjectKb(db, p.id)?.id || null
+    }))
   })
   h('projects:create', (o) => {
     const name = String((o && o.name) || '').trim()
@@ -242,8 +244,10 @@ function registerIpc(ctx) {
       workspaceVerifyCommand: verifyCommand,
       workspaceConflictStrategy: conflictStrategy
     })
+    const workspaceIndex =
+      o && o.createWorkspaceIndex === true ? rag.startProjectIndex({ projectId: r.id }) : null
     broadcast('projects:changed', {})
-    return r
+    return workspaceIndex ? { ...r, workspaceIndex } : r
   })
   h('projects:update', ({ id, patch }) => {
     const db = dbm.get()
@@ -265,13 +269,36 @@ function registerIpc(ctx) {
     }
     const r = repos.updateProject(db, id, patch || {})
     if (!r) throw new Error('项目不存在')
+    if (patch && patch.path !== undefined) {
+      const kb = repos.getProjectKb(db, id)
+      if (kb) {
+        db.prepare('UPDATE kbs SET root_path=?, updated_at=? WHERE id=?').run(
+          r.path,
+          Date.now(),
+          kb.id
+        )
+        rag.startProjectIndex({ projectId: id, rebuild: true })
+      }
+    }
     broadcast('projects:changed', {})
     return r
   })
   h('projects:delete', (id) => {
-    repos.softDeleteProject(dbm.get(), id)
+    const db = dbm.get()
+    const kb = repos.getProjectKb(db, id)
+    if (kb) {
+      faissIndex.invalidate(kb.id)
+      repos.softDeleteKb(db, kb.id)
+      broadcast('kb:changed', { kbId: kb.id })
+    }
+    repos.softDeleteProject(db, id)
     broadcast('projects:changed', {})
     return true
+  })
+  h('projects:index', ({ projectId, rebuild = false } = {}) => {
+    const result = rag.startProjectIndex({ projectId, rebuild: !!rebuild })
+    broadcast('projects:changed', {})
+    return result
   })
 
   // chat
@@ -356,6 +383,7 @@ function registerIpc(ctx) {
   h('kb:delete', (id) => {
     faissIndex.invalidate(id)
     repos.softDeleteKb(dbm.get(), id)
+    broadcast('kb:changed', { kbId: id })
     return true
   })
 
@@ -379,8 +407,8 @@ function registerIpc(ctx) {
   })
 
   // agent
-  h('agent:run', ({ conversationId, goal, permission, cluster }) =>
-    agent.startAgentRun({ conversationId, goal, permission, cluster })
+  h('agent:run', ({ conversationId, goal, permission, cluster, kbIds }) =>
+    agent.startAgentRun({ conversationId, goal, permission, cluster, kbIds })
   )
   h('agent:status', (id) => agent.getRunStatus(id))
   h('agent:result', ({ runId, maxChars }) => agent.getRunResult(runId, maxChars))

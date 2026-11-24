@@ -33,6 +33,13 @@ export const useKbStore = defineStore('kb', {
     async select(id) {
       this.activeKbId = id
       this.docs = await window.api.kb.docs(id)
+      const active = this.kbs.find((k) => k.id === id)
+      if (active) {
+        active.stats = {
+          docs: this.docs.length,
+          chunks: this.docs.reduce((sum, doc) => sum + Number(doc.chunkCount || 0), 0)
+        }
+      }
       this.searchResults = []
       this.lastSearch = null
     },

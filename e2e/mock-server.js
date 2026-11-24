@@ -7,7 +7,7 @@ function vectorFor(text) {
   const t = String(text)
   const h = crypto.createHash('sha1').update(t).digest()
   const base = [h[0] / 255, h[1] / 255, h[2] / 255, h[3] / 255]
-  base[0] = t.includes('E2EKB') ? 1 : base[0] * 0.2
+  base[0] = t.includes('E2EKB') || t.includes('WORKSPACE_INDEX_MARKER') ? 1 : base[0] * 0.2
   return base
 }
 
@@ -325,6 +325,15 @@ export function createMockServer() {
             return
           }
           replyFinal('浏览器任务完成。')
+          return
+        }
+        if (body.tools && sysText.includes('WORKSPACE_INDEX_MARKER')) {
+          sse(res, [
+            JSON.stringify({
+              choices: [{ index: 0, delta: { content: '已根据项目工作区索引回答。' } }]
+            }),
+            JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })
+          ])
           return
         }
         if (body.tools && body.tools.length && !hasToolResult) {

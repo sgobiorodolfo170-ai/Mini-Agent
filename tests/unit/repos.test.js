@@ -8,10 +8,10 @@ beforeEach(() => {
 })
 
 describe('schema + settings', () => {
-  it('migrates to v10 and roundtrips settings', () => {
+  it('migrates to the current schema and roundtrips settings', () => {
     const row = dbm.get().prepare('PRAGMA user_version').get()
     expect(row.user_version).toBe(dbm.SCHEMA_VERSION)
-    expect(dbm.SCHEMA_VERSION).toBe(13)
+    expect(dbm.SCHEMA_VERSION).toBe(14)
     repos.setSetting(dbm.get(), 'theme', 'dark')
     repos.setSetting(dbm.get(), 'agentAuthorizedDirs', ['C:\\a', 'C:\\b'])
     expect(repos.getSetting(dbm.get(), 'theme')).toBe('dark')
@@ -293,6 +293,37 @@ describe('projects + conversation categorization', () => {
 })
 
 describe('kb storage', () => {
+  it('每个项目最多有一个工作区索引，并与普通知识库隔离', () => {
+    const db = dbm.get()
+    const project = repos.createProject(db, { name: '项目', path: 'C:\\work' })
+    const kb = repos.createKb(db, {
+      name: '项目 · 工作区索引',
+      projectId: project.id,
+      kind: 'workspace',
+      rootPath: project.path,
+      embedSource: 'local',
+      embedModel: 'bge-small-zh-v1.5',
+      embedQuant: 'int8'
+    })
+    expect(repos.getProjectKb(db, project.id)).toMatchObject({
+      id: kb.id,
+      projectId: project.id,
+      kind: 'workspace',
+      rootPath: 'C:\\work'
+    })
+    expect(repos.listKbs(db)[0].kind).toBe('workspace')
+    expect(() =>
+      repos.createKb(db, {
+        name: '重复索引',
+        projectId: project.id,
+        kind: 'workspace',
+        rootPath: project.path
+      })
+    ).toThrow(/UNIQUE/)
+    repos.softDeleteKb(db, kb.id)
+    expect(repos.getProjectKb(db, project.id)).toBeUndefined()
+  })
+
   it('stores chunks with float32 embeddings and joins chunk text', () => {
     const db = dbm.get()
     const kb = repos.createKb(db, {

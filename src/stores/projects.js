@@ -28,6 +28,9 @@ export const useProjectsStore = defineStore('projects', {
     async remove(id) {
       await window.api.projects.remove(id)
       await this.load()
+    },
+    createIndex(id, rebuild = true) {
+      return window.api.projects.createIndex({ projectId: id, rebuild })
     }
   }
 })

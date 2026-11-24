@@ -217,6 +217,7 @@ const showProjectDialog = ref(false)
 const projectName = ref('')
 const projectPath = ref('')
 const projectWorktree = ref(true)
+const projectCreateIndex = ref(true)
 const projectAutoMerge = ref(true)
 const projectVerifyCommand = ref('')
 const projectConflictStrategy = ref('manual')
@@ -225,6 +226,7 @@ function openProjectDialog() {
   projectName.value = ''
   projectPath.value = ''
   projectWorktree.value = true
+  projectCreateIndex.value = true
   projectAutoMerge.value = true
   projectVerifyCommand.value = ''
   projectConflictStrategy.value = 'manual'
@@ -247,11 +249,19 @@ async function submitProject() {
       workspaceMode: projectWorktree.value ? 'worktree' : 'shared',
       workspaceAutoMerge: projectAutoMerge.value,
       workspaceVerifyCommand: projectVerifyCommand.value.trim(),
-      workspaceConflictStrategy: projectConflictStrategy.value
+      workspaceConflictStrategy: projectConflictStrategy.value,
+      createWorkspaceIndex: projectCreateIndex.value
     })
     showProjectDialog.value = false
     collapsedProjects.value[p.id] = false
-    ui.toast('项目已添加，新建会话将归入该项目', 'success')
+    ui.toast(
+      p.workspaceIndex?.error
+        ? '项目已添加，但工作区索引不可用：' + p.workspaceIndex.error
+        : p.workspaceIndex?.started
+          ? '项目已添加，正在后台创建工作区索引'
+          : '项目已添加，新建会话将归入该项目',
+      p.workspaceIndex?.error ? 'warn' : 'success'
+    )
   } catch (e) {
     ui.toast('添加项目失败：' + String((e && e.message) || e), 'error')
   } finally {
@@ -276,6 +286,17 @@ function onProjectRenameKeydown(e) {
 }
 async function createInProject(p) {
   await chat.create({ projectId: p.id })
+}
+async function rebuildProjectIndex(p) {
+  try {
+    const result = await projects.createIndex(p.id, true)
+    ui.toast(
+      result.error ? '工作区索引不可用：' + result.error : '正在重建工作区索引',
+      result.error ? 'warn' : 'success'
+    )
+  } catch (e) {
+    ui.toast('重建工作区索引失败：' + String((e && e.message) || e), 'error')
+  }
 }
 async function removeProject(p) {
   const ok = await ui.confirm({
@@ -384,6 +405,12 @@ function projectMenuItems(p) {
       label: p.pinned ? '取消置顶' : '置顶',
       icon: 'pin',
       onSelect: () => projects.update(p.id, { pinned: p.pinned ? 0 : 1 })
+    },
+    {
+      id: 'workspaceIndex',
+      label: p.workspaceIndexKbId ? '重建工作区索引' : '创建工作区索引',
+      icon: 'refresh',
+      onSelect: () => rebuildProjectIndex(p)
     },
     {
       id: 'remove',
@@ -939,251 +966,255 @@ function startBrowserResize(e) {
         class="flex-1 min-w-0 flex flex-col m-3 chat-surface overflow-hidden"
         data-testid="chat-main"
       >
-      <!-- 页头：列表开关 / 标题 / 生效模型 / 更多（设置入口统一在侧栏「设置」） -->
-      <header class="shrink-0 h-14 flex items-center gap-2 px-4 bg-surface">
-        <button
-          class="icon-btn"
-          :title="ui.chatListVisible ? '收起列表' : '展开列表'"
-          :aria-label="ui.chatListVisible ? '收起会话列表' : '展开会话列表'"
-          @click="ui.toggleChatList()"
-        >
-          <UiIcon :name="ui.chatListVisible ? 'panelLeft' : 'panelLeft'" :size="18" />
-        </button>
-        <div class="min-w-0 flex-1">
-          <div class="flex items-center gap-2 min-w-0">
-            <h1 class="text-sm font-semibold truncate" :title="conv ? conv.title : '未选择会话'">
-              {{ conv ? conv.title : '未选择会话' }}
-            </h1>
-          </div>
-          <div class="text-xs text-ink-muted truncate">
-            <template v-if="!hasService">尚未配置服务</template>
-            <template v-else-if="!conv">—</template>
-            <template v-else>
-              {{ activeProvider ? activeProvider.name : '默认服务' }}
-              <template v-if="activeModelId"> / {{ activeModelId }}</template>
-            </template>
-          </div>
-        </div>
-        <button v-if="!hasService" class="btn-secondary !h-8 text-xs" @click="ui.view = 'settings'">
-          配置服务
-        </button>
-        <div class="relative">
+        <!-- 页头：列表开关 / 标题 / 生效模型 / 更多（设置入口统一在侧栏「设置」） -->
+        <header class="shrink-0 h-14 flex items-center gap-2 px-4 bg-surface">
           <button
             class="icon-btn"
-            title="更多操作"
-            aria-label="更多操作"
-            :aria-expanded="showMoreMenu"
-            :disabled="!conv"
-            @click="showMoreMenu = !showMoreMenu"
+            :title="ui.chatListVisible ? '收起列表' : '展开列表'"
+            :aria-label="ui.chatListVisible ? '收起会话列表' : '展开会话列表'"
+            @click="ui.toggleChatList()"
           >
-            <UiIcon name="more" :size="18" />
+            <UiIcon :name="ui.chatListVisible ? 'panelLeft' : 'panelLeft'" :size="18" />
           </button>
+          <div class="min-w-0 flex-1">
+            <div class="flex items-center gap-2 min-w-0">
+              <h1 class="text-sm font-semibold truncate" :title="conv ? conv.title : '未选择会话'">
+                {{ conv ? conv.title : '未选择会话' }}
+              </h1>
+            </div>
+            <div class="text-xs text-ink-muted truncate">
+              <template v-if="!hasService">尚未配置服务</template>
+              <template v-else-if="!conv">—</template>
+              <template v-else>
+                {{ activeProvider ? activeProvider.name : '默认服务' }}
+                <template v-if="activeModelId"> / {{ activeModelId }}</template>
+              </template>
+            </div>
+          </div>
+          <button
+            v-if="!hasService"
+            class="btn-secondary !h-8 text-xs"
+            @click="ui.view = 'settings'"
+          >
+            配置服务
+          </button>
+          <div class="relative">
+            <button
+              class="icon-btn"
+              title="更多操作"
+              aria-label="更多操作"
+              :aria-expanded="showMoreMenu"
+              :disabled="!conv"
+              @click="showMoreMenu = !showMoreMenu"
+            >
+              <UiIcon name="more" :size="18" />
+            </button>
+            <div
+              v-if="showMoreMenu"
+              class="absolute right-0 top-10 z-30 w-36 rounded-xl border border-line-subtle bg-elevated shadow-menu py-1"
+              role="menu"
+            >
+              <button
+                class="w-full flex items-center gap-2 px-3 h-9 text-sm hover:bg-subtle"
+                role="menuitem"
+                @click="exportConv('md')"
+              >
+                <UiIcon name="export" :size="16" /> 导出 MD
+              </button>
+              <button
+                class="w-full flex items-center gap-2 px-3 h-9 text-sm hover:bg-subtle"
+                role="menuitem"
+                @click="exportConv('json')"
+              >
+                <UiIcon name="export" :size="16" /> 导出 JSON
+              </button>
+            </div>
+          </div>
+          <button
+            class="icon-btn"
+            :class="ui.browserPanelOpen ? 'text-brand-ink bg-brand-soft' : ''"
+            :title="ui.browserPanelOpen ? '折叠内置浏览器' : '展开内置浏览器'"
+            :aria-label="ui.browserPanelOpen ? '折叠内置浏览器' : '展开内置浏览器'"
+            :aria-pressed="ui.browserPanelOpen"
+            data-testid="chat-browser-panel-toggle"
+            @click="toggleBrowserPanel"
+          >
+            <UiIcon name="panelRight" :size="18" />
+          </button>
+        </header>
+
+        <!-- 消息区：单滚动容器 + 回到底部（F14） -->
+        <div class="relative flex-1 min-h-0 bg-surface">
+          <!-- 提示词定位柱：横向柱形列表，垂直居中 -->
           <div
-            v-if="showMoreMenu"
-            class="absolute right-0 top-10 z-30 w-36 rounded-xl border border-line-subtle bg-elevated shadow-menu py-1"
-            role="menu"
+            v-if="promptMarkers.length"
+            class="absolute left-1 top-1/2 z-10 flex -translate-y-1/2 flex-col gap-1.5"
+            aria-label="提示词定位"
           >
             <button
-              class="w-full flex items-center gap-2 px-3 h-9 text-sm hover:bg-subtle"
-              role="menuitem"
-              @click="exportConv('md')"
-            >
-              <UiIcon name="export" :size="16" /> 导出 MD
-            </button>
-            <button
-              class="w-full flex items-center gap-2 px-3 h-9 text-sm hover:bg-subtle"
-              role="menuitem"
-              @click="exportConv('json')"
-            >
-              <UiIcon name="export" :size="16" /> 导出 JSON
-            </button>
-          </div>
-        </div>
-        <button
-          class="icon-btn"
-          :class="ui.browserPanelOpen ? 'text-brand-ink bg-brand-soft' : ''"
-          :title="ui.browserPanelOpen ? '折叠内置浏览器' : '展开内置浏览器'"
-          :aria-label="ui.browserPanelOpen ? '折叠内置浏览器' : '展开内置浏览器'"
-          :aria-pressed="ui.browserPanelOpen"
-          data-testid="chat-browser-panel-toggle"
-          @click="toggleBrowserPanel"
-        >
-          <UiIcon name="panelRight" :size="18" />
-        </button>
-      </header>
-
-      <!-- 消息区：单滚动容器 + 回到底部（F14） -->
-      <div class="relative flex-1 min-h-0 bg-surface">
-        <!-- 提示词定位柱：横向柱形列表，垂直居中 -->
-        <div
-          v-if="promptMarkers.length"
-          class="absolute left-1 top-1/2 z-10 flex -translate-y-1/2 flex-col gap-1.5"
-          aria-label="提示词定位"
-        >
-          <button
-            v-for="m in promptMarkers"
-            :key="m.id"
-            type="button"
-            class="h-[3px] w-3 rounded-full bg-violet-300 transition-all hover:w-5 hover:bg-violet-400 dark:bg-violet-500/60 dark:hover:bg-violet-400"
-            :title="'定位提示词：' + (m.content || '').slice(0, 30)"
-            aria-label="定位到提示词"
-            @click="scrollToPrompt(m.id)"
-          />
-        </div>
-        <div
-          ref="scrollEl"
-          class="absolute inset-0 overflow-y-auto px-4 md:px-6 py-4 bg-surface"
-          @scroll.passive="onScroll"
-        >
-          <div class="max-w-[840px] mx-auto w-full space-y-4">
-            <!-- 空态（F12）：无服务给配置清单，有服务给开始入口 -->
-            <div
-              v-if="!chat.activeId"
-              class="h-full min-h-[280px] flex items-center justify-center"
-            >
-              <div v-if="!hasService" class="card max-w-sm w-full p-5">
-                <h2 class="text-base font-semibold mb-1">先连接模型服务</h2>
-                <p class="text-xs text-ink-muted mb-4">完成三步即可开始提问，配置只需一次。</p>
-                <ol class="space-y-2.5 text-sm text-ink-secondary mb-4">
-                  <li class="flex items-center gap-2">
-                    <span
-                      class="w-5 h-5 rounded-full bg-brand-soft text-brand-ink text-xs flex items-center justify-center shrink-0"
-                      >1</span
-                    >
-                    添加供应商并填写服务地址
-                  </li>
-                  <li class="flex items-center gap-2">
-                    <span
-                      class="w-5 h-5 rounded-full bg-brand-soft text-brand-ink text-xs flex items-center justify-center shrink-0"
-                      >2</span
-                    >
-                    添加 API Key
-                  </li>
-                  <li class="flex items-center gap-2">
-                    <span
-                      class="w-5 h-5 rounded-full bg-brand-soft text-brand-ink text-xs flex items-center justify-center shrink-0"
-                      >3</span
-                    >
-                    选择默认模型，返回开始对话
-                  </li>
-                </ol>
-                <button
-                  class="btn-primary w-full"
-                  data-testid="empty-goto-settings"
-                  @click="ui.view = 'settings'"
-                >
-                  配置服务
-                </button>
-              </div>
-              <div v-else class="text-center">
-                <div class="text-base text-ink-secondary mb-3">开始一段新会话</div>
-                <button class="btn-primary" @click="chat.create()">新建会话</button>
-                <div class="mt-3 text-xs text-ink-muted">也可以按 Alt+Space 快速提问</div>
-              </div>
-            </div>
-            <MessageItem
-              v-for="(m, i) in chat.messages"
+              v-for="m in promptMarkers"
               :key="m.id"
-              :msg="m"
-              :is-last="i === chat.messages.length - 1"
+              type="button"
+              class="h-[3px] w-3 rounded-full bg-violet-300 transition-all hover:w-5 hover:bg-violet-400 dark:bg-violet-500/60 dark:hover:bg-violet-400"
+              :title="'定位提示词：' + (m.content || '').slice(0, 30)"
+              aria-label="定位到提示词"
+              @click="scrollToPrompt(m.id)"
             />
           </div>
-        </div>
-        <button
-          v-if="!stickBottom"
-          class="absolute bottom-4 left-1/2 -translate-x-1/2 btn-secondary !h-8 shadow-menu text-xs"
-          @click="backToBottom"
-        >
-          <UiIcon name="arrowDown" :size="14" />
-          回到底部
-        </button>
-      </div>
-
-      <!-- 输入区（AgentComposer）：状态徽标 + 单张白卡（上层输入 / 下层操作栏） -->
-      <div class="shrink-0 px-6 pb-5 pt-3 bg-surface">
-        <div class="mx-auto w-full" style="max-width: 1136px">
-          <AgentComposer
-            :variant="composerVariant"
-            :placeholder="composerPlaceholder"
-            :hint="composerHint"
-            :value="input"
-            :submitting="sending"
-            :streaming="chat.hasStreaming"
-            :model="composerModel"
-            :model-groups="modelGroups"
-            :status-items="composerStatusItems"
-            :mode-action="modeAction"
-            :context-action="contextAction"
-            :add-action="addAction"
-            :cluster-action="clusterAction"
-            :context-usage="contextUsage"
-            :runtime-state="runtimeState"
-            :optimizing="optimizing"
-            :send-label="chat.agentMode ? '开始任务' : '发送'"
-            @update:value="input = $event"
-            @submit="send"
-            @optimize="optimizePrompt"
-            @stop="stopComposer"
-            @add="addAttachment"
-            @context="showKbPopover = !showKbPopover"
-            @toggle-cluster="toggleCluster"
-            @select-mode="selectMode"
-            @select-model="selectModel"
-            @status-select="openRun"
+          <div
+            ref="scrollEl"
+            class="absolute inset-0 overflow-y-auto px-4 md:px-6 py-4 bg-surface"
+            @scroll.passive="onScroll"
           >
-            <template #attachment>
+            <div class="max-w-[840px] mx-auto w-full space-y-4">
+              <!-- 空态（F12）：无服务给配置清单，有服务给开始入口 -->
               <div
-                v-if="ui.pendingAttachment"
-                class="mb-2 flex items-center gap-2 text-xs"
-                data-testid="composer-attachment"
+                v-if="!chat.activeId"
+                class="h-full min-h-[280px] flex items-center justify-center"
               >
-                <img
-                  :src="ui.pendingAttachment"
-                  class="h-10 rounded-lg border border-line-subtle"
-                  alt="截图附件"
-                />
-                <span class="text-ink-secondary">截图附件</span>
-                <button class="text-link hover:underline" @click="ui.pendingAttachment = null">
-                  移除
-                </button>
-              </div>
-            </template>
-            <template #context-panel>
-              <div
-                v-if="showKbPopover"
-                ref="kbPopoverEl"
-                class="ac-menu ac-menu--left w-72 !max-w-[calc(100vw-48px)]"
-                role="group"
-                aria-label="选择知识库"
-              >
-                <div v-if="!kb.kbs.length" class="ac-menu__empty">
-                  还没有知识库，到「知识库」页创建
+                <div v-if="!hasService" class="card max-w-sm w-full p-5">
+                  <h2 class="text-base font-semibold mb-1">先连接模型服务</h2>
+                  <p class="text-xs text-ink-muted mb-4">完成三步即可开始提问，配置只需一次。</p>
+                  <ol class="space-y-2.5 text-sm text-ink-secondary mb-4">
+                    <li class="flex items-center gap-2">
+                      <span
+                        class="w-5 h-5 rounded-full bg-brand-soft text-brand-ink text-xs flex items-center justify-center shrink-0"
+                        >1</span
+                      >
+                      添加供应商并填写服务地址
+                    </li>
+                    <li class="flex items-center gap-2">
+                      <span
+                        class="w-5 h-5 rounded-full bg-brand-soft text-brand-ink text-xs flex items-center justify-center shrink-0"
+                        >2</span
+                      >
+                      添加 API Key
+                    </li>
+                    <li class="flex items-center gap-2">
+                      <span
+                        class="w-5 h-5 rounded-full bg-brand-soft text-brand-ink text-xs flex items-center justify-center shrink-0"
+                        >3</span
+                      >
+                      选择默认模型，返回开始对话
+                    </li>
+                  </ol>
+                  <button
+                    class="btn-primary w-full"
+                    data-testid="empty-goto-settings"
+                    @click="ui.view = 'settings'"
+                  >
+                    配置服务
+                  </button>
                 </div>
-                <label
-                  v-for="k in kb.kbs"
-                  :key="k.id"
-                  class="ac-menu__item cursor-pointer items-center"
-                >
-                  <input
-                    type="checkbox"
-                    :checked="chat.selectedKbIds.includes(k.id)"
-                    @change="toggleKb(k.id)"
-                  />
-                  <span class="ac-menu__text">
-                    <span class="ac-menu__label">{{ k.name }}</span>
-                    <span v-if="k.stats" class="ac-menu__hint">
-                      {{ k.stats.docs }} 文档 · {{ k.stats.chunks }} 分块
-                    </span>
-                  </span>
-                </label>
+                <div v-else class="text-center">
+                  <div class="text-base text-ink-secondary mb-3">开始一段新会话</div>
+                  <button class="btn-primary" @click="chat.create()">新建会话</button>
+                  <div class="mt-3 text-xs text-ink-muted">也可以按 Alt+Space 快速提问</div>
+                </div>
               </div>
-            </template>
-          </AgentComposer>
-          <p v-if="kbNames.length" class="mt-2 px-1 text-xs text-ink-muted">
-            将检索：{{ kbNames.join('、') }}
-          </p>
+              <MessageItem
+                v-for="(m, i) in chat.messages"
+                :key="m.id"
+                :msg="m"
+                :is-last="i === chat.messages.length - 1"
+              />
+            </div>
+          </div>
+          <button
+            v-if="!stickBottom"
+            class="absolute bottom-4 left-1/2 -translate-x-1/2 btn-secondary !h-8 shadow-menu text-xs"
+            @click="backToBottom"
+          >
+            <UiIcon name="arrowDown" :size="14" />
+            回到底部
+          </button>
         </div>
-      </div>
+
+        <!-- 输入区（AgentComposer）：状态徽标 + 单张白卡（上层输入 / 下层操作栏） -->
+        <div class="shrink-0 px-6 pb-5 pt-3 bg-surface">
+          <div class="mx-auto w-full" style="max-width: 1136px">
+            <AgentComposer
+              :variant="composerVariant"
+              :placeholder="composerPlaceholder"
+              :hint="composerHint"
+              :value="input"
+              :submitting="sending"
+              :streaming="chat.hasStreaming"
+              :model="composerModel"
+              :model-groups="modelGroups"
+              :status-items="composerStatusItems"
+              :mode-action="modeAction"
+              :context-action="contextAction"
+              :add-action="addAction"
+              :cluster-action="clusterAction"
+              :context-usage="contextUsage"
+              :runtime-state="runtimeState"
+              :optimizing="optimizing"
+              :send-label="chat.agentMode ? '开始任务' : '发送'"
+              @update:value="input = $event"
+              @submit="send"
+              @optimize="optimizePrompt"
+              @stop="stopComposer"
+              @add="addAttachment"
+              @context="showKbPopover = !showKbPopover"
+              @toggle-cluster="toggleCluster"
+              @select-mode="selectMode"
+              @select-model="selectModel"
+              @status-select="openRun"
+            >
+              <template #attachment>
+                <div
+                  v-if="ui.pendingAttachment"
+                  class="mb-2 flex items-center gap-2 text-xs"
+                  data-testid="composer-attachment"
+                >
+                  <img
+                    :src="ui.pendingAttachment"
+                    class="h-10 rounded-lg border border-line-subtle"
+                    alt="截图附件"
+                  />
+                  <span class="text-ink-secondary">截图附件</span>
+                  <button class="text-link hover:underline" @click="ui.pendingAttachment = null">
+                    移除
+                  </button>
+                </div>
+              </template>
+              <template #context-panel>
+                <div
+                  v-if="showKbPopover"
+                  ref="kbPopoverEl"
+                  class="ac-menu ac-menu--left w-72 !max-w-[calc(100vw-48px)]"
+                  role="group"
+                  aria-label="选择知识库"
+                >
+                  <div v-if="!kb.kbs.length" class="ac-menu__empty">
+                    还没有知识库，到「知识库」页创建
+                  </div>
+                  <label
+                    v-for="k in kb.kbs"
+                    :key="k.id"
+                    class="ac-menu__item cursor-pointer items-center"
+                  >
+                    <input
+                      type="checkbox"
+                      :checked="chat.selectedKbIds.includes(k.id)"
+                      @change="toggleKb(k.id)"
+                    />
+                    <span class="ac-menu__text">
+                      <span class="ac-menu__label">{{ k.name }}</span>
+                      <span v-if="k.stats" class="ac-menu__hint">
+                        {{ k.stats.docs }} 文档 · {{ k.stats.chunks }} 分块
+                      </span>
+                    </span>
+                  </label>
+                </div>
+              </template>
+            </AgentComposer>
+            <p v-if="kbNames.length" class="mt-2 px-1 text-xs text-ink-muted">
+              将检索：{{ kbNames.join('、') }}
+            </p>
+          </div>
+        </div>
       </section>
 
       <div
@@ -1284,6 +1315,20 @@ function startBrowserResize(e) {
             </label>
           </div>
         </label>
+        <div class="rounded-xl border border-line-subtle bg-subtle/40 p-3">
+          <label class="flex items-center gap-2 cursor-pointer">
+            <input
+              v-model="projectCreateIndex"
+              type="checkbox"
+              data-testid="project-workspace-index"
+              class="accent-brand-ink"
+            />
+            <span class="text-sm font-medium">创建工作区索引</span>
+          </label>
+          <p class="field-help mt-1.5">
+            建立工作区索引可增强上下文理解能力，从而提升智能体回复准确性。
+          </p>
+        </div>
         <label v-if="projectWorktree && projectAutoMerge" class="block">
           <span class="field-label">合并验收命令（可选）</span>
           <input

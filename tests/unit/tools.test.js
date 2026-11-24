@@ -41,6 +41,13 @@ beforeAll(() => {
     },
     tavilyKey: '',
     webSearchProvider: 'auto',
+    searchWorkspaceIndex: async (query, options) => ({
+      kbId: 'kb-project',
+      blocks: [{ n: 1, title: 'src/app.ts', text: query, score: 0.9 }],
+      refs: [],
+      warning: null,
+      options
+    }),
     // 会话管理：这里用最小替身，验证工具层的参数归一与委派，真实行为由 agent-sessions 覆盖
     createSession: async ({ title, goal }) => ({
       id: 'c-new',
@@ -67,6 +74,18 @@ beforeAll(() => {
 
 afterAll(() => {
   fs.rmSync(dir, { recursive: true, force: true })
+})
+
+describe('workspace index tool', () => {
+  it('按需检索项目索引并限制返回条数', async () => {
+    expect(map.search_workspace_index.risk).toBe('readonly')
+    const result = JSON.parse(
+      await map.search_workspace_index.handler({ query: '登录流程', k: 100 })
+    )
+    expect(result.blocks[0]).toMatchObject({ title: 'src/app.ts', text: '登录流程' })
+    expect(result.options.k).toBe(10)
+    await expect(map.search_workspace_index.handler({ query: '' })).rejects.toThrow('不能为空')
+  })
 })
 
 describe('file tools honor the authorized-directory guard', () => {

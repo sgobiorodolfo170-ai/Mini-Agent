@@ -85,6 +85,55 @@ describe('sendChat 全链路', () => {
     ).toBe(true)
   })
 
+  it('项目会话自动检索工作区索引，无需手动选库', async () => {
+    const { convId, pid } = seed()
+    const db = dbm.get()
+    const project = repos.createProject(db, { name: '项目', path: 'C:\\work' })
+    repos.updateConversation(db, convId, { projectId: project.id })
+    const kb = repos.createKb(db, {
+      name: '项目 · 工作区索引',
+      projectId: project.id,
+      kind: 'workspace',
+      rootPath: project.path,
+      embedProviderId: pid,
+      embedModel: 'emb-1'
+    })
+    const docId = repos.insertDoc(db, {
+      kbId: kb.id,
+      path: 'C:\\work\\README.md',
+      title: 'README.md',
+      hash: 'workspace-readme',
+      size: 20
+    })
+    repos.insertChunks(db, docId, kb.id, [
+      { seq: 0, text: 'PROJECT_KB_MARKER', vector: Float32Array.from([1, 0]) }
+    ])
+    repos.updateDocStatus(db, docId, { status: 'ready', chunkCount: 1 })
+    let payload
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, options) => {
+      if (String(url).endsWith('/embeddings')) {
+        return {
+          ok: true,
+          json: async () => ({ data: [{ index: 0, embedding: [1, 0] }] })
+        }
+      }
+      payload = JSON.parse(options.body)
+      return sseRes([
+        'data: {"choices":[{"delta":{"content":"项目回答"}}]}\n\n',
+        'data: [DONE]\n\n'
+      ])
+    })
+    const result = await gateway.sendChat({
+      conversationId: convId,
+      content: '项目内容是什么',
+      kbIds: []
+    })
+    expect(await waitFor(() => doneOf(result.assistantMsgId))).toBe(true)
+    expect(payload.messages.some((message) => message.content.includes('PROJECT_KB_MARKER'))).toBe(
+      true
+    )
+  })
+
   it('429 自动切换下一把 Key 并完成回答', async () => {
     const { convId, pid } = seed()
     const auths = []

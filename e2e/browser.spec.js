@@ -334,10 +334,28 @@ describe('内置浏览器 P6 韧性与可观测性', () => {
     )
 
     await win.evaluate(() => window.api.settings.set('browserAllowPrivateNetwork', true))
+    await win.getByTestId('browser-retry').click()
+    await waitFor(async () =>
+      (await readGuestBody(electronApp, pageUrl))?.includes('内置浏览器测试页')
+    )
+
+    await win.getByTestId('browser-address').fill('not a url')
+    await win.getByTestId('browser-go').click()
+    await win.getByTestId('browser-error').waitFor()
+    expect(await win.getByTestId('browser-error').textContent()).toContain('URL 格式无效')
+
+    await win.getByTestId('browser-address').fill('http://127.0.0.1:65534/')
+    await win.getByTestId('browser-go').click()
+    await waitFor(async () =>
+      (await win.getByTestId('browser-error').textContent()).includes('拒绝连接')
+    )
+
+    await win.getByTestId('browser-address').fill(pageUrl)
     await win.getByTestId('browser-go').click()
     await waitFor(async () =>
       (await readGuestBody(electronApp, pageUrl))?.includes('内置浏览器测试页')
     )
+    await win.getByTestId('browser-error').waitFor({ state: 'detached' })
 
     await win.evaluate(() => window.api.browser.setEnabled(false))
     await win.getByTestId('browser-enable').waitFor()
@@ -348,6 +366,42 @@ describe('内置浏览器 P6 韧性与可观测性', () => {
     )
     expect(unexpectedErrors(consoleErrors)).toEqual([])
   })
+})
+
+describe.skipIf(process.env.MINIAGENT_E2E_PUBLIC_BROWSER !== '1')('真实公网网站验收', () => {
+  it('支持裸域名并打开常见公网网站', async () => {
+    const { electronApp, win } = ctx
+    await win.getByTestId('nav-browser').click()
+    await win.getByTestId('browser-view').waitFor()
+    await waitFor(
+      async () => (await win.evaluate(() => window.api.browser.state())).tabs.length === 1
+    )
+
+    for (const [input, origin] of [
+      ['example.com', 'https://example.com/'],
+      ['https://www.baidu.com/', 'https://www.baidu.com/']
+    ]) {
+      await win.getByTestId('browser-address').fill(input)
+      await win.getByTestId('browser-go').click()
+      await waitFor(async () => {
+        const state = await win.evaluate(() => window.api.browser.state())
+        const tab = state.tabs.find((item) => item.id === state.activeTabId)
+        return tab && tab.url.startsWith(origin) && !tab.loading && !tab.error
+      }, 30000)
+      const guest = await electronApp.evaluate(({ webContents }, target) => {
+        const contents = webContents
+          .getAllWebContents()
+          .find((item) => !item.isDestroyed() && item.getURL().startsWith(target))
+        if (!contents) return null
+        return contents.executeJavaScript(
+          '({title: document.title, text: document.body ? document.body.innerText.slice(0, 200) : ""})'
+        )
+      }, origin)
+      expect(guest).toBeTruthy()
+      expect(guest.title).toBeTruthy()
+      expect(guest.text.length).toBeGreaterThan(0)
+    }
+  }, 90000)
 })
 
 describe('聊天右侧内置浏览器侧栏', () => {
