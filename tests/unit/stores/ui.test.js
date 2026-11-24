@@ -181,4 +181,40 @@ describe('ui store 会话布局偏好与确认（F01/F04/F22）', () => {
     expect(s.chatListVisible).toBe(false)
     expect(window.api.settings.set).toHaveBeenCalledWith('chatListVisible', false)
   })
+
+  it('init 读取浏览器侧栏偏好，宽度夹取到 360–720', async () => {
+    window.api.settings.get.mockImplementation(
+      async (k) =>
+        ({
+          browserPanelOpen: true,
+          browserPanelWidth: 999
+        })[k] ?? null
+    )
+    const s = useUiStore()
+    await s.init()
+    expect(s.browserPanelOpen).toBe(true)
+    expect(s.browserPanelWidth).toBe(720)
+    s.setBrowserPanelWidth(100)
+    expect(s.browserPanelWidth).toBe(360)
+    expect(window.api.settings.set).toHaveBeenCalledWith('browserPanelWidth', 360)
+  })
+
+  it('拖动过程中不逐帧写设置，结束后再持久化', async () => {
+    const s = useUiStore()
+    await s.init()
+    window.api.settings.set.mockClear()
+    s.setBrowserPanelWidth(520, false)
+    expect(s.browserPanelWidth).toBe(520)
+    expect(window.api.settings.set).not.toHaveBeenCalled()
+    s.setBrowserPanelWidth(560)
+    expect(window.api.settings.set).toHaveBeenCalledWith('browserPanelWidth', 560)
+  })
+
+  it('toggleBrowserPanel 持久化展开状态', async () => {
+    const s = useUiStore()
+    await s.init()
+    s.toggleBrowserPanel()
+    expect(s.browserPanelOpen).toBe(true)
+    expect(window.api.settings.set).toHaveBeenCalledWith('browserPanelOpen', true)
+  })
 })

@@ -6,6 +6,7 @@ import UiDialog from '../components/UiDialog.vue'
 import ConvRow from '../components/ConvRow.vue'
 import RowMenu from '../components/RowMenu.vue'
 import AgentComposer from '../components/composer/AgentComposer.vue'
+import BrowserView from './BrowserView.vue'
 import { useAgentStore } from '../stores/agent'
 import { useChatStore } from '../stores/chat'
 import { useSettingsStore } from '../stores/settings'
@@ -35,6 +36,16 @@ const optimizing = ref(false)
 const pinnedCollapsed = ref(false)
 const projectsCollapsed = ref(false)
 const recentCollapsed = ref(false)
+const workspaceWidth = ref(window.innerWidth)
+const browserPanelMaxWidth = computed(() =>
+  Math.max(
+    360,
+    Math.min(720, workspaceWidth.value - (ui.chatListVisible ? ui.chatListWidth : 0) - 72)
+  )
+)
+const visibleBrowserPanelWidth = computed(() =>
+  Math.min(ui.browserPanelWidth, browserPanelMaxWidth.value)
+)
 
 const conv = computed(() => chat.activeConv)
 const streamingMsg = computed(() =>
@@ -619,13 +630,19 @@ function onWindowKeydown(e) {
   // 输入区弹出的面板优先关闭，且不清空输入文本（规范 §5.2）
   if (showKbPopover.value) showKbPopover.value = false
 }
+function onWindowResize() {
+  workspaceWidth.value = window.innerWidth
+}
 onMounted(() => {
   window.addEventListener('keydown', onWindowKeydown)
+  window.addEventListener('resize', onWindowResize)
   document.addEventListener('pointerdown', onDocPointerDown, true)
 })
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onWindowKeydown)
+  window.removeEventListener('resize', onWindowResize)
   document.removeEventListener('pointerdown', onDocPointerDown, true)
+  if (stopBrowserResize) stopBrowserResize()
   clearTimeout(searchTimer)
 })
 
@@ -643,6 +660,46 @@ function startResize(e) {
   }
   window.addEventListener('mousemove', move)
   window.addEventListener('mouseup', up)
+}
+
+function toggleBrowserPanel() {
+  showMoreMenu.value = false
+  ui.toggleBrowserPanel()
+}
+
+let stopBrowserResize = null
+
+function setBrowserPanelWidth(width) {
+  ui.setBrowserPanelWidth(Math.max(360, Math.min(browserPanelMaxWidth.value, width)))
+}
+
+function resizeBrowserPanelBy(delta) {
+  setBrowserPanelWidth(visibleBrowserPanelWidth.value + delta)
+}
+
+function startBrowserResize(e) {
+  if (e.button !== undefined && e.button !== 0) return
+  e.preventDefault()
+  if (stopBrowserResize) stopBrowserResize()
+  const startX = e.clientX
+  const startW = visibleBrowserPanelWidth.value
+  const move = (ev) => {
+    ui.setBrowserPanelWidth(
+      Math.max(360, Math.min(browserPanelMaxWidth.value, startW + startX - ev.clientX)),
+      false
+    )
+  }
+  const up = () => {
+    window.removeEventListener('mousemove', move)
+    window.removeEventListener('mouseup', up)
+    window.removeEventListener('blur', up)
+    ui.setBrowserPanelWidth(ui.browserPanelWidth)
+    if (stopBrowserResize === up) stopBrowserResize = null
+  }
+  stopBrowserResize = up
+  window.addEventListener('mousemove', move)
+  window.addEventListener('mouseup', up)
+  window.addEventListener('blur', up)
 }
 </script>
 
@@ -876,8 +933,12 @@ function startResize(e) {
       />
     </aside>
 
-    <!-- 聊天主区：整个右区为白底悬浮卡片（含页头、消息与输入区） -->
-    <section class="flex-1 min-w-0 flex flex-col m-3 chat-surface overflow-hidden">
+    <div class="flex-1 min-w-0 min-h-0 flex">
+      <!-- 聊天主区：整个右区为白底悬浮卡片（含页头、消息与输入区） -->
+      <section
+        class="flex-1 min-w-0 flex flex-col m-3 chat-surface overflow-hidden"
+        data-testid="chat-main"
+      >
       <!-- 页头：列表开关 / 标题 / 生效模型 / 更多（设置入口统一在侧栏「设置」） -->
       <header class="shrink-0 h-14 flex items-center gap-2 px-4 bg-surface">
         <button
@@ -938,6 +999,17 @@ function startResize(e) {
             </button>
           </div>
         </div>
+        <button
+          class="icon-btn"
+          :class="ui.browserPanelOpen ? 'text-brand-ink bg-brand-soft' : ''"
+          :title="ui.browserPanelOpen ? '折叠内置浏览器' : '展开内置浏览器'"
+          :aria-label="ui.browserPanelOpen ? '折叠内置浏览器' : '展开内置浏览器'"
+          :aria-pressed="ui.browserPanelOpen"
+          data-testid="chat-browser-panel-toggle"
+          @click="toggleBrowserPanel"
+        >
+          <UiIcon name="panelRight" :size="18" />
+        </button>
       </header>
 
       <!-- 消息区：单滚动容器 + 回到底部（F14） -->
@@ -1112,7 +1184,52 @@ function startResize(e) {
           </p>
         </div>
       </div>
-    </section>
+      </section>
+
+      <div
+        v-if="ui.browserPanelOpen"
+        class="group w-2 shrink-0 my-3 flex items-center justify-center cursor-col-resize"
+        role="separator"
+        tabindex="0"
+        aria-orientation="vertical"
+        aria-label="调整会话与内置浏览器宽度"
+        aria-valuemin="360"
+        :aria-valuemax="browserPanelMaxWidth"
+        :aria-valuenow="visibleBrowserPanelWidth"
+        data-testid="chat-browser-divider"
+        title="左右拖动调整分区宽度"
+        @mousedown="startBrowserResize"
+        @keydown.left.prevent="resizeBrowserPanelBy(-16)"
+        @keydown.right.prevent="resizeBrowserPanelBy(16)"
+        @keydown.home.prevent="setBrowserPanelWidth(360)"
+        @keydown.end.prevent="setBrowserPanelWidth(browserPanelMaxWidth)"
+      >
+        <div class="h-full w-0.5 rounded bg-line-subtle group-hover:bg-brand transition-colors" />
+      </div>
+
+      <aside
+        v-if="ui.browserPanelOpen"
+        class="shrink-0 min-h-0 flex flex-col my-3 mr-3 chat-surface overflow-hidden"
+        :style="{ width: visibleBrowserPanelWidth + 'px' }"
+        aria-label="内置浏览器侧栏"
+        data-testid="chat-browser-panel"
+      >
+        <div class="h-8 shrink-0 flex items-center gap-2 px-2 border-b border-line-subtle bg-panel">
+          <UiIcon name="globe" :size="14" class="text-brand-ink" />
+          <span class="text-xs font-medium text-ink-secondary flex-1">内置浏览器</span>
+          <button
+            class="icon-btn-sm !w-6 !h-6"
+            title="折叠浏览器"
+            aria-label="折叠内置浏览器"
+            data-testid="chat-browser-panel-close"
+            @click="ui.toggleBrowserPanel()"
+          >
+            <UiIcon name="panelRight" :size="14" />
+          </button>
+        </div>
+        <BrowserView v-if="ui.view === 'chat'" class="flex-1 min-h-0" />
+      </aside>
+    </div>
 
     <!-- 添加项目工作目录（替代设置页的命令工作目录） -->
     <UiDialog :open="showProjectDialog" title="添加项目" @close="showProjectDialog = false">

@@ -15,6 +15,11 @@ function clampListWidth(w) {
   return Math.min(320, Math.max(220, n))
 }
 
+function clampBrowserPanelWidth(w) {
+  const n = Number(w) || 480
+  return Math.min(720, Math.max(360, n))
+}
+
 export const useUiStore = defineStore('ui', {
   state: () => ({
     view: 'chat',
@@ -23,6 +28,8 @@ export const useUiStore = defineStore('ui', {
     pendingAttachment: null,
     chatListVisible: true,
     chatListWidth: 240,
+    browserPanelOpen: false,
+    browserPanelWidth: 480,
     confirmState: null, // { title, message, impact, confirmText, danger, _resolve }
     settingsSection: 'model', // 设置页当前分组
     _media: null
@@ -34,12 +41,16 @@ export const useUiStore = defineStore('ui', {
     async init() {
       const t = await window.api.settings.get('theme')
       this.theme = t || 'dark'
-      const [listVisible, listWidth] = await Promise.all([
+      const [listVisible, listWidth, browserPanelOpen, browserPanelWidth] = await Promise.all([
         window.api.settings.get('chatListVisible'),
-        window.api.settings.get('chatListWidth')
+        window.api.settings.get('chatListWidth'),
+        window.api.settings.get('browserPanelOpen'),
+        window.api.settings.get('browserPanelWidth')
       ])
       this.chatListVisible = listVisible !== false
       this.chatListWidth = clampListWidth(listWidth)
+      this.browserPanelOpen = browserPanelOpen === true
+      this.browserPanelWidth = clampBrowserPanelWidth(browserPanelWidth)
       applyTheme(this.theme)
       this.watchSystemTheme()
     },
@@ -69,6 +80,14 @@ export const useUiStore = defineStore('ui', {
     setChatListWidth(w) {
       this.chatListWidth = clampListWidth(w)
       window.api.settings.set('chatListWidth', this.chatListWidth)
+    },
+    toggleBrowserPanel() {
+      this.browserPanelOpen = !this.browserPanelOpen
+      window.api.settings.set('browserPanelOpen', this.browserPanelOpen)
+    },
+    setBrowserPanelWidth(w, persist = true) {
+      this.browserPanelWidth = clampBrowserPanelWidth(w)
+      if (persist) window.api.settings.set('browserPanelWidth', this.browserPanelWidth)
     },
     toast(message, level = 'info') {
       const id = Date.now() + Math.random()

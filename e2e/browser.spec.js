@@ -349,3 +349,80 @@ describe('内置浏览器 P6 韧性与可观测性', () => {
     expect(unexpectedErrors(consoleErrors)).toEqual([])
   })
 })
+
+describe('聊天右侧内置浏览器侧栏', () => {
+  it('expands to the right, shrinks chat and coexists with the standalone browser view', async () => {
+    const { win, consoleErrors } = ctx
+    await win.getByTestId('nav-chat').click()
+    await win.getByTestId('new-conv').click()
+    const before = await win.getByTestId('chat-main').boundingBox()
+
+    await win.getByRole('button', { name: '更多操作' }).click()
+    await win.getByRole('menuitem', { name: '导出 MD' }).waitFor()
+    await win.getByRole('button', { name: '更多操作' }).click()
+    await win.getByTestId('chat-browser-panel-toggle').click()
+    await win.getByTestId('chat-browser-panel').waitFor()
+    await win.getByTestId('browser-view').waitFor()
+    await waitFor(async () => {
+      const state = await win.evaluate(() => window.api.browser.state())
+      return !!state.attachedTabId
+    })
+
+    const after = await win.getByTestId('chat-main').boundingBox()
+    const panelBefore = await win.getByTestId('chat-browser-panel').boundingBox()
+    expect(after.width).toBeLessThan(before.width)
+
+    const divider = await win.getByTestId('chat-browser-divider').boundingBox()
+    expect(divider).toBeTruthy()
+    await win.mouse.move(divider.x + divider.width / 2, divider.y + divider.height / 2)
+    await win.mouse.down()
+    await win.mouse.move(divider.x - 70, divider.y + divider.height / 2, { steps: 8 })
+    await win.mouse.up()
+    await waitFor(
+      async () =>
+        (await win.getByTestId('chat-browser-panel').boundingBox()).width > panelBefore.width + 40
+    )
+    const widened = await win.getByTestId('chat-main').boundingBox()
+    const widenedPanel = await win.getByTestId('chat-browser-panel').boundingBox()
+    expect(widened.width).toBeLessThan(after.width - 40)
+
+    const movedDivider = await win.getByTestId('chat-browser-divider').boundingBox()
+    await win.mouse.move(
+      movedDivider.x + movedDivider.width / 2,
+      movedDivider.y + movedDivider.height / 2
+    )
+    await win.mouse.down()
+    await win.mouse.move(movedDivider.x + 50, movedDivider.y + movedDivider.height / 2, {
+      steps: 6
+    })
+    await win.mouse.up()
+    await waitFor(
+      async () =>
+        (await win.getByTestId('chat-browser-panel').boundingBox()).width < widenedPanel.width - 20
+    )
+    const narrowedPanel = await win.getByTestId('chat-browser-panel').boundingBox()
+
+    await win.getByTestId('chat-browser-divider').focus()
+    await win.keyboard.press('ArrowRight')
+    await waitFor(
+      async () =>
+        (await win.getByTestId('chat-browser-panel').boundingBox()).width > narrowedPanel.width + 8
+    )
+
+    await win.getByTestId('nav-browser').click()
+    await waitFor(async () => {
+      const state = await win.evaluate(() => window.api.browser.state())
+      return !!state.attachedTabId
+    })
+    expect(await win.getByTestId('chat-browser-panel').isVisible()).toBe(false)
+
+    await win.getByTestId('nav-chat').click()
+    await win.getByTestId('chat-browser-panel').waitFor()
+    await win.getByTestId('chat-browser-panel-close').click()
+    await waitFor(async () => {
+      const state = await win.evaluate(() => window.api.browser.state())
+      return state.attachedTabId === null
+    })
+    expect(unexpectedErrors(consoleErrors)).toEqual([])
+  })
+})
