@@ -10,6 +10,10 @@ class FakeWebContents extends EventEmitter {
     this.loads = []
     this.commands = []
     this.loadError = ''
+    this.devToolsOpened = false
+    this.devToolsFocused = false
+    this.devToolsOptions = []
+    this.devToolsWebContents = null
   }
 
   isDestroyed() {
@@ -71,7 +75,32 @@ class FakeWebContents extends EventEmitter {
     this.commands.push('stop')
   }
 
+  openDevTools(options) {
+    this.devToolsOpened = true
+    this.devToolsOptions.push(options)
+    this.devToolsWebContents = new EventEmitter()
+    this.devToolsWebContents.isDestroyed = () => false
+    this.emit('devtools-opened')
+  }
+
+  closeDevTools() {
+    if (!this.devToolsOpened) return
+    this.devToolsOpened = false
+    this.devToolsWebContents = null
+    this.devToolsFocused = false
+    this.emit('devtools-closed')
+  }
+
+  isDevToolsOpened() {
+    return this.devToolsOpened
+  }
+
+  isDevToolsFocused() {
+    return this.devToolsFocused
+  }
+
   close() {
+    this.closeDevTools()
     this.destroyed = true
     this.emit('destroyed')
   }
@@ -165,6 +194,20 @@ function harness({ allowPrivateNetwork = true } = {}) {
   return { service, children, sessions }
 }
 
+function emitKey(webContents, input) {
+  let prevented = false
+  webContents.emit(
+    'before-input-event',
+    {
+      preventDefault() {
+        prevented = true
+      }
+    },
+    input
+  )
+  return prevented
+}
+
 describe('browser service', () => {
   it('opens, attaches, navigates and closes visible user tabs', async () => {
     const { service, children } = harness()
@@ -185,6 +228,67 @@ describe('browser service', () => {
     service.close(tab.id)
     expect(service.getState().tabs).toHaveLength(0)
     expect(children).toHaveLength(0)
+  })
+
+  it('toggles detached native DevTools with F12 and the focused menu command', () => {
+    const { service, children } = harness()
+    const tab = service.open({ kind: 'user' })
+    const wc = children[0].webContents
+
+    expect(emitKey(wc, { type: 'keyUp', key: 'F12' })).toBe(false)
+    expect(emitKey(wc, { type: 'keyDown', key: 'F12', isAutoRepeat: true })).toBe(false)
+    expect(wc.isDevToolsOpened()).toBe(false)
+
+    expect(emitKey(wc, { type: 'keyDown', key: 'F12' })).toBe(true)
+    expect(wc.isDevToolsOpened()).toBe(true)
+    expect(wc.devToolsOptions).toEqual([{ mode: 'detach', title: 'Mini Agent 开发者工具' }])
+    expect(service.getState().tabs[0].devToolsOpened).toBe(true)
+
+    wc.devToolsFocused = true
+    expect(service.toggleFocusedDevTools()).toMatchObject({ id: tab.id })
+    expect(wc.isDevToolsOpened()).toBe(false)
+    expect(service.getState().tabs[0].devToolsOpened).toBe(false)
+
+    service.toggleDevTools(tab.id)
+    expect(wc.isDevToolsOpened()).toBe(true)
+    expect(service.toggleFocusedDevTools()).toBe(null)
+    service.toggleDevTools(tab.id)
+    expect(wc.isDevToolsOpened()).toBe(false)
+  })
+
+  it('closes DevTools when switching, detaching or closing its tab', () => {
+    const { service, children } = harness()
+    const first = service.open({ kind: 'user' })
+    service.attach(first.id, { x: 0, y: 0, width: 800, height: 600 })
+    service.toggleDevTools(first.id)
+    const second = service.open({ kind: 'user' })
+
+    service.activate(second.id)
+    expect(children[0].webContents.isDevToolsOpened()).toBe(false)
+    service.toggleDevTools(second.id)
+    expect(children[1].webContents.isDevToolsOpened()).toBe(true)
+
+    service.detach()
+    expect(children[1].webContents.isDevToolsOpened()).toBe(false)
+    service.toggleDevTools(second.id)
+    const secondContents = children[1].webContents
+    service.close(second.id)
+    expect(secondContents.isDevToolsOpened()).toBe(false)
+  })
+
+  it('treats F12 on a locked Agent tab as a human takeover', async () => {
+    const { service, children } = harness()
+    const agent = service.forRun('run-devtools')
+    await agent.navigate({ url: 'https://agent.example/' })
+    const tab = agent.tabs()[0]
+    const wc = children[0].webContents
+
+    expect(emitKey(wc, { type: 'keyDown', key: 'F12' })).toBe(true)
+    expect(service.getState().tabs[0].owner).toBe('user')
+    expect(wc.isDevToolsOpened()).toBe(true)
+    await expect(agent.snapshot({ tabId: tab.id })).rejects.toMatchObject({
+      code: 'BROWSER_TAKEN_OVER'
+    })
   })
 
   it('使用 Chromium DNS 解析器并给出可读的页面加载错误', async () => {

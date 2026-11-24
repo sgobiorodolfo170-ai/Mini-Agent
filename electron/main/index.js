@@ -1,4 +1,4 @@
-const { app } = require('electron')
+const { app, Menu } = require('electron')
 const path = require('path')
 const dbm = require('../store/db')
 const repos = require('../store/repos')
@@ -149,6 +149,31 @@ function readUpdateFeed(file) {
   }
 }
 
+function installBrowserDevToolsShortcut() {
+  Menu.setApplicationMenu(
+    Menu.buildFromTemplate([
+      { role: 'appMenu' },
+      { role: 'editMenu' },
+      {
+        label: '浏览器',
+        submenu: [
+          {
+            id: 'browser-devtools',
+            label: '开发者工具',
+            accelerator: 'F12',
+            click: () => {
+              const service = browser.getBrowser()
+              if (service) service.toggleFocusedDevTools()
+            }
+          }
+        ]
+      },
+      { role: 'viewMenu' },
+      { role: 'windowMenu' }
+    ])
+  )
+}
+
 function applyHotkeysNow() {
   const db = dbm.get()
   const map = repos.getSetting(db, 'hotkeys') || {
@@ -198,6 +223,7 @@ if (!gotLock) {
     })
 
     const main = windows.createMainWindow()
+    installBrowserDevToolsShortcut()
     browser.initBrowser({
       electronApi: require('electron'),
       getMainWindow: () => windows.get('main'),

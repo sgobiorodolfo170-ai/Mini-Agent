@@ -457,6 +457,7 @@ function registerIpc(ctx) {
   bh('browser:activate', ({ tabId } = {}) => requireBrowser().activate(tabId))
   bh('browser:close', ({ tabId } = {}) => requireBrowser().close(tabId))
   bh('browser:command', ({ tabId, command } = {}) => requireBrowser().command(tabId, command))
+  bh('browser:toggleDevTools', ({ tabId } = {}) => requireBrowser().toggleDevTools(tabId))
   bh('browser:attach', ({ tabId, bounds } = {}) => requireBrowser().attach(tabId, bounds))
   bh('browser:detach', () => requireBrowser().detach())
   bh('browser:takeover', ({ tabId } = {}) => requireBrowser().takeover(tabId))

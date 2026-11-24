@@ -100,6 +100,7 @@ function buildMain() {
       activate: (tabId) => inv('browser:activate', { tabId }),
       close: (tabId) => inv('browser:close', { tabId }),
       command: (tabId, command) => inv('browser:command', { tabId, command }),
+      toggleDevTools: (tabId) => inv('browser:toggleDevTools', { tabId }),
       attach: (tabId, bounds) => inv('browser:attach', { tabId, bounds }),
       detach: () => inv('browser:detach'),
       takeover: (tabId) => inv('browser:takeover', { tabId }),

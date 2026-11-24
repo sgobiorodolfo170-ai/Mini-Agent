@@ -64,6 +64,12 @@ export const useBrowserStore = defineStore('browser', {
       await window.api.browser.command(this.activeTabId, command)
       return this.load()
     },
+    async toggleDevTools(tabId = this.activeTabId) {
+      if (!tabId) return null
+      const tab = await window.api.browser.toggleDevTools(tabId)
+      await this.load()
+      return tab
+    },
     async attach(tabId, bounds) {
       const state = await window.api.browser.attach(tabId, bounds)
       this.apply(state)

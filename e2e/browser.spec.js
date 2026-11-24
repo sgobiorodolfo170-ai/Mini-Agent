@@ -39,6 +39,54 @@ async function readGuestBody(electronApp, url) {
   }, url)
 }
 
+async function isGuestDevToolsOpened(electronApp, url) {
+  return electronApp.evaluate(({ webContents }, target) => {
+    const guest = webContents.getAllWebContents().find((contents) => contents.getURL() === target)
+    return guest ? guest.isDevToolsOpened() : false
+  }, url)
+}
+
+async function sendF12(electronApp, url) {
+  return electronApp.evaluate(({ webContents }, target) => {
+    const guest = webContents.getAllWebContents().find((contents) => contents.getURL() === target)
+    if (!guest) throw new Error('guest not found')
+    guest.focus()
+    guest.sendInputEvent({ type: 'keyDown', keyCode: 'F12' })
+    guest.sendInputEvent({ type: 'keyUp', keyCode: 'F12' })
+    return null
+  }, url)
+}
+
+async function focusGuestDevTools(electronApp, url) {
+  await waitFor(() =>
+    electronApp.evaluate(({ webContents }, target) => {
+      const guest = webContents.getAllWebContents().find((contents) => contents.getURL() === target)
+      return !!guest?.devToolsWebContents
+    }, url)
+  )
+  await electronApp.evaluate(({ webContents }, target) => {
+    const guest = webContents.getAllWebContents().find((contents) => contents.getURL() === target)
+    guest.devToolsWebContents.focus()
+    return null
+  }, url)
+  await waitFor(() =>
+    electronApp.evaluate(({ webContents }, target) => {
+      const guest = webContents.getAllWebContents().find((contents) => contents.getURL() === target)
+      return !!guest && guest.isDevToolsFocused()
+    }, url)
+  )
+}
+
+async function activateBrowserDevToolsMenu(electronApp) {
+  return electronApp.evaluate(({ Menu }) => {
+    const item = Menu.getApplicationMenu()?.getMenuItemById('browser-devtools')
+    if (!item) throw new Error('browser DevTools menu item not found')
+    const accelerator = item.accelerator
+    item.click()
+    return accelerator
+  })
+}
+
 async function sendBrowserGoal(win) {
   await win.getByTestId('nav-chat').click()
   await win.getByTestId('new-conv').click()
@@ -171,6 +219,45 @@ describe('内置浏览器 P1 技术 spike', () => {
       return current.attachedTabId === current.activeTabId && !!current.activeTabId
     })
 
+    expect(unexpectedErrors(consoleErrors)).toEqual([])
+  })
+})
+
+describe('内置浏览器原生开发者工具', () => {
+  it('opens with F12 or the toolbar and closes from DevTools or browser navigation', async () => {
+    const { electronApp, win, consoleErrors } = ctx
+    await win.getByTestId('nav-browser').click()
+    await win.getByTestId('browser-view').waitFor()
+    await win.getByTestId('browser-address').fill(pageUrl)
+    await win.getByTestId('browser-go').click()
+    await waitFor(async () =>
+      (await readGuestBody(electronApp, pageUrl))?.includes('内置浏览器测试页')
+    )
+
+    await sendF12(electronApp, pageUrl)
+    await waitFor(() => isGuestDevToolsOpened(electronApp, pageUrl))
+    await waitFor(
+      async () =>
+        (await win.getByTestId('browser-devtools').getAttribute('aria-pressed')) === 'true'
+    )
+
+    await focusGuestDevTools(electronApp, pageUrl)
+    expect(await activateBrowserDevToolsMenu(electronApp)).toBe('F12')
+    await waitFor(async () => !(await isGuestDevToolsOpened(electronApp, pageUrl)))
+
+    await win.getByTestId('browser-address').focus()
+    await win.keyboard.press('F12')
+    await waitFor(() => isGuestDevToolsOpened(electronApp, pageUrl))
+    await focusGuestDevTools(electronApp, pageUrl)
+    expect(await activateBrowserDevToolsMenu(electronApp)).toBe('F12')
+    await waitFor(async () => !(await isGuestDevToolsOpened(electronApp, pageUrl)))
+    await win.getByTestId('browser-devtools').click()
+    await waitFor(async () => !(await isGuestDevToolsOpened(electronApp, pageUrl)))
+
+    await win.getByTestId('browser-devtools').click()
+    await waitFor(() => isGuestDevToolsOpened(electronApp, pageUrl))
+    await win.getByTestId('nav-chat').click()
+    await waitFor(async () => !(await isGuestDevToolsOpened(electronApp, pageUrl)))
     expect(unexpectedErrors(consoleErrors)).toEqual([])
   })
 })

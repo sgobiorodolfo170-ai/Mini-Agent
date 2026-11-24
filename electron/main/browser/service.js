@@ -104,6 +104,7 @@ function createBrowserService(options = {}) {
       error: tab.error,
       owner: tab.owner,
       crashed: tab.crashed,
+      devToolsOpened: tab.webContents.isDevToolsOpened(),
       createdAt: tab.createdAt,
       bounds: tab.view.getBounds()
     }
@@ -250,9 +251,23 @@ function createBrowserService(options = {}) {
 
     tab.cleanups.push(() => wc.removeAllListeners('before-input-event'))
     wc.on('before-input-event', (event, input) => {
+      if (input && input.type === 'keyDown' && input.key === 'F12' && !input.isAutoRepeat) {
+        event.preventDefault()
+        toggleDevTools(tab.id)
+        return
+      }
       if (tab.kind !== 'agent' || tab.owner !== 'agent') return
       event.preventDefault()
       if (input && input.type === 'keyDown' && input.key === 'Escape') takeover(tab.id)
+    })
+
+    const onDevToolsOpened = () => emitState('state', { tabId: tab.id })
+    const onDevToolsClosed = () => emitState('state', { tabId: tab.id })
+    wc.on('devtools-opened', onDevToolsOpened)
+    wc.on('devtools-closed', onDevToolsClosed)
+    tab.cleanups.push(() => {
+      wc.removeListener('devtools-opened', onDevToolsOpened)
+      wc.removeListener('devtools-closed', onDevToolsClosed)
     })
 
     wc.setWindowOpenHandler(({ url }) => {
@@ -469,6 +484,7 @@ function createBrowserService(options = {}) {
 
   function closeTab(tabId) {
     const tab = requireTab(tabId)
+    closeDevTools(tab)
     tab.destroyed = true
     tabs.delete(tab.id)
     if (runTabs.get(String(tab.runId)) === tab.id) runTabs.delete(String(tab.runId))
@@ -507,7 +523,10 @@ function createBrowserService(options = {}) {
     activeTabId = tab.id
     if (attachedTabId) {
       const previous = tabs.get(attachedTabId)
-      if (previous && previous.id !== tab.id) previous.view.setVisible(false)
+      if (previous && previous.id !== tab.id) {
+        previous.view.setVisible(false)
+        closeDevTools(previous)
+      }
       attachedTabId = tab.id
       tab.view.setVisible(true)
     }
@@ -520,7 +539,10 @@ function createBrowserService(options = {}) {
     const rect = normalizeBounds(bounds)
     if (attachedTabId && attachedTabId !== tab.id) {
       const previous = tabs.get(attachedTabId)
-      if (previous) previous.view.setVisible(false)
+      if (previous) {
+        previous.view.setVisible(false)
+        closeDevTools(previous)
+      }
     }
     activeTabId = tab.id
     attachedTabId = tab.id
@@ -547,7 +569,10 @@ function createBrowserService(options = {}) {
   function detach() {
     if (attachedTabId) {
       const tab = tabs.get(attachedTabId)
-      if (tab) tab.view.setVisible(false)
+      if (tab) {
+        tab.view.setVisible(false)
+        closeDevTools(tab)
+      }
     }
     attachedTabId = null
     emitState('state')
@@ -591,6 +616,27 @@ function createBrowserService(options = {}) {
     if (tab.kind === 'agent' && tab.owner !== 'user') {
       throw new BrowserError('请先人工接管 Agent 标签', 'BROWSER_TAKEN_OVER')
     }
+  }
+
+  function closeDevTools(tab) {
+    if (!tab || tab.destroyed || tab.webContents.isDestroyed()) return
+    if (tab.webContents.isDevToolsOpened()) tab.webContents.closeDevTools()
+  }
+
+  function toggleDevTools(tabId = attachedTabId || activeTabId) {
+    if (!tabId) return null
+    const tab = requireTab(tabId)
+    if (tab.kind === 'agent' && tab.owner === 'agent') tab.owner = 'user'
+    if (tab.webContents.isDevToolsOpened()) tab.webContents.closeDevTools()
+    else tab.webContents.openDevTools({ mode: 'detach', title: 'Mini Agent 开发者工具' })
+    return summarize(tab)
+  }
+
+  function toggleFocusedDevTools() {
+    const tab = tabs.get(attachedTabId || activeTabId)
+    if (!tab || !tab.webContents.isDevToolsOpened() || !tab.webContents.isDevToolsFocused())
+      return null
+    return toggleDevTools(tab.id)
   }
 
   async function snapshot(tab, maxChars = 20000) {
@@ -769,6 +815,8 @@ function createBrowserService(options = {}) {
     activate: activateTab,
     close: closeTab,
     command: commandTab,
+    toggleDevTools,
+    toggleFocusedDevTools,
     attach: attachTab,
     detach,
     takeover,

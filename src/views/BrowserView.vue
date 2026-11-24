@@ -118,6 +118,22 @@ async function runCommand(command) {
   }
 }
 
+async function toggleDevTools() {
+  if (!browser.activeTabId) return
+  localError.value = ''
+  try {
+    await browser.toggleDevTools(browser.activeTabId)
+  } catch (error) {
+    localError.value = String(error.message || error)
+  }
+}
+
+function handleF12(event) {
+  if (event.key !== 'F12' || event.repeat || !browser.activeTabId) return
+  event.preventDefault()
+  void toggleDevTools()
+}
+
 async function takeover() {
   if (!activeTab.value) return
   await browser.takeover(activeTab.value.id)
@@ -144,6 +160,7 @@ async function enableBrowser() {
 }
 
 onMounted(async () => {
+  window.addEventListener('keydown', handleF12)
   await initialize()
   if (typeof ResizeObserver !== 'undefined') {
     observer = new ResizeObserver(scheduleAttach)
@@ -152,6 +169,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(async () => {
+  window.removeEventListener('keydown', handleF12)
   if (attachFrame) cancelAnimationFrame(attachFrame)
   if (observer) observer.disconnect()
   try {
@@ -267,6 +285,20 @@ onBeforeUnmount(async () => {
             {{ busy ? '打开中' : '打开' }}
           </button>
         </form>
+        <button
+          class="icon-btn-sm"
+          :class="{ 'bg-subtle': activeTab && activeTab.devToolsOpened }"
+          data-testid="browser-devtools"
+          :title="
+            activeTab && activeTab.devToolsOpened ? '关闭开发者工具 (F12)' : '开发者工具 (F12)'
+          "
+          :aria-label="activeTab && activeTab.devToolsOpened ? '关闭开发者工具' : '打开开发者工具'"
+          :aria-pressed="!!(activeTab && activeTab.devToolsOpened)"
+          :disabled="!activeTab"
+          @click="toggleDevTools"
+        >
+          <UiIcon name="terminal" :size="15" />
+        </button>
         <button
           class="icon-btn-sm"
           data-testid="browser-screenshot"
