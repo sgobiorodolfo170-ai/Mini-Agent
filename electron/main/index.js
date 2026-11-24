@@ -4,6 +4,7 @@ const dbm = require('../store/db')
 const repos = require('../store/repos')
 const notify = require('./notify')
 const windows = require('./windows')
+const browser = require('./browser')
 const tray = require('./tray')
 const shortcutsMod = require('./shortcuts')
 const updaterMod = require('./updater')
@@ -76,6 +77,7 @@ function requestQuit() {
         await embedLocal.disposeSessions()
         faissIndex.invalidateAll()
         tray.destroyTray()
+        browser.shutdownBrowser()
         windows.destroyAll()
       }
     },
@@ -196,6 +198,12 @@ if (!gotLock) {
     })
 
     const main = windows.createMainWindow()
+    browser.initBrowser({
+      electronApi: require('electron'),
+      getMainWindow: () => windows.get('main'),
+      getSetting: (key) => repos.getSetting(dbm.get(), key),
+      emit: (channel, payload) => notify.broadcast(channel, payload)
+    })
     main.on('close', (e) => {
       if (forceQuit) return
       const { shouldCloseToTray } = require('./lifecycle')
@@ -228,6 +236,7 @@ if (!gotLock) {
       applyHotkeysNow,
       version: app.getVersion(),
       remote: () => remoteManager,
+      browser: () => browser.getBrowser(),
       buildInfo: buildInfo.getBuildInfo()
     })
 

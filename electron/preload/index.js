@@ -91,6 +91,21 @@ function buildMain() {
       graph: (runId) => inv('agent:graph', runId),
       mutateGraph: (o) => inv('agent:graph:mutate', o)
     },
+    browser: {
+      state: () => inv('browser:state'),
+      setEnabled: (enabled) => inv('browser:setEnabled', { enabled }),
+      open: (o) => inv('browser:open', o || {}),
+      navigate: (o) => inv('browser:navigate', o),
+      activate: (tabId) => inv('browser:activate', { tabId }),
+      close: (tabId) => inv('browser:close', { tabId }),
+      command: (tabId, command) => inv('browser:command', { tabId, command }),
+      attach: (tabId, bounds) => inv('browser:attach', { tabId, bounds }),
+      detach: () => inv('browser:detach'),
+      takeover: (tabId) => inv('browser:takeover', { tabId }),
+      release: (tabId) => inv('browser:release', { tabId }),
+      screenshot: (tabId) => inv('browser:screenshot', { tabId }),
+      clearData: () => inv('browser:clearData')
+    },
     remote: {
       state: () => inv('remote:state'),
       start: (o) => inv('remote:start', o),

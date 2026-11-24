@@ -16,6 +16,7 @@ async function runAgentLoop({
   initialSteps = 0,
   decide,
   execute,
+  redactArgs = (_name, args) => args,
   onEvent,
   onCheckpoint,
   isStopped,
@@ -89,7 +90,7 @@ async function runAgentLoop({
         decision = await decide({ name, args, riskLevel, exists: !!tool })
         allowed = !!decision.allowed
       }
-      if (onEvent) onEvent('tool-start', { name, args, riskLevel, allowed })
+      if (onEvent) onEvent('tool-start', { name, args: redactArgs(name, args), riskLevel, allowed })
 
       let resultText
       let ok = true

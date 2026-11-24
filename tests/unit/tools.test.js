@@ -349,6 +349,37 @@ describe('browser_* tools share one offscreen session', () => {
   })
 })
 
+describe('browser_* tools delegate to the Run-scoped BrowserService', () => {
+  it('forwards tabId and returns an untrusted snapshot after navigation', async () => {
+    const calls = []
+    const localCtx = {
+      todo: { seq: 0, items: [] },
+      browser: {
+        navigate: async (args) => calls.push(['navigate', args]),
+        snapshot: async (args) => {
+          calls.push(['snapshot', args])
+          return JSON.stringify({ untrusted: true, text: 'ok' })
+        },
+        click: async (args) => calls.push(['click', args]),
+        tabs: () => [{ id: 'tab-1', kind: 'agent' }],
+        close: async (args) => calls.push(['close', args])
+      }
+    }
+    const local = Object.fromEntries(defineTools(localCtx).map((tool) => [tool.name, tool]))
+
+    const out = await local.browser_navigate.handler({ url: 'https://example.com', tabId: 'tab-1' })
+    expect(JSON.parse(out).untrusted).toBe(true)
+    expect(calls).toEqual([
+      ['navigate', { url: 'https://example.com', tabId: 'tab-1' }],
+      ['snapshot', { tabId: 'tab-1' }]
+    ])
+
+    await local.browser_click.handler({ tabId: 'tab-1', ref: 2 })
+    expect(calls.at(-1)).toEqual(['click', { tabId: 'tab-1', ref: 2 }])
+    expect(JSON.parse(await local.browser_tabs.handler({}))).toHaveLength(1)
+  })
+})
+
 describe('mcp_* tools resolve configured servers', () => {
   it('lists tools and calls a tool against a real spawned server', async () => {
     const server = path.join(os.tmpdir(), 'miniagent-tools-mcp-' + process.pid + '.js')

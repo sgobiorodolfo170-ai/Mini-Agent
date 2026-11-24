@@ -18,6 +18,7 @@ const HIGH_RISK_TOOLS = new Set([
   'browser_navigate',
   'browser_click',
   'browser_type',
+  'browser_close',
   'mcp_call_tool',
   'spawn_agent'
 ])

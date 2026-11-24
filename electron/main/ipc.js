@@ -405,6 +405,37 @@ function registerIpc(ctx) {
   h('agent:graph', (runId) => agent.getGraphForParent(runId))
   h('agent:graph:mutate', (o) => agent.mutateRunGraph(o || {}))
 
+  // 内置浏览器：仅主窗口可调用，Agent 通过主进程 BrowserService 访问自己的临时标签。
+  const requireBrowser = () => {
+    const service = ctx.browser && ctx.browser()
+    if (!service) throw new Error('内置浏览器尚未初始化')
+    return service
+  }
+  const bh = (channel, fn) =>
+    ipcMain.handle(channel, async (event, ...args) => {
+      const main = windows.get('main')
+      if (!main || event.sender !== main.webContents) {
+        throw new Error('仅主窗口可控制内置浏览器')
+      }
+      return fn(...args)
+    })
+  bh('browser:state', () => requireBrowser().getState())
+  bh('browser:setEnabled', ({ enabled } = {}) => {
+    repos.setSetting(dbm.get(), 'browserEnabled', enabled === true)
+    return requireBrowser().setEnabled(enabled === true)
+  })
+  bh('browser:open', ({ url = 'about:blank' } = {}) => requireBrowser().open({ url, kind: 'user' }))
+  bh('browser:navigate', ({ tabId, url } = {}) => requireBrowser().navigate(tabId, url))
+  bh('browser:activate', ({ tabId } = {}) => requireBrowser().activate(tabId))
+  bh('browser:close', ({ tabId } = {}) => requireBrowser().close(tabId))
+  bh('browser:command', ({ tabId, command } = {}) => requireBrowser().command(tabId, command))
+  bh('browser:attach', ({ tabId, bounds } = {}) => requireBrowser().attach(tabId, bounds))
+  bh('browser:detach', () => requireBrowser().detach())
+  bh('browser:takeover', ({ tabId } = {}) => requireBrowser().takeover(tabId))
+  bh('browser:release', ({ tabId } = {}) => requireBrowser().release(tabId))
+  bh('browser:screenshot', ({ tabId } = {}) => requireBrowser().screenshot(tabId))
+  bh('browser:clearData', () => requireBrowser().clearData())
+
   // 局域网远程控制：管理接口仅暴露给主窗口，手机只能走受限网络协议。
   const remoteManager = () => ctx.remote && ctx.remote()
   const requireRemote = () => {

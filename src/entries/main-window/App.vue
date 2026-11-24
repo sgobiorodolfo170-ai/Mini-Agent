@@ -11,6 +11,7 @@ import { useUpdaterStore } from '../../stores/updater'
 import ChatView from '../../views/ChatView.vue'
 import KbView from '../../views/KbView.vue'
 import AgentView from '../../views/AgentView.vue'
+import BrowserView from '../../views/BrowserView.vue'
 import SettingsView from '../../views/SettingsView.vue'
 import ConfirmCard from '../../components/ConfirmCard.vue'
 import ConfirmDialog from '../../components/ConfirmDialog.vue'
@@ -18,6 +19,7 @@ import UpdateDialog from '../../components/UpdateDialog.vue'
 import UiIcon from '../../components/UiIcon.vue'
 import RemotePanel from '../../components/remote/RemotePanel.vue'
 import { useRemoteStore } from '../../stores/remote'
+import { useBrowserStore } from '../../stores/browser'
 
 const ui = useUiStore()
 const chat = useChatStore()
@@ -28,12 +30,14 @@ const projects = useProjectsStore()
 const sessions = useSessionsStore()
 const updater = useUpdaterStore()
 const remote = useRemoteStore()
+const browser = useBrowserStore()
 const updateOpen = ref(false)
 
 const navs = [
   { key: 'chat', icon: 'chat', label: '会话' },
   { key: 'kb', icon: 'kb', label: '知识库' },
   { key: 'agent', icon: 'terminal', label: '执行' },
+  { key: 'browser', icon: 'globe', label: '浏览器' },
   { key: 'remote', icon: 'monitor', label: '远程' },
   { key: 'settings', icon: 'settings', label: '设置' }
 ]
@@ -61,6 +65,7 @@ onMounted(async () => {
   window.api.on('kb:progress', (p) => kb.handleProgress(p))
   if (window.api.models) window.api.on('models:progress', (p) => settings.handleModelsProgress(p))
   window.api.on('agent:event', (ev) => agent.handleEvent(ev))
+  window.api.on('browser:event', (ev) => browser.handleEvent(ev))
   window.api.on('updater:changed', (s) => updater.apply(s))
   if (window.api.remote) window.api.on('remote:changed', (s) => remote.apply(s))
   window.api.on('agent:confirm', (c) => agent.pushConfirm(c))
@@ -273,6 +278,7 @@ async function closeWindow() {
         <ChatView v-show="ui.view === 'chat'" />
         <KbView v-show="ui.view === 'kb'" />
         <AgentView v-show="ui.view === 'agent'" />
+        <BrowserView v-if="ui.view === 'browser'" />
         <SettingsView v-show="ui.view === 'settings'" />
         <RemotePanel v-if="ui.view === 'remote'" />
       </main>

@@ -15,6 +15,7 @@ const sections = [
   { key: 'models', label: '本地向量模型' },
   { key: 'hotkeys', label: '快捷键' },
   { key: 'agent', label: '智能任务' },
+  { key: 'browser', label: '浏览器' },
   { key: 'appearance', label: '外观' },
   { key: 'data', label: '数据' },
   { key: 'logs', label: '运行日志' }
@@ -37,6 +38,8 @@ const hookStages = ref(['session.send', 'run.start', 'run.end', 'tool.before', '
 const hookActions = ref(['notify', 'log', 'block'])
 const hooksError = ref('')
 const includeKeys = ref(false)
+const browserEnabled = ref(true)
+const browserAllowPrivateNetwork = ref(false)
 
 function syncFromStore() {
   hotkeys.value = { ...settings.hotkeys }
@@ -45,6 +48,8 @@ function syncFromStore() {
   webSearchProvider.value = settings.settings.webSearchProvider || 'auto'
   tavilyApiKey.value = settings.settings.tavilyApiKey || ''
   mcpServersJson.value = settings.settings.agentMcpServers || ''
+  browserEnabled.value = settings.settings.browserEnabled !== false
+  browserAllowPrivateNetwork.value = settings.settings.browserAllowPrivateNetwork === true
   syncHooks()
 }
 
@@ -382,6 +387,39 @@ function saveMcpServers() {
         (String(e.message || e).includes('JSON') ? 'MCP 配置不是合法 JSON' : e.message || e),
       'error'
     )
+  }
+}
+
+// ---------- 内置浏览器 ----------
+async function toggleBrowserEnabled(value) {
+  try {
+    await window.api.browser.setEnabled(value)
+    settings.settings.browserEnabled = value
+    browserEnabled.value = value
+    ui.toast(value ? '内置浏览器已启用' : '内置浏览器已停用，所有标签已关闭', 'success')
+  } catch (error) {
+    browserEnabled.value = !value
+    ui.toast('浏览器开关保存失败：' + String(error.message || error), 'error')
+  }
+}
+async function toggleBrowserPrivateNetwork(value) {
+  browserAllowPrivateNetwork.value = value
+  await settings.set('browserAllowPrivateNetwork', value)
+  ui.toast(value ? '已允许访问内网地址，请仅用于可信网络' : '已恢复仅访问公网地址', 'warn')
+}
+async function clearBrowserData() {
+  const ok = await ui.confirm({
+    title: '清除浏览器数据',
+    message: '将关闭所有标签并清除 Cookie、本地存储和缓存。',
+    impact: '用户浏览器登录态会丢失，此操作不可撤销。',
+    confirmText: '清除数据'
+  })
+  if (!ok) return
+  try {
+    await window.api.browser.clearData()
+    ui.toast('浏览器数据已清除', 'success')
+  } catch (error) {
+    ui.toast('清除失败：' + String(error.message || error), 'error')
   }
 }
 
@@ -1249,6 +1287,46 @@ async function openLogFolder() {
                   hooksError
                 }}</span>
               </label>
+            </div>
+          </section>
+
+          <!-- 内置浏览器 -->
+          <section v-show="section === 'browser'" class="space-y-4">
+            <h2 class="text-base font-semibold">内置浏览器</h2>
+            <div class="space-y-3 max-w-2xl">
+              <label class="flex items-center gap-2 cursor-pointer min-h-[36px]">
+                <input
+                  type="checkbox"
+                  data-testid="browser-enabled"
+                  :checked="browserEnabled"
+                  @change="toggleBrowserEnabled($event.target.checked)"
+                />
+                <span>启用内置浏览器</span>
+              </label>
+              <p class="field-help -mt-2">
+                用户标签保存登录态；Agent 标签按任务隔离，任务结束自动关闭，不读取用户 Cookie。
+              </p>
+              <label class="flex items-center gap-2 cursor-pointer min-h-[36px]">
+                <input
+                  type="checkbox"
+                  data-testid="browser-private-network"
+                  :checked="browserAllowPrivateNetwork"
+                  @change="toggleBrowserPrivateNetwork($event.target.checked)"
+                />
+                <span>允许访问内网和本地地址</span>
+              </label>
+              <p class="field-help -mt-2">
+                默认阻止回环、私网和链路本地地址。仅在需要访问可信内网服务时开启。
+              </p>
+              <div>
+                <button
+                  class="btn-secondary"
+                  data-testid="browser-clear-data"
+                  @click="clearBrowserData"
+                >
+                  清除浏览器数据
+                </button>
+              </div>
             </div>
           </section>
 

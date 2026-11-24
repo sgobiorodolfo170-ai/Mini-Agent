@@ -47,4 +47,40 @@ function escalateRisk(toolName, args, riskLevel) {
   return riskLevel
 }
 
-module.exports = { isPathInside, isPathAllowed, assertAllowed, classifyCommand, escalateRisk }
+function redactToolArgs(toolName, args) {
+  const redact = (value, key = '') => {
+    if (/password|passwd|secret|token|apiKey|authorization/i.test(key)) return '[redacted]'
+    if (Array.isArray(value)) return value.map((entry) => redact(entry))
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(
+        Object.entries(value).map(([name, entry]) => [name, redact(entry, name)])
+      )
+    }
+    return value
+  }
+  const source = args && typeof args === 'object' ? redact(args) : {}
+  if (toolName === 'browser_type') source.text = '[redacted]'
+  if (toolName === 'browser_navigate' && typeof source.url === 'string') {
+    try {
+      const url = new URL(source.url)
+      const hadQuery = !!url.search
+      const hadHash = !!url.hash
+      url.search = ''
+      url.hash = ''
+      source.url =
+        url.toString() + (hadQuery ? (hadHash ? '?[redacted]#[redacted]' : '?[redacted]') : '')
+    } catch {
+      source.url = '[invalid-url]'
+    }
+  }
+  return source
+}
+
+module.exports = {
+  isPathInside,
+  isPathAllowed,
+  assertAllowed,
+  classifyCommand,
+  escalateRisk,
+  redactToolArgs
+}

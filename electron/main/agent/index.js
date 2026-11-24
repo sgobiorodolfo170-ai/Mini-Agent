@@ -28,7 +28,7 @@ const { resolveModel, msgOut, effectiveParams, safeJson } = require('../gateway/
 const { decryptSecret } = require('../../store/keys')
 const { broadcast } = require('../notify')
 const { defineTools } = require('./tools')
-const { escalateRisk } = require('./guard')
+const { escalateRisk, redactToolArgs } = require('./guard')
 const { runAgentLoop } = require('./loop')
 const { readMemoryFile } = require('./memory')
 const { parseMcpServers } = require('./mcp-client')
@@ -42,6 +42,7 @@ const workspace = require('./workspace')
 const { createApprovalService } = require('../remote/approval-service')
 const { createRunControl } = require('../remote/run-control-service')
 const { isShuttingDown } = require('../lifecycle')
+const { getBrowser } = require('../browser')
 
 let controlRuntime = null
 function getControlRuntime(db) {
@@ -110,6 +111,7 @@ function resolveAgentParams(settings, conv, provider, model) {
 }
 
 function summarize(toolName, args) {
+  args = redactToolArgs(toolName, args)
   try {
     if (toolName === 'write_file')
       return `写入文件 ${args.path}（${String(args.content || '').length} 字符）`
@@ -136,8 +138,15 @@ function summarize(toolName, args) {
       return `读取会话结果 ${String(args.conversationId || '').slice(0, 8)}`
     if (toolName === 'session_list') return '列出子会话'
     if (toolName === 'browser_navigate') return `打开网页 ${args.url}`
-    if (toolName === 'browser_click') return `点击 ${args.selector}`
-    if (toolName === 'browser_type') return `输入到 ${args.selector}`
+    if (toolName === 'browser_snapshot') return '读取浏览器页面快照'
+    if (toolName === 'browser_click')
+      return `点击 ${args.ref ? '元素 #' + args.ref : args.selector}`
+    if (toolName === 'browser_type')
+      return `输入到 ${args.ref ? '元素 #' + args.ref : args.selector}`
+    if (toolName === 'browser_wait') return '等待浏览器页面'
+    if (toolName === 'browser_scroll') return '滚动浏览器页面'
+    if (toolName === 'browser_screenshot') return '截取浏览器页面'
+    if (toolName === 'browser_tabs') return '列出浏览器标签'
     if (toolName === 'browser_close') return '关闭内置浏览器'
     if (toolName === 'mcp_list_tools') return `列出 MCP 工具(${args.server})`
     if (toolName === 'mcp_call_tool') return `调用 MCP ${args.server}.${args.tool}`
@@ -1018,6 +1027,7 @@ async function doAgentRun({
     todo: { seq: 0, items: [] },
     memoryPath: path.join(electron.app.getPath('userData'), 'agent-memory.md'),
     browserFactory: (opts) => new electron.BrowserWindow(opts),
+    browser: getBrowser() ? getBrowser().forRun(runId) : null,
     mcpServers: parseMcpServers(settings.agentMcpServers),
     tavilyKey: settings.tavilyApiKey || '',
     webSearchProvider: settings.webSearchProvider || 'auto',
@@ -1240,6 +1250,7 @@ async function doAgentRun({
   }
   const decide = async ({ name, args, riskLevel }) => {
     const risk = escalateRisk(name, args, riskLevel)
+    const safeArgs = redactToolArgs(name, args)
     // 每条返回路径都要写回 lastDecision，否则日志里的「确认方式」会沿用上一步的旧值
     const settle = (decision) => {
       lastDecision = { allowed: !!decision.allowed, confirmedBy: decision.confirmedBy }
@@ -1269,7 +1280,7 @@ async function doAgentRun({
         runId,
         step: ++callCount,
         tool: name,
-        args,
+        args: safeArgs,
         riskLevel: risk,
         confirmedBy: 'permission:readonly',
         result: null,
@@ -1296,7 +1307,7 @@ async function doAgentRun({
       runId,
       conversationId,
       name,
-      args,
+      args: safeArgs,
       riskLevel: risk
     })
     return settle({
@@ -1339,7 +1350,7 @@ async function doAgentRun({
         runId,
         step: ++callCount,
         tool: tool.name,
-        args,
+        args: redactToolArgs(tool.name, args),
         riskLevel: tool.risk,
         confirmedBy: `mandate:${decision.reason}`,
         result: null,
@@ -1354,7 +1365,7 @@ async function doAgentRun({
       runId,
       step,
       tool: tool.name,
-      args,
+      args: redactToolArgs(tool.name, args),
       riskLevel: tool.risk,
       confirmedBy: lastDecision.confirmedBy,
       callId
@@ -1424,6 +1435,7 @@ async function doAgentRun({
       modelCall: (msgs) => withKeyRetry(db, provider, (apiKey) => modelCallWith(apiKey)(msgs)),
       decide,
       execute,
+      redactArgs: redactToolArgs,
       onEvent,
       onCheckpoint: (snapshot) => saveCheckpoint(db, runId, snapshot)
     })
@@ -1520,6 +1532,13 @@ async function doAgentRun({
       },
       runId
     )
+  }
+  if (ctx.browser && typeof ctx.browser.closeRun === 'function') {
+    try {
+      ctx.browser.closeRun()
+    } catch {
+      // 浏览器可能已停用或视图已销毁
+    }
   }
   if (ctx._browser) {
     try {
