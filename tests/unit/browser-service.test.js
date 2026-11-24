@@ -95,6 +95,8 @@ class FakeSession extends EventEmitter {
     super()
     this.permissionRequest = null
     this.permissionCheck = null
+    this.webRequest = new EventEmitter()
+    this.webRequest.onBeforeRequest = (handler) => this.webRequest.on('before-request', handler)
   }
 
   setPermissionRequestHandler(handler) {
@@ -106,9 +108,10 @@ class FakeSession extends EventEmitter {
   }
 
   async clearStorageData() {}
+  flushStorageData() {}
 }
 
-function harness() {
+function harness({ allowPrivateNetwork = true } = {}) {
   const sessions = new Map()
   const children = []
   const mainWindow = {
@@ -141,7 +144,7 @@ function harness() {
   const service = createBrowserService({
     electronApi,
     getMainWindow: () => mainWindow,
-    getSetting: (key) => (key === 'browserAllowPrivateNetwork' ? true : null),
+    getSetting: (key) => (key === 'browserAllowPrivateNetwork' ? allowPrivateNetwork : null),
     emit: () => {},
     downloadDir: process.cwd(),
     artifactDir: process.cwd()
@@ -179,6 +182,8 @@ describe('browser service', () => {
     expect(JSON.parse(snapshot).untrusted).toBe(true)
     expect(JSON.parse(snapshot).text).toBe('页面正文')
     expect(agent.tabs()).toHaveLength(1)
+    await agent.wait({ ms: 1 })
+    await agent.scroll({ y: 120 })
 
     await expect(
       service.forRun('run-2').snapshot({ tabId: agent.tabs()[0].id })
@@ -196,6 +201,25 @@ describe('browser service', () => {
     }
     wc.emit('before-mouse-event', mouse)
     expect(prevented).toBe(true)
+    let keyPrevented = false
+    wc.emit(
+      'before-input-event',
+      {
+        preventDefault() {
+          keyPrevented = true
+        }
+      },
+      { type: 'keyDown', key: 'a' }
+    )
+    expect(keyPrevented).toBe(true)
+    wc.emit(
+      'before-input-event',
+      {
+        preventDefault() {}
+      },
+      { type: 'keyDown', key: 'Escape' }
+    )
+    expect(service.getState().tabs[0].owner).toBe('user')
 
     service.takeover(tab.id)
     expect(service.getState().tabs[0].owner).toBe('user')
@@ -208,9 +232,86 @@ describe('browser service', () => {
 
     service.release(tab.id)
     await expect(agent.click({ tabId: tab.id, ref: 1 })).resolves.toMatchObject({ id: tab.id })
+    await expect(agent.click({ tabId: tab.id })).rejects.toMatchObject({
+      code: 'BROWSER_INVALID_TARGET'
+    })
+    await expect(agent.click({ tabId: tab.id, ref: 1, selector: '#go' })).rejects.toMatchObject({
+      code: 'BROWSER_INVALID_TARGET'
+    })
 
     agent.closeRun()
     expect(agent.tabs()).toHaveLength(0)
+    expect(agent.close()).toBe(null)
+    expect(children).toHaveLength(0)
+    await expect(agent.snapshot()).rejects.toMatchObject({ code: 'BROWSER_SESSION_EXPIRED' })
+  })
+
+  it('keeps shared user session handlers until the last tab closes and enforces the tab limit', () => {
+    const { service, sessions } = harness()
+    const first = service.open({ kind: 'user' })
+    const second = service.open({ kind: 'user' })
+    const session = sessions.get('persist:miniagent-browser')
+    expect(session.permissionRequest).toBeTypeOf('function')
+
+    service.close(first.id)
+    expect(session.permissionRequest).toBeTypeOf('function')
+    service.close(second.id)
+    expect(session.permissionRequest).toBe(null)
+
+    for (let i = 0; i < 6; i++) service.open({ kind: 'user' })
+    expect(() => service.open({ kind: 'user' })).toThrow(/最多/)
+  })
+
+  it('marks a crashed renderer and clears the crash state on reload', () => {
+    const { service, children } = harness()
+    const tab = service.open({ kind: 'user' })
+    children[0].webContents.emit('render-process-gone', {}, { reason: 'crashed' })
+    expect(service.getState().tabs[0].crashed).toBe(true)
+    expect(service.getState().tabs[0].error).toContain('crashed')
+
+    service.command(tab.id, 'reload')
+    expect(service.getState().tabs[0].crashed).toBe(false)
+    expect(children[0].webContents.commands).toContain('reload')
+  })
+
+  it('blocks literal private subresource requests in Agent sessions unless explicitly allowed', async () => {
+    const { service, sessions } = harness({ allowPrivateNetwork: false })
+    await service.forRun('run-1').navigate({ url: 'about:blank' })
+    const webRequest = sessions.get('miniagent-agent-run-1').webRequest
+    let response
+    webRequest.emit('before-request', { url: 'http://127.0.0.1/admin' }, (value) => {
+      response = value
+    })
+    expect(response).toEqual({ cancel: true })
+    webRequest.emit('before-request', { url: 'https://example.com/app.js' }, (value) => {
+      response = value
+    })
+    expect(response).toEqual({})
+    expect(service.getState().stats.agentTabCount).toBe(1)
+  })
+
+  it('denies downloads from Agent sessions', async () => {
+    const { service, children, sessions } = harness()
+    await service.forRun('run-1').navigate({ url: 'https://agent.example/' })
+    const session = sessions.get('miniagent-agent-run-1')
+    let canceled = false
+    let savePath = null
+    session.emit(
+      'will-download',
+      {},
+      {
+        getFilename: () => 'secret.bin',
+        setSavePath: (value) => {
+          savePath = value
+        },
+        cancel: () => {
+          canceled = true
+        }
+      },
+      children[0].webContents
+    )
+    expect(canceled).toBe(true)
+    expect(savePath).toBe(null)
   })
 
   it('disabling the feature destroys every tab', async () => {

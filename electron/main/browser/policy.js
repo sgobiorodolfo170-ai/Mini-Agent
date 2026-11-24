@@ -120,6 +120,22 @@ async function assertBrowserUrlAllowed(raw, options = {}) {
   return url
 }
 
+function isPrivateBrowserUrl(raw) {
+  try {
+    const url = new URL(String(raw || ''))
+    if (!/^(https?|wss?):$/.test(url.protocol)) return false
+    const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '')
+    return (
+      host === 'localhost' ||
+      host.endsWith('.localhost') ||
+      host.endsWith('.local') ||
+      (net.isIP(host) ? isPrivateIp(host) : false)
+    )
+  } catch {
+    return false
+  }
+}
+
 function safeFilename(name) {
   const base = Array.from(String(name || 'download'))
     .map((char) => (char.charCodeAt(0) < 32 ? '_' : char))
@@ -134,6 +150,7 @@ module.exports = {
   BrowserPolicyError,
   normalizeBrowserUrl,
   isPrivateIp,
+  isPrivateBrowserUrl,
   assertHostnameAllowed,
   assertBrowserUrlAllowed,
   safeFilename

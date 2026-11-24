@@ -1,9 +1,9 @@
 # Mini Agent
 
-Windows 桌面个人 AI 助理（自用）：主窗口多会话对话 · 多 Key 管理 · 托盘/快捷唤起 · 划词 · 截屏问 AI · 本地知识库（RAG，支持本地离线嵌入） · Agent 工具调用、任务依赖图、Worktree 隔离与断点恢复。
+Windows 桌面个人 AI 助理（自用）：主窗口多会话对话 · 多 Key 管理 · 托盘/快捷唤起 · 划词 · 截屏问 AI · 本地知识库（RAG，支持本地离线嵌入） · 内置多标签浏览器与 Agent 接管 · Agent 工具调用、任务依赖图、Worktree 隔离与断点恢复。
 
 - **技术栈**：Electron + Vue 3 + Vite + Pinia + Tailwind；主进程 Node.js，存储 SQLite（node:sqlite 内置模块），知识库向量检索 faiss-node（本地嵌入走 onnxruntime-node + BGE 中文模型，可一键下载；远程嵌入走 OpenAI 兼容 /embeddings），Key 用 safeStorage（DPAPI）加密。
-- **当前阶段**：v1.8 / P10 发布收口已完成（版本 1.4.0）：安全 `model_done` 恢复、可配置 Worktree 冲突策略、任务图分层可视化与 queued 节点重规划。质量基线：587 单测 / 68 文件 + 41 个非调试 mock E2E / eslint / prettier / 覆盖率门槛。
+- **当前阶段**：v1.8 / P10 发布收口已完成（版本 1.4.0）：安全 `model_done` 恢复、可配置 Worktree 冲突策略、任务图分层可视化与 queued 节点重规划。内置浏览器已完成 P1–P6：可见多标签、Agent 临时会话、人工接管、登录态隔离、受控下载和安全开关。质量基线：603 单测 / 70 文件 + 46 个非调试 mock E2E / eslint / prettier / 覆盖率门槛。
 - **安装包**：`dist-app/Mini Agent Setup 1.4.0.exe` 已构建并完成安装版冒烟（约 218 MB，未签名）；安装版窗口/IPC/DPAPI 6 项 E2E 全绿。
 
 ## 文档索引
@@ -14,6 +14,7 @@ Windows 桌面个人 AI 助理（自用）：主窗口多会话对话 · 多 Key
 | [技术设计](docs/技术设计.md) | 架构、关键流程、数据模型、IPC 接口、安全设计、M0 技术验证清单 | v1.1 |
 | [开发计划](docs/开发计划.md) | M0–M5 任务拆解、验收标准、开放问题跟进 | v0.2 |
 | [完成报告](docs/完成报告.md) | 交付总览、里程碑实现、缺陷修复、修订历史 | v1.8 |
+| [内置浏览器研发契约](docs/内置浏览器研发契约.md) | 浏览器状态、IPC、Agent 工具、安全边界、回滚与限制 | v1.0 |
 
 ## 快速约定
 

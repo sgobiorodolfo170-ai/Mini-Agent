@@ -26,6 +26,9 @@ export function createMockServer() {
     planRun: false,
     planNodeDelayMs: 0,
     agentDelayMs: 0,
+    browserRun: false,
+    browserUrl: '',
+    browserDelayMs: 0,
     // 记录同时在途的子 Agent 数量峰值，用来证明「并发」而非串行
     subInFlight: 0,
     subPeak: 0
@@ -268,6 +271,60 @@ export function createMockServer() {
             }),
             JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })
           ])
+          return
+        }
+        if (body.tools && state.browserRun) {
+          const last = msgs.at(-1)
+          const replyTool = (name, args, id) =>
+            sse(res, [
+              JSON.stringify({
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: [
+                        {
+                          index: 0,
+                          id,
+                          type: 'function',
+                          function: { name, arguments: JSON.stringify(args) }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }),
+              JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })
+            ])
+          const replyFinal = (content) =>
+            sse(res, [
+              JSON.stringify({ choices: [{ index: 0, delta: { content } }] }),
+              JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })
+            ])
+          if (!hasToolResult) {
+            replyTool('browser_navigate', { url: state.browserUrl }, 'call-browser-nav')
+            return
+          }
+          if (String((last && last.content) || '').includes('人工接管')) {
+            replyFinal('浏览器任务已中止：用户人工接管。')
+            return
+          }
+          if (last && last.tool_call_id === 'call-browser-nav') {
+            const next = () =>
+              replyTool(
+                'browser_type',
+                { selector: '#name', text: 'MiniAgent' },
+                'call-browser-type'
+              )
+            if (state.browserDelayMs) setTimeout(next, state.browserDelayMs)
+            else next()
+            return
+          }
+          if (last && last.tool_call_id === 'call-browser-type') {
+            replyTool('browser_click', { selector: '#go' }, 'call-browser-click')
+            return
+          }
+          replyFinal('浏览器任务完成。')
           return
         }
         if (body.tools && body.tools.length && !hasToolResult) {

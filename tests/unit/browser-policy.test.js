@@ -3,6 +3,7 @@ import {
   assertBrowserUrlAllowed,
   assertHostnameAllowed,
   isPrivateIp,
+  isPrivateBrowserUrl,
   normalizeBrowserUrl,
   safeFilename
 } from '../../electron/main/browser/policy'
@@ -62,5 +63,12 @@ describe('browser URL policy', () => {
   it('sanitizes download filenames', () => {
     expect(safeFilename('../a<b>c?.txt')).toBe('a_b_c_.txt')
     expect(safeFilename('...')).toBe('download')
+  })
+
+  it('detects literal private network URLs for Agent subresource blocking', () => {
+    expect(isPrivateBrowserUrl('http://127.0.0.1/admin')).toBe(true)
+    expect(isPrivateBrowserUrl('https://service.local/api')).toBe(true)
+    expect(isPrivateBrowserUrl('https://example.com/image.png')).toBe(false)
+    expect(isPrivateBrowserUrl('data:image/png;base64,AA==')).toBe(false)
   })
 })

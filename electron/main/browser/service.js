@@ -1,7 +1,12 @@
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
-const { normalizeBrowserUrl, assertBrowserUrlAllowed, safeFilename } = require('./policy')
+const {
+  normalizeBrowserUrl,
+  assertBrowserUrlAllowed,
+  isPrivateBrowserUrl,
+  safeFilename
+} = require('./policy')
 
 const USER_PARTITION = 'persist:miniagent-browser'
 const DEFAULT_LOAD_TIMEOUT_MS = 30000
@@ -85,6 +90,11 @@ function createBrowserService(options = {}) {
       activeTabId,
       attachedTabId,
       tabs: [...tabs.values()].map(summarize),
+      stats: {
+        tabCount: tabs.size,
+        agentTabCount: [...tabs.values()].filter((tab) => tab.kind === 'agent').length,
+        attached: !!attachedTabId
+      },
       policy: { allowPrivateNetwork: allowPrivateNetwork(), maxTabs }
     }
   }
@@ -109,13 +119,18 @@ function createBrowserService(options = {}) {
     }
   }
 
-  function resolveRunTab(runId, tabId) {
+  function resolveRunTab(runId, tabId, { create = false } = {}) {
     const id = tabId || runTabs.get(String(runId))
     if (!id) {
-      const tab = openTab({ kind: 'agent', runId, url: 'about:blank' })
-      return tab
+      if (!create) {
+        throw new BrowserError('浏览器临时会话已结束，请重新导航', 'BROWSER_SESSION_EXPIRED')
+      }
+      return openTab({ kind: 'agent', runId, url: 'about:blank' })
     }
-    const tab = requireTab(id)
+    const tab = tabs.get(id)
+    if (!tab || tab.destroyed) {
+      throw new BrowserError('浏览器临时会话已结束，请重新导航', 'BROWSER_SESSION_EXPIRED')
+    }
     assertAgentAccess(tab, runId)
     return tab
   }
@@ -147,6 +162,15 @@ function createBrowserService(options = {}) {
       callback(safe)
     })
     sess.setPermissionCheckHandler(() => false)
+
+    if (kind === 'agent') {
+      const onBeforeRequest = (details, callback) => {
+        if (!allowPrivateNetwork() && isPrivateBrowserUrl(details.url)) callback({ cancel: true })
+        else callback({})
+      }
+      sess.webRequest.onBeforeRequest(onBeforeRequest)
+      handlers.push(() => sess.webRequest.removeListener('before-request', onBeforeRequest))
+    }
 
     const onDownload = (event, item, webContents) => {
       const tab = [...tabs.values()].find((entry) => entry.webContents === webContents)
@@ -568,10 +592,17 @@ function createBrowserService(options = {}) {
     })
   }
 
-  function targetScript({ ref, selector }) {
-    if (selector) return `document.querySelector(${JSON.stringify(String(selector))})`
+  function targetScript({ ref, selector } = {}) {
+    const hasSelector = typeof selector === 'string' && selector.trim().length > 0
+    const hasRef = ref !== undefined && ref !== null
+    if (hasSelector === hasRef) {
+      throw new BrowserError('必须且只能提供 ref 或 selector', 'BROWSER_INVALID_TARGET')
+    }
+    if (hasSelector) return `document.querySelector(${JSON.stringify(selector.trim())})`
     const index = Number(ref)
-    if (!Number.isInteger(index) || index < 1) return 'null'
+    if (!Number.isInteger(index) || index < 1) {
+      throw new BrowserError('ref 必须是正整数', 'BROWSER_INVALID_TARGET')
+    }
     return `Array.from(document.querySelectorAll('a,button,input,textarea,select,[role="button"],[contenteditable="true"]')).filter(el => el.getClientRects().length)[${index - 1}]`
   }
 
@@ -673,6 +704,11 @@ function createBrowserService(options = {}) {
     for (const tab of [...tabs.values()]) closeTab(tab.id)
     for (const partition of [...configuredSessions.keys()]) removeSessionHandlers(partition)
     runTabs.clear()
+    try {
+      electronApi.session.fromPartition(USER_PARTITION).flushStorageData()
+    } catch {
+      // 非 Electron 测试环境或会话尚未创建时无需刷新
+    }
   }
 
   function setEnabled(value) {
@@ -705,7 +741,8 @@ function createBrowserService(options = {}) {
     forRun(runId) {
       const id = String(runId)
       return {
-        navigate: (args = {}) => navigateTab(resolveRunTab(id, args.tabId), args.url),
+        navigate: (args = {}) =>
+          navigateTab(resolveRunTab(id, args.tabId, { create: true }), args.url),
         snapshot: async (args = {}) => snapshot(resolveRunTab(id, args.tabId), args.maxChars),
         click: async (args = {}) => click(resolveRunTab(id, args.tabId), args),
         type: async (args = {}) => type(resolveRunTab(id, args.tabId), args),
@@ -716,7 +753,10 @@ function createBrowserService(options = {}) {
           [...tabs.values()]
             .filter((tab) => tab.kind === 'agent' && tab.runId === id)
             .map(summarize),
-        close: (args = {}) => closeTab(resolveRunTab(id, args.tabId).id),
+        close: (args = {}) => {
+          const tabId = args.tabId || runTabs.get(id)
+          return tabId ? closeTab(tabId) : null
+        },
         closeRun: () => {
           for (const tab of [...tabs.values()]) {
             if (tab.kind === 'agent' && tab.runId === id) closeTab(tab.id)

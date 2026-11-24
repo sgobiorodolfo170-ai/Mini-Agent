@@ -1,6 +1,8 @@
+import fs from 'node:fs'
 import http from 'node:http'
+import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { closeApp, launchApp, unexpectedErrors } from './helpers'
+import { closeApp, launchApp, setupProviderAndKey, unexpectedErrors } from './helpers'
 
 let ctx
 let pageServer
@@ -37,11 +39,25 @@ async function readGuestBody(electronApp, url) {
   }, url)
 }
 
+async function sendBrowserGoal(win) {
+  await win.getByTestId('nav-chat').click()
+  await win.getByTestId('new-conv').click()
+  await win.getByTestId('agent-toggle').click()
+  await win.getByRole('menuitemradio', { name: /完整权限/ }).click()
+  await win.getByTestId('chat-input').fill('打开内置浏览器测试页，输入 MiniAgent 并提交')
+  await win.keyboard.press('Enter')
+}
+
 beforeEach(async () => {
-  pageState = { result: null }
+  pageState = { result: null, userCookie: null, agentCookie: null }
   pageServer = http.createServer((req, res) => {
-    if (req.url === '/') {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+    if (req.url === '/' || req.url.startsWith('/?')) {
+      if (req.url.includes('agent=1')) pageState.agentCookie = req.headers.cookie || ''
+      else pageState.userCookie = req.headers.cookie || ''
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Set-Cookie': 'miniagent_user=secret; Path=/; Max-Age=3600; SameSite=Lax'
+      })
       res.end(`<!doctype html><html><head><title>Mini Agent Browser</title></head><body>
         <h1>内置浏览器测试页</h1>
         <input id="name" value="MiniAgent" />
@@ -60,6 +76,14 @@ beforeEach(async () => {
     if (req.url === '/popup') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       res.end('<!doctype html><title>Popup</title><body>POPUP_OK</body>')
+      return
+    }
+    if (req.url === '/download') {
+      res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Disposition': 'attachment; filename="miniagent-download.txt"'
+      })
+      res.end('DOWNLOAD_OK')
       return
     }
     if (req.url.startsWith('/result')) {
@@ -107,6 +131,13 @@ describe('内置浏览器 P1 技术 spike', () => {
     expect(Math.abs(state.tabs[0].bounds.y - rect.y)).toBeLessThanOrEqual(2)
     expect(Math.abs(state.tabs[0].bounds.width - rect.width)).toBeLessThanOrEqual(2)
 
+    const screenshot = await win.evaluate(async () => {
+      const current = await window.api.browser.state()
+      return window.api.browser.screenshot(current.activeTabId)
+    })
+    expect(fs.existsSync(screenshot.path)).toBe(true)
+    fs.rmSync(screenshot.path, { force: true })
+
     await win.setViewportSize({ width: 1100, height: 720 })
     await waitFor(async () => {
       const current = await win.evaluate(() => window.api.browser.state())
@@ -140,6 +171,181 @@ describe('内置浏览器 P1 技术 spike', () => {
       return current.attachedTabId === current.activeTabId && !!current.activeTabId
     })
 
+    expect(unexpectedErrors(consoleErrors)).toEqual([])
+  })
+})
+
+describe('内置浏览器 P2 安全最小闭环', () => {
+  it('runs a real Agent navigate/type/click chain in an isolated visible tab and redacts audit text', async () => {
+    const { win, mock, consoleErrors } = ctx
+    await setupProviderAndKey(win, mock.url, 'sk-good')
+    mock.state.browserRun = true
+    mock.state.browserUrl = pageUrl + '?agent=1'
+    mock.state.browserDelayMs = 1500
+
+    await win.getByTestId('nav-browser').click()
+    await win.getByTestId('browser-view').waitFor()
+    await waitFor(
+      async () => (await win.evaluate(() => window.api.browser.state())).tabs.length === 1
+    )
+    await win.getByTestId('browser-address').fill(pageUrl)
+    await win.getByTestId('browser-go').click()
+    await waitFor(async () =>
+      (await readGuestBody(ctx.electronApp, pageUrl))?.includes('内置浏览器测试页')
+    )
+    await win.getByTestId('browser-reload').click()
+    await waitFor(async () => pageState.userCookie === 'miniagent_user=secret')
+    await sendBrowserGoal(win)
+
+    await waitFor(async () => {
+      const state = await win.evaluate(() => window.api.browser.state())
+      return state.tabs.some((tab) => tab.kind === 'agent')
+    })
+    await win.getByTestId('nav-browser').click()
+    await win.getByTestId('browser-agent-banner').waitFor()
+    await waitFor(async () => pageState.result === 'MiniAgent')
+    expect(pageState.userCookie).toBe('miniagent_user=secret')
+    expect(pageState.agentCookie).toBe('')
+    await win.getByTestId('nav-chat').click()
+    await win.getByText('浏览器任务完成。').waitFor({ timeout: 45000 })
+
+    await waitFor(async () => {
+      const current = await win.evaluate(() => window.api.browser.state())
+      return !current.tabs.some((tab) => tab.kind === 'agent')
+    })
+    const state = await win.evaluate(() => window.api.browser.state())
+    expect(state.tabs.some((tab) => tab.kind === 'agent')).toBe(false)
+    const audit = await win.evaluate(async () => {
+      const runs = await window.api.agent.runs()
+      const calls = await window.api.agent.calls(runs[0].id)
+      return calls.map((call) => ({ tool: call.tool, args: call.args, error: call.error }))
+    })
+    const typeCall = audit.find((call) => call.tool === 'browser_type')
+    expect(typeCall).toBeTruthy()
+    expect(JSON.parse(typeCall.args).text).toBe('[redacted]')
+    expect(audit.some((call) => call.tool === 'browser_navigate')).toBe(true)
+    expect(audit.some((call) => call.tool === 'browser_click')).toBe(true)
+    expect(unexpectedErrors(consoleErrors)).toEqual([])
+  })
+
+  it('blocks subsequent Agent actions after human takeover', async () => {
+    const { win, mock, consoleErrors } = ctx
+    await setupProviderAndKey(win, mock.url, 'sk-good')
+    mock.state.browserRun = true
+    mock.state.browserUrl = pageUrl
+    mock.state.browserDelayMs = 3000
+
+    await sendBrowserGoal(win)
+    await waitFor(async () => {
+      const state = await win.evaluate(() => window.api.browser.state())
+      return state.tabs.some((tab) => tab.kind === 'agent')
+    })
+    await win.getByTestId('nav-browser').click()
+    await win.getByTestId('browser-agent-banner').waitFor()
+    await win.getByTestId('browser-takeover').click()
+    await win.getByTestId('nav-chat').click()
+    await win.getByText('浏览器任务已中止：用户人工接管。').waitFor({ timeout: 45000 })
+
+    expect(pageState.result).toBe(null)
+    const failedCall = await win.evaluate(async () => {
+      const runs = await window.api.agent.runs()
+      const calls = await window.api.agent.calls(runs[0].id)
+      return (
+        calls.find(
+          (call) =>
+            call.tool.startsWith('browser_') && String(call.error || '').includes('人工接管')
+        ) || null
+      )
+    })
+    expect(failedCall).toBeTruthy()
+    expect(failedCall.error).toContain('人工接管')
+    expect(unexpectedErrors(consoleErrors)).toEqual([])
+  })
+})
+
+describe('内置浏览器 P5 登录态与文件能力', () => {
+  it('persists user login across restart, clears it and stores downloads in a dedicated directory', async () => {
+    let { electronApp, win, mock, userData, consoleErrors } = ctx
+    await win.getByTestId('nav-browser').click()
+    await win.getByTestId('browser-view').waitFor()
+    await waitFor(
+      async () => (await win.evaluate(() => window.api.browser.state())).tabs.length === 1
+    )
+    await win.getByTestId('browser-address').fill(pageUrl)
+    await win.getByTestId('browser-go').click()
+    await waitFor(async () =>
+      (await readGuestBody(electronApp, pageUrl))?.includes('内置浏览器测试页')
+    )
+    await win.getByTestId('browser-reload').click()
+    await waitFor(async () => pageState.userCookie === 'miniagent_user=secret')
+
+    await closeApp(electronApp, mock)
+    ctx = null
+    pageState.userCookie = null
+    ctx = await launchApp({ reuseUserData: userData })
+    ;({ electronApp, win, mock, consoleErrors } = ctx)
+    await win.evaluate(() => window.api.settings.set('browserAllowPrivateNetwork', true))
+
+    await win.getByTestId('nav-browser').click()
+    await win.getByTestId('browser-view').waitFor()
+    await waitFor(
+      async () => (await win.evaluate(() => window.api.browser.state())).tabs.length === 1
+    )
+    await win.getByTestId('browser-address').fill(pageUrl)
+    await win.getByTestId('browser-go').click()
+    await waitFor(async () => pageState.userCookie === 'miniagent_user=secret')
+
+    const info = await win.evaluate(() => window.api.app.info())
+    await electronApp.evaluate(({ webContents }, url) => {
+      const guest = webContents.getAllWebContents().find((contents) => contents.getURL() === url)
+      if (!guest) throw new Error('guest not found')
+      return guest.executeJavaScript(
+        `(() => { location.href = ${JSON.stringify(url + 'download')} })()`
+      )
+    }, pageUrl)
+    const downloadPath = path.join(info.dataDir, 'browser-downloads', 'miniagent-download.txt')
+    await waitFor(() => fs.existsSync(downloadPath))
+    expect(fs.readFileSync(downloadPath, 'utf8')).toBe('DOWNLOAD_OK')
+
+    await win.evaluate(() => window.api.browser.clearData())
+    await win.getByTestId('browser-new-tab').click()
+    await win.getByTestId('browser-address').fill(pageUrl)
+    await win.getByTestId('browser-go').click()
+    await waitFor(async () => pageState.userCookie === '')
+    expect(unexpectedErrors(consoleErrors)).toEqual([])
+  })
+})
+
+describe('内置浏览器 P6 韧性与可观测性', () => {
+  it('blocks private navigation by default and the feature switch closes every tab', async () => {
+    const { electronApp, win, consoleErrors } = ctx
+    await win.evaluate(() => window.api.settings.set('browserAllowPrivateNetwork', false))
+    await win.getByTestId('nav-browser').click()
+    await win.getByTestId('browser-view').waitFor()
+    await waitFor(
+      async () => (await win.evaluate(() => window.api.browser.state())).tabs.length === 1
+    )
+
+    await win.getByTestId('browser-address').fill(pageUrl)
+    await win.getByTestId('browser-go').click()
+    await win.getByTestId('browser-error').waitFor()
+    await waitFor(async () =>
+      (await win.getByTestId('browser-error').textContent()).includes('禁止')
+    )
+
+    await win.evaluate(() => window.api.settings.set('browserAllowPrivateNetwork', true))
+    await win.getByTestId('browser-go').click()
+    await waitFor(async () =>
+      (await readGuestBody(electronApp, pageUrl))?.includes('内置浏览器测试页')
+    )
+
+    await win.evaluate(() => window.api.browser.setEnabled(false))
+    await win.getByTestId('browser-enable').waitFor()
+    expect((await win.evaluate(() => window.api.browser.state())).tabs).toHaveLength(0)
+    await win.getByTestId('browser-enable').click()
+    await waitFor(
+      async () => (await win.evaluate(() => window.api.browser.state())).tabs.length === 1
+    )
     expect(unexpectedErrors(consoleErrors)).toEqual([])
   })
 })
