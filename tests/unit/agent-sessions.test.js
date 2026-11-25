@@ -296,26 +296,61 @@ describe('session 状态与结果', () => {
     seedRun(conv.id, 'running')
     const r = await sessions.waitForSession({
       conversationId: conv.id,
-      timeoutMs: 1000,
-      pollMs: 200
+      timeoutMs: 1000
     })
     expect(r.timedOut).toBe(true)
     expect(r.status).toBe('running')
     expect(r.waited).toBeGreaterThanOrEqual(1000)
   })
 
-  it('wait 在轮询中观察到状态变化后返回', async () => {
+  it('wait 由状态事件唤醒，不依赖轮询', async () => {
     const parent = seedParent()
     const conv = await sessions.createSession({ parentConversationId: parent.id, title: 'T' })
     const runId = seedRun(conv.id, 'running')
-    setTimeout(() => repos.updateRun(dbm.get(), runId, { status: 'done', stepsUsed: 1 }), 250)
-    const r = await sessions.waitForSession({
-      conversationId: conv.id,
-      timeoutMs: 5000,
-      pollMs: 100
-    })
+    const pending = sessions.waitForSession({ conversationId: conv.id, timeoutMs: 5000 })
+    getHub().emit('run.end', { runId: 'other', conversationId: 'other', status: 'done' })
+    repos.updateRun(dbm.get(), runId, { status: 'done', stepsUsed: 1 })
+    getHub().emit('run.end', { runId, conversationId: conv.id, status: 'done' })
+    const r = await pending
     expect(r.timedOut).toBe(false)
     expect(r.status).toBe('done')
+  })
+
+  it('wait 支持普通对话完成事件', async () => {
+    const parent = seedParent()
+    const conv = await sessions.createSession({ parentConversationId: parent.id, title: 'T' })
+    const message = repos.insertMessage(dbm.get(), {
+      conversationId: conv.id,
+      role: 'assistant',
+      content: '',
+      status: 'pending'
+    })
+    const pending = sessions.waitForSession({ conversationId: conv.id, timeoutMs: 5000 })
+    repos.updateMessage(dbm.get(), message.id, { content: '完成', status: 'done' })
+    getHub().emit('chat:event', {
+      type: 'done',
+      conversationId: conv.id,
+      msgId: message.id
+    })
+    expect(await pending).toMatchObject({ status: 'done', timedOut: false })
+  })
+
+  it('wait 中止时拒绝并释放事件订阅', async () => {
+    const parent = seedParent()
+    const conv = await sessions.createSession({ parentConversationId: parent.id, title: 'T' })
+    seedRun(conv.id, 'running')
+    expect(sessions.getSessionStatus({ conversationId: conv.id }).status).toBe('running')
+    const controller = new AbortController()
+    const listeners = getHub().listenerCount()
+    const pending = sessions.waitForSession({
+      conversationId: conv.id,
+      timeoutMs: 5000,
+      signal: controller.signal
+    })
+    expect(getHub().listenerCount()).toBe(listeners + 1)
+    controller.abort()
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    expect(getHub().listenerCount()).toBe(listeners)
   })
 
   it('wait 不把 waiting_child 当成终态', async () => {
@@ -325,8 +360,7 @@ describe('session 状态与结果', () => {
     expect(repos.updateRunStatus(dbm.get(), runId, { status: 'waiting_child' }).ok).toBe(true)
     const r = await sessions.waitForSession({
       conversationId: conv.id,
-      timeoutMs: 1000,
-      pollMs: 200
+      timeoutMs: 1000
     })
     expect(r.timedOut).toBe(true)
     expect(r.status).toBe('waiting_child')

@@ -33,6 +33,20 @@ describe('redactToolArgs', () => {
     expect(redacted.url).not.toContain('frag')
   })
 
+  it('redacts computer input values and keys before approval and audit', () => {
+    expect(redactToolArgs('computer_type', { ref: 'e1', value: 'private' })).toEqual({
+      ref: 'e1',
+      value: '[redacted]'
+    })
+    expect(redactToolArgs('computer_key', { keys: 'private', processId: 42 })).toEqual({
+      keys: '[redacted]',
+      processId: 42
+    })
+    expect(
+      redactToolArgs('computer_input', { type: 'insertText', text: 'private', key: 'private' })
+    ).toEqual({ type: 'insertText', text: '[redacted]', key: '[redacted]' })
+  })
+
   it('redacts common secret fields without mutating the original args', () => {
     const args = { apiKey: 'key', nested: { password: 'pass' }, safe: 'ok' }
     const redacted = redactToolArgs('custom', args)

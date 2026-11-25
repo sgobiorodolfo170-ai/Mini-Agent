@@ -40,6 +40,7 @@ const hooksError = ref('')
 const includeKeys = ref(false)
 const browserEnabled = ref(true)
 const browserAllowPrivateNetwork = ref(false)
+const computerEnabled = ref(false)
 
 function syncFromStore() {
   hotkeys.value = { ...settings.hotkeys }
@@ -50,6 +51,7 @@ function syncFromStore() {
   mcpServersJson.value = settings.settings.agentMcpServers || ''
   browserEnabled.value = settings.settings.browserEnabled !== false
   browserAllowPrivateNetwork.value = settings.settings.browserAllowPrivateNetwork === true
+  computerEnabled.value = settings.settings.computerUseEnabled === true
   syncHooks()
 }
 
@@ -420,6 +422,19 @@ async function clearBrowserData() {
     ui.toast('浏览器数据已清除', 'success')
   } catch (error) {
     ui.toast('清除失败：' + String(error.message || error), 'error')
+  }
+}
+
+async function toggleComputerEnabled() {
+  const value = !computerEnabled.value
+  computerEnabled.value = value
+  try {
+    await settings.set('computerUseEnabled', value)
+    if (!value && window.api.computer) await window.api.computer.stop()
+    ui.toast(value ? '电脑操作已启用（默认仍需逐次确认）' : '电脑操作已停用', 'success')
+  } catch (error) {
+    computerEnabled.value = !value
+    ui.toast('电脑操作开关保存失败：' + String(error.message || error), 'error')
   }
 }
 
@@ -1238,6 +1253,25 @@ async function openLogFolder() {
                 <p class="field-help mt-1">
                   命令工作目录已移至会话页「项目」分组：每个项目可绑定独立目录，任务模式按会话所属项目执行命令。
                 </p>
+              </div>
+              <div class="max-w-2xl rounded-lg border border-line-subtle bg-panel p-3">
+                <div class="flex items-center justify-between gap-3">
+                  <div>
+                    <span class="field-label">电脑操作（Windows UIA + 浏览器 CDP）</span>
+                    <p class="field-help mt-1">
+                      默认关闭。启用后仍按工具风险审批；密码控件禁止写入，所有动作要求目标窗口在前台。需要
+                      .NET 10 Windows Desktop Runtime。
+                    </p>
+                  </div>
+                  <button
+                    class="btn-compact shrink-0"
+                    data-testid="computer-enabled-toggle"
+                    :aria-pressed="computerEnabled"
+                    @click="toggleComputerEnabled"
+                  >
+                    {{ computerEnabled ? '已启用' : '已停用' }}
+                  </button>
+                </div>
               </div>
               <div class="grid grid-cols-2 gap-3 max-w-md">
                 <label>

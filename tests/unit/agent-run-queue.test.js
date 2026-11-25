@@ -5,6 +5,7 @@ import repos from '../../electron/store/repos'
 import storage from '../../electron/store/run-storage'
 import runtime from '../../electron/main/agent/run-runtime'
 import graph from '../../electron/main/agent/graph'
+import { getHub } from '../../electron/main/events/hub'
 
 let db
 
@@ -55,6 +56,28 @@ it('exposes run snapshots, transfer results and event-driven waits', async () =>
   await expect(
     runtime.waitForRuns(db, { runIds: ['removed'], resolveRunIds: () => [], timeoutMs: 10 })
   ).resolves.toEqual({ timedOut: false, runs: [] })
+})
+
+it('waitForRuns wakes on run.end without a polling fallback', async () => {
+  const runId = seed('running')
+  const pending = runtime.waitForRuns(db, { runIds: [runId], timeoutMs: 5000 })
+  repos.updateRunStatus(db, runId, { status: 'done' })
+  getHub().emit('run.end', { runId, status: 'done' })
+  await expect(pending).resolves.toMatchObject({
+    timedOut: false,
+    runs: [expect.objectContaining({ runId, status: 'done' })]
+  })
+})
+
+it('waitForRuns also wakes when graph replanning stops a node', async () => {
+  const runId = seed('queued')
+  const pending = runtime.waitForRuns(db, { runIds: [runId], timeoutMs: 5000 })
+  repos.updateRunStatus(db, runId, { status: 'stopped' })
+  getHub().emit('graph.updated', { graphId: 'graph-1', status: 'running' })
+  await expect(pending).resolves.toMatchObject({
+    timedOut: false,
+    runs: [expect.objectContaining({ runId, status: 'stopped' })]
+  })
 })
 
 it('reset clears stale slots and invalidates a scheduled callback', async () => {

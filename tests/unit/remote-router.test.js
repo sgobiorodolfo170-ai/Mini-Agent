@@ -146,3 +146,22 @@ describe('RemoteCommandRouter', () => {
     await expect(router.execute(authCtx, c2, 'tls')).rejects.toThrow(/幂等/)
   })
 })
+
+describe('RemoteEventStore', () => {
+  it('消息 meta 为 JSON null 时仍返回快照和消息列表', () => {
+    const authCtx = { deviceId: device.device_id, role: 'operator' }
+    const message = repos.insertMessage(db, {
+      conversationId: conv.id,
+      role: 'assistant',
+      content: '空 meta 回复'
+    })
+    db.prepare("UPDATE messages SET meta='null' WHERE id=?").run(message.id)
+
+    expect(events.messages(authCtx, conv.id)).toEqual([
+      expect.objectContaining({ id: message.id, content: '空 meta 回复', agentRunId: null })
+    ])
+    expect(events.snapshot(authCtx).messages).toEqual([
+      expect.objectContaining({ id: message.id, agentRunId: null })
+    ])
+  })
+})

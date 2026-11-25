@@ -14,6 +14,9 @@ asarUnpack:
   - '**/node_modules/faiss-node/**'
   - '**/node_modules/bindings/**'
   - '**/node_modules/file-uri-to-path/**'
+extraResources:
+  - from: native/computer-uia/bin/Release/net10.0-windows/win-x64/publish
+    to: computer-uia
 electronDownload:
   mirror: https://npmmirror.com/mirrors/electron/
 win:

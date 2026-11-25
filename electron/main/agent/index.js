@@ -51,8 +51,57 @@ const { isShuttingDown } = require('../lifecycle')
 const { getBrowser } = require('../browser')
 const { retrieveProjectKb, startProjectIndex } = require('../rag/index')
 const { renderKbSystem } = require('../gateway/context')
+const { createComputerService } = require('../computer/service')
 
 let controlRuntime = null
+let computerRuntime = null
+function getComputer() {
+  if (!computerRuntime) {
+    const electron = require('electron')
+    const helperPath = electron.app.isPackaged
+      ? path.join(process.resourcesPath, 'computer-uia', 'computer-uia.exe')
+      : path.join(
+          electron.app.getAppPath(),
+          'native',
+          'computer-uia',
+          'bin',
+          'Release',
+          'net10.0-windows',
+          'win-x64',
+          'publish',
+          'computer-uia.exe'
+        )
+    computerRuntime = createComputerService({
+      helperPath,
+      artifactDir: path.join(electron.app.getPath('userData'), 'computer-artifacts'),
+      electronApi: electron,
+      getSetting: (key) => repos.getSetting(dbm.get(), key),
+      browser: getBrowser()
+    })
+  }
+  return computerRuntime
+}
+const computerFacade = {
+  listWindows: (...args) => getComputer().listWindows(...args),
+  snapshot: (...args) => getComputer().snapshot(...args),
+  foreground: (...args) => getComputer().foreground(...args),
+  invoke: (...args) => getComputer().invoke(...args),
+  setValue: (...args) => getComputer().setValue(...args),
+  key: (...args) => getComputer().key(...args),
+  input: (...args) => getComputer().input(...args),
+  capture: (...args) => getComputer().capture(...args),
+  stop: (...args) => getComputer().stop(...args)
+}
+function stopComputer() {
+  if (!computerRuntime) return
+  try {
+    computerRuntime.stop()
+  } catch {
+    // 功能未启用或助手已退出。
+  } finally {
+    computerRuntime = null
+  }
+}
 function getControlRuntime(db) {
   if (!controlRuntime || controlRuntime.db !== db) {
     controlRuntime = {
@@ -564,11 +613,17 @@ function registerPlan(tasks, { parentRunId, idempotencyKey } = {}) {
   return { graphId: rows.graphId || (rows[0] && rows[0].graphId) || null, runs: rows }
 }
 
-function getGraphForParent(parentRunId) {
+function resolveGraphForParent(parentRunId) {
   const db = dbm.get()
   const run = repos.getRun(db, parentRunId)
-  const g =
-    run && run.graphId ? graph.getGraph(db, run.graphId) : graph.getGraphForParent(db, parentRunId)
+  return run && run.graphId
+    ? graph.getGraph(db, run.graphId)
+    : graph.getGraphForParent(db, parentRunId)
+}
+
+function getGraphForParent(parentRunId) {
+  const db = dbm.get()
+  const g = resolveGraphForParent(parentRunId)
   if (!g) return null
   const result = graph.summary(db, g.id)
   if (result)
@@ -579,17 +634,153 @@ function getGraphForParent(parentRunId) {
   return result
 }
 
+function getGraphLayoutForParent(parentRunId) {
+  const g = resolveGraphForParent(parentRunId)
+  return g ? graph.graphLayout(dbm.get(), g.id) : null
+}
+
+function saveGraphLayoutForParent(parentRunId, input = {}) {
+  const g = resolveGraphForParent(parentRunId)
+  if (!g) throw new Error('任务图不存在')
+  return transaction(dbm.get(), () =>
+    graph.saveGraphLayout(dbm.get(), {
+      graphId: g.id,
+      layout: input.layout,
+      viewport: input.viewport,
+      baseRevision: input.baseRevision
+    })
+  )
+}
+
+function createDynamicGraphNode(db, { graphId, parentRunId, key, goal }) {
+  const ownerState = active.get(parentRunId)
+  const parent = repos.getRun(db, parentRunId)
+  if (!ownerState || ownerState.stopped || !parent) throw new Error('父任务运行状态不可用')
+  const parentConversation = repos.getConversation(db, parent.conversationId)
+  if (!parentConversation) throw new Error('父任务会话不存在')
+  const conversation = repos.createConversation(db, {
+    title: String(key).slice(0, 80),
+    origin: 'agent',
+    parentId: parentConversation.id,
+    createdByRun: parentRunId,
+    providerId: parentConversation.providerId,
+    model: parentConversation.model,
+    projectId: parentConversation.projectId,
+    systemPrompt: parentConversation.systemPrompt
+  })
+  const { provider, model } = resolveModel(db, conversation.id)
+  if (!provider || !model) throw new Error('未配置模型服务或模型')
+  const mandate = defaultSubMandate(ownerState.mandate)
+  if (mandate) {
+    if (!ownerState.mandate) {
+      const dirs = ownerState.authorizedDirs || []
+      mandate.authorizedDirs = { read: [...dirs], write: [...dirs] }
+    } else if (ownerState.workspacePath) {
+      mandate.authorizedDirs = {
+        read: [...new Set([...mandate.authorizedDirs.read, ownerState.workspacePath])],
+        write: [...new Set([...mandate.authorizedDirs.write, ownerState.workspacePath])]
+      }
+    }
+  }
+  const permission =
+    mandate?.permissionMode === 'readonly' || ownerState.permission === 'readonly'
+      ? 'readonly'
+      : 'autonomous'
+  const settings = repos.getAllSettings(db)
+  const maxSteps = Math.min(
+    Number(settings.agentMaxSteps) || 15,
+    mandate?.limits.maxSteps || Infinity
+  )
+  const runId = repos.createRun(db, {
+    conversationId: conversation.id,
+    goal,
+    maxSteps,
+    status: 'queued',
+    parentRunId,
+    controlMode: 'delegated',
+    mandate,
+    traceId: parent.traceId || parentRunId,
+    graphId,
+    nodeKey: key
+  })
+  const user = repos.insertMessage(db, {
+    conversationId: conversation.id,
+    role: 'user',
+    content: goal,
+    meta: { agent: true, runId }
+  })
+  const assistant = repos.insertMessage(db, {
+    conversationId: conversation.id,
+    role: 'assistant',
+    content: '',
+    status: 'pending',
+    meta: { agentRunId: runId }
+  })
+  db.prepare(
+    `UPDATE agent_runs SET submitted_at=?,user_message_id=?,assistant_message_id=?,run_spec_json=? WHERE id=?`
+  ).run(
+    Date.now(),
+    user.id,
+    assistant.id,
+    JSON.stringify({
+      version: 1,
+      providerId: provider.id,
+      model,
+      permission,
+      cluster: !!ownerState.cluster,
+      projectId: conversation.projectId,
+      kbIds: [],
+      first: true,
+      endpoint: provider.base_url,
+      context: [],
+      systemPrompt: conversation.systemPrompt || ''
+    }),
+    runId
+  )
+  repos.touchConversation(db, conversation.id)
+  recordRunState(db, runId)
+  return runId
+}
+
 function mutateRunGraph(input) {
   const db = dbm.get()
+  if (
+    input.ops?.some((op) => op.action === 'add') &&
+    repos.getSetting(db, 'dynamicGraphNodesEnabled') === false
+  ) {
+    throw new Error('动态新增节点已停用')
+  }
+  const beforeKeys = new Set(
+    graph.summary(db, input.graphId)?.nodes.map((node) => node.nodeKey) || []
+  )
   const result = transaction(db, () =>
     graph.mutateGraph(db, {
       graphId: input.graphId,
       etag: input.etag,
       ops: input.ops,
-      isClaimed: (runId) => runQueue.isClaimed(runId)
+      isClaimed: (runId) => runQueue.isClaimed(runId),
+      createNode: (node) => createDynamicGraphNode(db, node)
     })
   )
   runQueue.schedule(db)
+  for (const node of result.nodes.filter((node) => !beforeKeys.has(node.nodeKey))) {
+    const run = repos.getRun(db, node.runId)
+    publishRegistration(db, {
+      runId: node.runId,
+      conversationId: run.conversationId,
+      userMsgId: run.userMessageId,
+      assistantMsgId: run.assistantMessageId,
+      status: run.status,
+      graphId: result.graphId,
+      nodeKey: node.nodeKey
+    })
+    getHub().emit('graph.node.created', {
+      graphId: result.graphId,
+      runId: node.runId,
+      nodeKey: node.nodeKey,
+      parentRunId: result.parentRunId
+    })
+  }
   broadcast('agent:event', { type: 'graph', graphId: result.graphId, status: result.status })
   getHub().emit('graph.updated', result)
   return result
@@ -1054,6 +1245,7 @@ async function doAgentRun({
     memoryPath: path.join(electron.app.getPath('userData'), 'agent-memory.md'),
     browserFactory: (opts) => new electron.BrowserWindow(opts),
     browser: getBrowser() ? getBrowser().forRun(runId) : null,
+    computer: computerFacade,
     mcpServers: parseMcpServers(settings.agentMcpServers),
     tavilyKey: settings.tavilyApiKey || '',
     webSearchProvider: settings.webSearchProvider || 'auto',
@@ -1751,6 +1943,8 @@ function resumeRun(runId, actor = 'desktop') {
 module.exports = {
   startAgentRun,
   getGraphForParent,
+  getGraphLayoutForParent,
+  saveGraphLayoutForParent,
   mutateRunGraph,
   resumeQueuedRuns,
   getRunStatus: (id) => getRunStatus(dbm.get(), id),
@@ -1765,6 +1959,7 @@ module.exports = {
   retryInterruptedRun,
   stopRun,
   stopAllRuns,
+  stopComputer,
   listActiveRuns,
   summarize,
   resolveWorkingDir,

@@ -24,6 +24,7 @@ export function createMockServer() {
     clusterSpawn: false,
     transferRun: false,
     planRun: false,
+    computerRun: false,
     planNodeDelayMs: 0,
     agentDelayMs: 0,
     browserRun: false,
@@ -217,6 +218,110 @@ export function createMockServer() {
                               ]
                             })
                           }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }),
+              JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })
+            ])
+            return
+          }
+        }
+        if (body.tools && state.computerRun) {
+          const last = msgs.at(-1)
+          if (last?.role === 'tool' && last.tool_call_id === 'computer-list') {
+            let windows
+            try {
+              windows = JSON.parse(last.content)
+            } catch {
+              sse(res, [
+                JSON.stringify({
+                  choices: [{ index: 0, delta: { content: '电脑操作失败：' + last.content } }]
+                }),
+                JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })
+              ])
+              return
+            }
+            const target = windows.find((item) => String(item.name).includes('Mini Agent'))
+            if (!target) {
+              sse(res, [
+                JSON.stringify({
+                  choices: [{ index: 0, delta: { content: '未找到 Mini Agent 窗口' } }]
+                }),
+                JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })
+              ])
+              return
+            }
+            sse(res, [
+              JSON.stringify({
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: [
+                        {
+                          index: 0,
+                          id: 'computer-snapshot',
+                          type: 'function',
+                          function: {
+                            name: 'computer_snapshot',
+                            arguments: JSON.stringify({ processId: target.processId, maxNodes: 50 })
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }),
+              JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })
+            ])
+            return
+          }
+          if (last?.role === 'tool' && last.tool_call_id === 'computer-snapshot') {
+            sse(res, [
+              JSON.stringify({
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: [
+                        {
+                          index: 0,
+                          id: 'computer-capture',
+                          type: 'function',
+                          function: { name: 'computer_capture', arguments: '{}' }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }),
+              JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })
+            ])
+            return
+          }
+          if (last?.role === 'tool' && last.tool_call_id === 'computer-capture') {
+            sse(res, [
+              JSON.stringify({ choices: [{ index: 0, delta: { content: '电脑操作验收完成。' } }] }),
+              JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })
+            ])
+            return
+          }
+          if (!hasToolResult) {
+            sse(res, [
+              JSON.stringify({
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: [
+                        {
+                          index: 0,
+                          id: 'computer-list',
+                          type: 'function',
+                          function: { name: 'computer_list_windows', arguments: '{}' }
                         }
                       ]
                     }

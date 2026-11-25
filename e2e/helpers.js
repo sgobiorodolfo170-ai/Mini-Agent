@@ -1,6 +1,7 @@
 import path from 'path'
 import fs from 'fs'
 import os from 'os'
+import { once } from 'node:events'
 import { _electron } from 'playwright-core'
 import { createMockServer } from './mock-server'
 
@@ -64,7 +65,14 @@ export function unexpectedErrors(consoleErrors) {
 
 export async function closeApp(electronApp, mock) {
   try {
+    const child = electronApp.process()
     await electronApp.close()
+    if (child && child.exitCode === null && child.signalCode === null) {
+      await Promise.race([
+        once(child, 'exit'),
+        new Promise((resolve) => setTimeout(resolve, 10000))
+      ])
+    }
   } catch {
     /* ignore */
   }

@@ -60,6 +60,12 @@ function redactToolArgs(toolName, args) {
   }
   const source = args && typeof args === 'object' ? redact(args) : {}
   if (toolName === 'browser_type') source.text = '[redacted]'
+  if (toolName === 'computer_type') source.value = '[redacted]'
+  if (toolName === 'computer_key') source.keys = '[redacted]'
+  if (toolName === 'computer_input') {
+    source.text = '[redacted]'
+    source.key = '[redacted]'
+  }
   if (toolName === 'browser_navigate' && typeof source.url === 'string') {
     try {
       const url = new URL(source.url)

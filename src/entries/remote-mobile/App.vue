@@ -18,6 +18,14 @@ type Conn = 'offline' | 'connecting' | 'online' | 'retrying'
 type PairStatus = 'idle' | 'submitting' | 'expired' | 'error'
 type Tone = 'info' | 'ok' | 'warn' | 'bad'
 
+interface OfflineCommand {
+  id: string
+  type: string
+  payload: Record<string, unknown>
+  conversationId: string | null
+  createdAt: number
+}
+
 interface Conversation {
   id: string
   title: string
@@ -477,6 +485,8 @@ async function boot(): Promise<void> {
     return
   }
   clearCreds()
+  offlineQueue.value = []
+  persistOfflineQueue()
   phase.value = 'pairing'
   booting.value = false
   if (pair.ticket) void startPairing()
@@ -486,6 +496,8 @@ function goPairing(message?: string): void {
   closeSocket()
   stopWatchdog()
   clearCreds()
+  offlineQueue.value = []
+  persistOfflineQueue()
   serverAuth.authenticated = false
   phase.value = 'pairing'
   pair.status = 'idle'
@@ -566,6 +578,69 @@ let ackTimer: number | null = null
 let reconnectAttempt = 0
 let socketClosing = false
 const pending = new Map<string, { type: string; timer: number }>()
+const OFFLINE_QUEUE_KEY = 'miniagent_remote_offline_v1'
+const offlineQueue = ref<OfflineCommand[]>(readOfflineQueue())
+
+function readOfflineQueue(): OfflineCommand[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem(OFFLINE_QUEUE_KEY) || '[]')
+    if (!Array.isArray(raw)) return []
+    return raw
+      .filter(
+        (item) =>
+          item &&
+          typeof item.id === 'string' &&
+          typeof item.type === 'string' &&
+          item.payload &&
+          typeof item.payload === 'object'
+      )
+      .slice(-100)
+  } catch {
+    return []
+  }
+}
+
+function persistOfflineQueue(): void {
+  try {
+    localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(offlineQueue.value))
+  } catch {
+    pushToast('warn', '离线队列无法写入本地存储，请保持页面打开')
+  }
+}
+
+function enqueueOfflineCommand(
+  type: string,
+  payload: Record<string, unknown>,
+  conversationId: string | null
+): string {
+  const item: OfflineCommand = {
+    id: uuid(),
+    type,
+    payload,
+    conversationId,
+    createdAt: Date.now()
+  }
+  offlineQueue.value.push(item)
+  if (offlineQueue.value.length > 100) offlineQueue.value.shift()
+  persistOfflineQueue()
+  return item.id
+}
+
+function flushOfflineQueue(): void {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return
+  for (const item of offlineQueue.value) {
+    if (pending.has(item.id)) continue
+    const requestId = sendCommand(item.type, item.payload, item.conversationId, item.id)
+    if (!requestId) break
+  }
+}
+
+function removeOfflineCommand(requestId: string): void {
+  const index = offlineQueue.value.findIndex((item) => item.id === requestId)
+  if (index < 0) return
+  offlineQueue.value.splice(index, 1)
+  persistOfflineQueue()
+}
 
 function wsUrl(): string {
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -616,6 +691,7 @@ function connectSocket(): void {
       conversation_id: activeConversationId.value || null,
       payload: { epoch: streamEpoch.value || null, after_seq: lastSeq.value }
     })
+    flushOfflineQueue()
     clearTimer('heartbeat')
     heartbeatTimer = window.setInterval(() => {
       if (socket && socket.readyState === WebSocket.OPEN) {
@@ -735,9 +811,9 @@ function sendRaw(msg: Record<string, unknown>): boolean {
 function sendCommand(
   type: string,
   payload: Record<string, unknown>,
-  conversationId: string | null = null
+  conversationId: string | null = null,
+  requestId: string = uuid()
 ): string | null {
-  const requestId = uuid()
   const ok = sendRaw({
     v: 1,
     id: uuid(),
@@ -792,6 +868,9 @@ function settleAck(requestId: string, status: string, detail: unknown): void {
   window.clearTimeout(item.timer)
   const s = status.toLowerCase()
   if (s === 'accepted' || s === 'completed') {
+    removeOfflineCommand(requestId)
+    const queued = messages.value.find((message) => message.id === requestId)
+    if (queued) queued.status = 'sent'
     if (s === 'completed' && item.type === 'chat.message.send') {
       const msg = (detail ?? {}) as Record<string, unknown>
       const id = text(field(msg, ['messageId', 'message_id', 'id']), 64)
@@ -804,6 +883,9 @@ function settleAck(requestId: string, status: string, detail: unknown): void {
   const message =
     text(err?.message ?? (typeof detail === 'string' ? detail : ''), 200) || '服务端未接受该命令'
   pushToast('bad', `${labelOf(item.type)}失败：${message}`)
+  removeOfflineCommand(requestId)
+  const failed = messages.value.find((message) => message.id === requestId)
+  if (failed) failed.status = 'error'
 }
 
 function handleFrame(raw: string): void {
@@ -1093,6 +1175,11 @@ async function loadRuns(): Promise<void> {
 
 async function loadApprovals(): Promise<void> {
   if (phase.value !== 'app') return
+  if (!capability.value.approver) {
+    approvals.value = []
+    busy.approvals = false
+    return
+  }
   busy.approvals = true
   try {
     const data = await http<unknown>('/approvals?status=pending&limit=' + LIST_LIMIT)
@@ -1281,8 +1368,21 @@ async function sendChat(): Promise<void> {
     activeConversationId.value || null
   )
   if (!rid) {
+    const queuedId = enqueueOfflineCommand(
+      'chat.message.send',
+      { content, mode: 'chat' },
+      activeConversationId.value || null
+    )
+    messages.value.push({
+      id: queuedId,
+      role: 'user',
+      content,
+      status: 'queued',
+      createdAt: Date.now()
+    })
+    draft.value = ''
     busy.send = false
-    pushToast('warn', '实时通道未连接，正在重连，请稍后重试')
+    pushToast('ok', '已加入离线队列，连接恢复后自动发送')
     if (conn.value !== 'connecting') connectSocket()
     return
   }
@@ -1493,20 +1593,19 @@ function resolveConfirm(value: boolean): void {
 /* ---------------- 派生展示 ---------------- */
 
 const connLabel = computed(() => {
-  if (insecure.value && conn.value === 'online') return '已连接（非加密）'
-  return { offline: '未连接', connecting: '连接中', online: '已连接', retrying: '重连中' }[
-    conn.value
-  ]
+  const base =
+    insecure.value && conn.value === 'online'
+      ? '已连接（非加密）'
+      : { offline: '未连接', connecting: '连接中', online: '已连接', retrying: '重连中' }[
+          conn.value
+        ]
+  return offlineQueue.value.length ? `${base} · 待同步 ${offlineQueue.value.length}` : base
 })
 const connClass = computed(() => 'dot dot-' + conn.value)
 const pendingCount = computed(() => approvals.value.length)
 const activeRuns = computed(() => runs.value.filter(isRunActive))
 const canSend = computed(
-  () =>
-    capability.value.operator &&
-    conn.value === 'online' &&
-    draft.value.trim().length > 0 &&
-    !busy.send
+  () => capability.value.operator && draft.value.trim().length > 0 && !busy.send
 )
 const roleHint = computed(() => {
   const c = capability.value
@@ -1557,14 +1656,14 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="rm-root">
+  <div class="rm-root" data-testid="remote-mobile" :data-phase="phase">
     <!-- 顶部：连接状态 -->
     <header class="rm-header">
       <div class="rm-title">
         <span class="brand-dot" aria-hidden="true"></span>
         <span>Mini Agent 远程控制</span>
       </div>
-      <div v-if="phase === 'app'" class="rm-status">
+      <div v-if="phase === 'app'" class="rm-status" data-testid="remote-connection">
         <span :class="connClass" aria-hidden="true"></span>
         <span>{{ connLabel }}</span>
         <span class="rm-role">{{ capability.role }}</span>
@@ -1578,12 +1677,12 @@ onBeforeUnmount(() => {
 
     <main class="rm-main">
       <!-- 启动中 -->
-      <section v-if="phase === 'boot'" class="pane pane-center">
+      <section v-if="phase === 'boot'" class="pane pane-center" data-testid="remote-phase-boot">
         <p class="muted">正在检查登录状态…</p>
       </section>
 
       <!-- 配对 -->
-      <section v-else-if="phase === 'pairing'" class="pane">
+      <section v-else-if="phase === 'pairing'" class="pane" data-testid="remote-phase-pairing">
         <h2 class="pane-h">设备配对</h2>
 
         <div v-if="!pair.ticket" class="card">
@@ -1595,6 +1694,7 @@ onBeforeUnmount(() => {
             <span>也可以手动粘贴配对码（ticket）</span>
             <input
               v-model="pair.ticket"
+              data-testid="remote-pair-ticket"
               type="text"
               inputmode="text"
               autocomplete="off"
@@ -1615,6 +1715,7 @@ onBeforeUnmount(() => {
             <span>设备名称</span>
             <input
               v-model="pair.name"
+              data-testid="remote-pair-name"
               type="text"
               maxlength="40"
               autocomplete="off"
@@ -1641,6 +1742,7 @@ onBeforeUnmount(() => {
           >
             <button
               class="btn-primary"
+              data-testid="remote-pair-submit"
               type="button"
               :disabled="pair.status === 'submitting'"
               @click="startPairing"
@@ -1658,12 +1760,13 @@ onBeforeUnmount(() => {
       </section>
 
       <!-- 主界面：会话 / 任务 / 审批 / 设备 -->
-      <section v-else class="pane pane-fill">
+      <section v-else class="pane pane-fill" data-testid="remote-phase-app">
         <nav class="tabs" role="tablist">
           <button
             v-for="t in TABS"
             :key="t.key"
             class="tab"
+            :data-testid="'remote-tab-' + t.key"
             role="tab"
             type="button"
             :aria-selected="tab === t.key"
@@ -1687,26 +1790,42 @@ onBeforeUnmount(() => {
               <span class="sr-only">会话</span>
               <select
                 v-model="activeConversationId"
+                data-testid="remote-conversation"
                 @change="selectConversation(activeConversationId)"
               >
                 <option v-for="c in conversations" :key="c.id" :value="c.id">{{ c.title }}</option>
                 <option v-if="!conversations.length" value="">（无授权会话）</option>
               </select>
             </label>
-            <button class="btn-ghost" type="button" :disabled="busy.messages" @click="loadMessages">
+            <button
+              class="btn-ghost"
+              data-testid="remote-messages-refresh"
+              type="button"
+              :disabled="busy.messages"
+              @click="loadMessages"
+            >
               刷新
             </button>
           </div>
 
-          <div ref="messagesEl" class="messages scroll">
+          <div ref="messagesEl" class="messages scroll" data-testid="remote-messages">
             <p v-if="busy.messages" class="muted center">加载中…</p>
             <p v-else-if="!messages.length" class="muted center">这个会话还没有消息。</p>
-            <article v-for="m in messages" :key="m.id" :class="msgClass(m)">
+            <article
+              v-for="m in messages"
+              :key="m.id"
+              :data-testid="'remote-message-' + m.id"
+              :data-status="m.status"
+              :class="msgClass(m)"
+            >
               <header class="msg-h">
                 <span>{{ m.role === 'user' ? '我' : 'Agent' }}</span>
                 <span v-if="m.status === 'streaming'" class="tag">生成中</span>
                 <span v-else-if="m.status === 'error'" class="tag tag-bad">出错</span>
-                <span v-else-if="m.status === 'sending'" class="tag">已发送</span>
+                <span v-else-if="m.status === 'sending' || m.status === 'sent'" class="tag"
+                  >已发送</span
+                >
+                <span v-else-if="m.status === 'queued'" class="tag">待同步</span>
               </header>
               <div class="msg-b">{{ m.content }}</div>
             </article>
@@ -1715,6 +1834,7 @@ onBeforeUnmount(() => {
           <footer class="composer">
             <textarea
               v-model="draft"
+              data-testid="remote-chat-input"
               rows="2"
               maxlength="16000"
               :disabled="!capability.operator"
@@ -1726,7 +1846,13 @@ onBeforeUnmount(() => {
             <div class="row row-end">
               <span class="muted small">{{ draft.length }}/16000</span>
               <button class="btn-ghost" type="button" @click="stopStreaming">停止</button>
-              <button class="btn-primary" type="button" :disabled="!canSend" @click="sendChat">
+              <button
+                class="btn-primary"
+                data-testid="remote-chat-send"
+                type="button"
+                :disabled="!canSend"
+                @click="sendChat"
+              >
                 发送
               </button>
             </div>
@@ -1871,7 +1997,7 @@ onBeforeUnmount(() => {
             </button>
           </div>
           <p v-if="!capability.approver" class="banner banner-info">
-            当前角色 {{ capability.role }} 没有审批权限，只能查看待审批列表。
+            当前角色 {{ capability.role }} 没有审批权限，不能查看或处理待审批列表。
           </p>
           <p v-if="busy.approvals && !approvals.length" class="muted center">加载中…</p>
           <p v-else-if="!approvals.length" class="muted center">没有待审批的工具调用。</p>
@@ -1907,7 +2033,7 @@ onBeforeUnmount(() => {
         </div>
 
         <!-- 设备 -->
-        <div v-else class="stack">
+        <div v-else class="stack" data-testid="remote-device-panel">
           <div class="card">
             <h3 class="sub-h">当前设备</h3>
             <dl class="kv">
@@ -1928,7 +2054,7 @@ onBeforeUnmount(() => {
                 seq {{ lastSeq }} · {{ streamEpoch ? streamEpoch.slice(0, 8) : '—' }}
               </dd>
               <dt>协议通道</dt>
-              <dd>{{ insecure ? 'ws（非加密）' : 'wss' }}</dd>
+              <dd data-testid="remote-transport">{{ insecure ? 'ws（非加密）' : 'wss' }}</dd>
             </dl>
           </div>
 
@@ -1966,6 +2092,7 @@ onBeforeUnmount(() => {
     <div
       v-if="confirmState.open"
       class="overlay"
+      data-testid="remote-confirm-dialog"
       role="dialog"
       aria-modal="true"
       :aria-label="confirmState.title"

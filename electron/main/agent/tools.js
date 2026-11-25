@@ -606,7 +606,7 @@ function defineTools(ctx) {
       },
       handler: async ({ conversationId, timeoutMs }) => {
         if (typeof ctx.waitForSession !== 'function') throw new Error('会话管理未启用')
-        // waitForSession 是异步有界轮询；漏掉 await 会把 Promise 序列化成 "{}"
+        // waitForSession 是异步事件等待；漏掉 await 会把 Promise 序列化成 "{}"
         return JSON.stringify(await ctx.waitForSession({ conversationId, timeoutMs }))
       }
     },
@@ -859,6 +859,108 @@ function defineTools(ctx) {
         }
         return browserSession(ctx).close()
       }
+    },
+    {
+      name: 'computer_list_windows',
+      risk: 'readonly',
+      description: '列出当前可见的 Windows 顶层窗口，返回 window ref、进程和边界',
+      parameters: { type: 'object', properties: {} },
+      handler: async () => ctx.computer.listWindows()
+    },
+    {
+      name: 'computer_snapshot',
+      risk: 'readonly',
+      description:
+        '读取指定 Windows 窗口的 UIA 元素树；windowRef、processId、name 必须且只能提供一个，密码值不会返回',
+      parameters: {
+        type: 'object',
+        properties: {
+          windowRef: { type: 'string' },
+          processId: { type: 'number' },
+          name: { type: 'string' },
+          maxNodes: { type: 'number', description: '最多返回元素数，默认 500' }
+        }
+      },
+      handler: async (args = {}) => ctx.computer.snapshot(args)
+    },
+    {
+      name: 'computer_click',
+      risk: 'side_effect',
+      description: '通过 UIA InvokePattern 点击前台窗口中的元素；必须先 computer_snapshot 获取 ref',
+      parameters: {
+        type: 'object',
+        properties: { ref: { type: 'string' } },
+        required: ['ref']
+      },
+      handler: async ({ ref }) => ctx.computer.invoke({ ref })
+    },
+    {
+      name: 'computer_type',
+      risk: 'side_effect',
+      description: '通过 UIA ValuePattern 写入非密码控件；目标窗口必须仍在前台',
+      parameters: {
+        type: 'object',
+        properties: { ref: { type: 'string' }, value: { type: 'string' } },
+        required: ['ref', 'value']
+      },
+      handler: async ({ ref, value }) => ctx.computer.setValue({ ref }, value)
+    },
+    {
+      name: 'computer_key',
+      risk: 'side_effect',
+      description: '向当前前台进程发送 SendKeys 组合键；必须提供 processId，禁止盲写密码窗口',
+      parameters: {
+        type: 'object',
+        properties: { keys: { type: 'string' }, processId: { type: 'number' } },
+        required: ['keys', 'processId']
+      },
+      handler: async (args) => ctx.computer.key(args)
+    },
+    {
+      name: 'computer_input',
+      risk: 'side_effect',
+      description:
+        '向当前可见的内置浏览器用户标签发送真实 CDP 鼠标/键盘输入；type 为 mousePressed/mouseReleased/mouseMoved/keyDown/keyUp/char/insertText',
+      parameters: {
+        type: 'object',
+        properties: {
+          type: { type: 'string' },
+          x: { type: 'number' },
+          y: { type: 'number' },
+          button: { type: 'string' },
+          clickCount: { type: 'number' },
+          key: { type: 'string' },
+          code: { type: 'string' },
+          text: { type: 'string' }
+        },
+        required: ['type']
+      },
+      handler: async (args) => ctx.computer.input(args)
+    },
+    {
+      name: 'computer_scroll',
+      risk: 'side_effect',
+      description: '在当前可见的内置浏览器用户标签中滚动页面',
+      parameters: {
+        type: 'object',
+        properties: { deltaX: { type: 'number' }, deltaY: { type: 'number' } }
+      },
+      handler: async (args = {}) =>
+        ctx.computer.input({ type: 'mouseWheel', deltaX: args.deltaX, deltaY: args.deltaY })
+    },
+    {
+      name: 'computer_capture',
+      risk: 'readonly',
+      description: '截取当前主屏并保存到本地 computer-artifacts，返回路径和尺寸',
+      parameters: { type: 'object', properties: {} },
+      handler: async () => ctx.computer.capture()
+    },
+    {
+      name: 'computer_stop',
+      risk: 'side_effect',
+      description: '立即终止电脑操作助手并清空所有元素引用；重新启用需重启应用',
+      parameters: { type: 'object', properties: {} },
+      handler: async () => ctx.computer.stop()
     },
     {
       name: 'mcp_list_tools',

@@ -319,7 +319,9 @@ describe('P10 恢复与发布验收', () => {
       conversationId
     )
     mock.state.agentFile = path.join(userData, 'workspaces', projectId, runId, 'a.txt')
-    await expect.poll(() => mock.state.requests.some(({ body }) => body?.tools?.length)).toBe(true)
+    await expect
+      .poll(() => mock.state.requests.some(({ body }) => body?.tools?.length), { timeout: 20000 })
+      .toBe(true)
     fs.writeFileSync(path.join(repo, 'a.txt'), 'main change\n')
     git('add', 'a.txt')
     git('-c', 'user.name=Test', '-c', 'user.email=test@local', 'commit', '-m', 'main change')

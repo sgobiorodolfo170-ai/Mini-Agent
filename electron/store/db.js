@@ -2,7 +2,7 @@ const fs = require('fs')
 const path = require('path')
 
 const { RUN_SCHEMA, recoverRuns } = require('./run-storage')
-const SCHEMA_VERSION = 14
+const SCHEMA_VERSION = 18
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS settings (
@@ -375,6 +375,154 @@ CREATE INDEX IF NOT EXISTS idx_tool_calls_call ON agent_tool_calls(run_id, call_
         }
         db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_kbs_project_workspace
           ON kbs(project_id) WHERE project_id IS NOT NULL AND kind='workspace' AND deleted_at IS NULL`)
+        db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
+      })
+    }
+    if (current < 15) {
+      const { transaction } = require('../main/remote/protocol')
+      transaction(db, () => {
+        if (!columnExists(db, 'run_graphs', 'layout_json')) {
+          db.exec('ALTER TABLE run_graphs ADD COLUMN layout_json TEXT')
+        }
+        if (!columnExists(db, 'run_graphs', 'viewport_json')) {
+          db.exec('ALTER TABLE run_graphs ADD COLUMN viewport_json TEXT')
+        }
+        if (!columnExists(db, 'run_graphs', 'layout_revision')) {
+          db.exec('ALTER TABLE run_graphs ADD COLUMN layout_revision INTEGER NOT NULL DEFAULT 0')
+        }
+        db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
+      })
+    }
+    if (current < 16) {
+      const { transaction } = require('../main/remote/protocol')
+      transaction(db, () => {
+        db.exec(`CREATE TABLE IF NOT EXISTS graph_node_requests (
+          graph_id TEXT NOT NULL,
+          client_id TEXT NOT NULL,
+          run_id TEXT NOT NULL,
+          fingerprint TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          PRIMARY KEY (graph_id, client_id)
+        )`)
+        db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
+      })
+    }
+    if (current < 17) {
+      const { transaction } = require('../main/remote/protocol')
+      transaction(db, () => {
+        db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+          content, tool_calls, content='messages', tokenize='trigram'
+        )`)
+        db.exec(`CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+          INSERT INTO messages_fts(rowid,content,tool_calls) VALUES(new.rowid,new.content,new.tool_calls);
+        END`)
+        db.exec(`CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+          INSERT INTO messages_fts(messages_fts,rowid,content,tool_calls)
+          VALUES('delete',old.rowid,old.content,old.tool_calls);
+        END`)
+        db.exec(`CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages BEGIN
+          INSERT INTO messages_fts(messages_fts,rowid,content,tool_calls)
+          VALUES('delete',old.rowid,old.content,old.tool_calls);
+          INSERT INTO messages_fts(rowid,content,tool_calls) VALUES(new.rowid,new.content,new.tool_calls);
+        END`)
+        db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+        db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
+      })
+    }
+    if (current < 18) {
+      const { transaction } = require('../main/remote/protocol')
+      transaction(db, () => {
+        db.exec(`CREATE TABLE IF NOT EXISTS sync_changes (
+          seq INTEGER PRIMARY KEY AUTOINCREMENT,
+          change_id TEXT NOT NULL UNIQUE,
+          device_id TEXT NOT NULL,
+          entity TEXT NOT NULL,
+          entity_id TEXT NOT NULL,
+          op TEXT NOT NULL,
+          payload TEXT,
+          base_version INTEGER,
+          new_version INTEGER,
+          created_at INTEGER NOT NULL
+        )`)
+        db.exec(`CREATE TABLE IF NOT EXISTS sync_applied (
+          change_id TEXT PRIMARY KEY,
+          source_device_id TEXT NOT NULL,
+          applied_at INTEGER NOT NULL
+        )`)
+        db.exec(`CREATE TABLE IF NOT EXISTS sync_cursors (
+          device_id TEXT NOT NULL,
+          peer_device_id TEXT NOT NULL,
+          cursor INTEGER NOT NULL DEFAULT 0,
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY (device_id, peer_device_id)
+        )`)
+        db.exec(`CREATE TABLE IF NOT EXISTS sync_leases (
+          conversation_id TEXT PRIMARY KEY,
+          owner_device_id TEXT NOT NULL,
+          epoch INTEGER NOT NULL DEFAULT 1,
+          expires_at INTEGER NOT NULL
+        )`)
+        db.exec(`CREATE TABLE IF NOT EXISTS sync_conflicts (
+          id TEXT PRIMARY KEY,
+          change_id TEXT NOT NULL,
+          source_device_id TEXT NOT NULL,
+          entity TEXT NOT NULL,
+          entity_id TEXT NOT NULL,
+          local_payload TEXT,
+          remote_payload TEXT NOT NULL,
+          op TEXT NOT NULL,
+          base_version INTEGER,
+          new_version INTEGER,
+          lease_epoch INTEGER,
+          status TEXT NOT NULL DEFAULT 'open',
+          created_at INTEGER NOT NULL,
+          resolved_at INTEGER
+        )`)
+        db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_active_seq
+          ON messages(conversation_id,seq) WHERE deleted_at IS NULL`)
+        db.exec(
+          "INSERT OR IGNORE INTO settings(key,value) VALUES('syncDeviceId',json_quote(lower(hex(randomblob(16)))))"
+        )
+        const guard =
+          "(SELECT json_extract(value,'$') FROM settings WHERE key='syncApplying') IS NULL"
+        const device =
+          "COALESCE((SELECT json_extract(value,'$') FROM settings WHERE key='syncDeviceId'),'local')"
+        for (const [table, idColumn] of [
+          ['projects', 'id'],
+          ['conversations', 'id'],
+          ['messages', 'id']
+        ]) {
+          const columns = db
+            .prepare(`PRAGMA table_info(${table})`)
+            .all()
+            .map((row) => row.name)
+          const payload = (prefix) =>
+            `json_object(${columns.map((column) => `'${column}',${prefix}.${column}`).join(',')})`
+          const versionColumn = columns.includes('updated_at') ? 'updated_at' : null
+          const baseVersion = versionColumn ? `old.${versionColumn}` : 'NULL'
+          const newVersion = versionColumn ? `new.${versionColumn}` : 'NULL'
+          db.exec(`CREATE TRIGGER IF NOT EXISTS sync_${table}_ai AFTER INSERT ON ${table}
+            WHEN ${guard} BEGIN
+              INSERT INTO sync_changes(change_id,device_id,entity,entity_id,op,payload,base_version,new_version,created_at)
+              VALUES(lower(hex(randomblob(16))),${device},'${table}',new.${idColumn},'insert',${payload('new')},NULL,${newVersion},unixepoch()*1000);
+            END`)
+          db.exec(`CREATE TRIGGER IF NOT EXISTS sync_${table}_au AFTER UPDATE ON ${table}
+            WHEN ${guard} BEGIN
+              INSERT INTO sync_changes(change_id,device_id,entity,entity_id,op,payload,base_version,new_version,created_at)
+              VALUES(lower(hex(randomblob(16))),${device},'${table}',new.${idColumn},'update',${payload('new')},${baseVersion},${newVersion},unixepoch()*1000);
+            END`)
+          db.exec(`CREATE TRIGGER IF NOT EXISTS sync_${table}_ad AFTER DELETE ON ${table}
+            WHEN ${guard} BEGIN
+              INSERT INTO sync_changes(change_id,device_id,entity,entity_id,op,payload,base_version,new_version,created_at)
+              VALUES(lower(hex(randomblob(16))),${device},'${table}',old.${idColumn},'delete',${payload('old')},${baseVersion},NULL,unixepoch()*1000);
+            END`)
+          const baselinePayload = `json_object(${columns
+            .map((column) => `'${column}',${column}`)
+            .join(',')})`
+          db.exec(`INSERT INTO sync_changes(change_id,device_id,entity,entity_id,op,payload,base_version,new_version,created_at)
+            SELECT lower(hex(randomblob(16))),${device},'${table}',${idColumn},'insert',${baselinePayload},NULL,${versionColumn || 'NULL'},unixepoch()*1000
+            FROM ${table}`)
+        }
         db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
       })
     }

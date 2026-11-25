@@ -14,7 +14,14 @@ export const useChatStore = defineStore('chat', {
     agentCluster: false,
     // 搜索筛选与完整会话数据分开存放：activeConv 始终从完整列表取值（F03）
     filterQuery: '',
-    filterIds: []
+    filterIds: [],
+    messageSearch: {
+      query: '',
+      results: [],
+      nextCursor: null,
+      loading: false,
+      error: ''
+    }
   }),
   getters: {
     // 任务模式 = 任一非默认权限。保留旧字段名，避免既有调用点与测试失效
@@ -55,6 +62,32 @@ export const useChatStore = defineStore('chat', {
     async applyFilter(query) {
       const rows = await window.api.conversations.search(query)
       this.filterIds = rows.map((r) => r.id)
+    },
+    async searchMessages(query, cursor = 0, append = false) {
+      const text = String(query || '').trim()
+      this.messageSearch.query = text
+      this.messageSearch.loading = true
+      this.messageSearch.error = ''
+      try {
+        const result = await window.api.chat.searchMessages({ query: text, cursor, limit: 50 })
+        this.messageSearch.results = append
+          ? [...this.messageSearch.results, ...result.results]
+          : result.results
+        this.messageSearch.nextCursor = result.nextCursor
+        return result
+      } catch (error) {
+        this.messageSearch.error = String(error?.message || error)
+        throw error
+      } finally {
+        this.messageSearch.loading = false
+      }
+    },
+    clearMessageSearch() {
+      this.messageSearch.query = ''
+      this.messageSearch.results = []
+      this.messageSearch.nextCursor = null
+      this.messageSearch.loading = false
+      this.messageSearch.error = ''
     },
     async select(id) {
       this.activeId = id

@@ -15,6 +15,18 @@ function normalizeKey(value) {
   return key
 }
 
+function addFingerprint(op) {
+  return createHash('sha256')
+    .update(
+      JSON.stringify({
+        key: normalizeKey(op.key),
+        goal: String(op.goal || '').trim(),
+        deps: [...new Set((op.deps || []).map((id) => String(id)))].sort()
+      })
+    )
+    .digest('hex')
+}
+
 // 校验并规范化任务列表；返回 [{ key, goal, deps, conversationId, title }]
 function validatePlan(tasks) {
   if (!Array.isArray(tasks) || !tasks.length) throw new Error('任务列表不能为空')
@@ -98,6 +110,72 @@ function addDependencies(db, tasks, keyToRunId) {
 
 function getGraph(db, id) {
   return db.prepare('SELECT * FROM run_graphs WHERE id=?').get(id)
+}
+
+function parseJson(value, fallback) {
+  try {
+    return value ? JSON.parse(value) : fallback
+  } catch {
+    return fallback
+  }
+}
+
+function finiteNumber(value, fallback, min, max) {
+  const number = Number(value)
+  return Number.isFinite(number) ? Math.max(min, Math.min(max, number)) : fallback
+}
+
+function normalizeLayout(value, nodes) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  const known = new Set(nodes.map((node) => node.runId))
+  const layout = {}
+  for (const [runId, position] of Object.entries(value)) {
+    if (!known.has(runId) || !position || typeof position !== 'object') continue
+    layout[runId] = {
+      x: finiteNumber(position.x, 0, -100000, 100000),
+      y: finiteNumber(position.y, 0, -100000, 100000)
+    }
+  }
+  return layout
+}
+
+function normalizeViewport(value) {
+  const viewport = value && typeof value === 'object' ? value : {}
+  return {
+    x: finiteNumber(viewport.x, 0, -100000, 100000),
+    y: finiteNumber(viewport.y, 0, -100000, 100000),
+    zoom: finiteNumber(viewport.zoom, 1, 0.2, 2)
+  }
+}
+
+function graphLayout(db, graphId) {
+  const graph = getGraph(db, graphId)
+  if (!graph) return null
+  const nodes = listNodes(db, graphId).map((node) => ({ runId: node.id }))
+  return {
+    layout: normalizeLayout(parseJson(graph.layout_json, {}), nodes),
+    viewport: normalizeViewport(parseJson(graph.viewport_json, null)),
+    layoutRevision: Number(graph.layout_revision) || 0
+  }
+}
+
+function saveGraphLayout(db, { graphId, layout, viewport, baseRevision } = {}) {
+  const graph = getGraph(db, graphId)
+  if (!graph) throw new Error('任务图不存在')
+  const currentRevision = Number(graph.layout_revision) || 0
+  if (baseRevision !== undefined && Number(baseRevision) !== currentRevision) {
+    const error = new Error('任务图布局已变化，请刷新后重试')
+    error.code = 'GRAPH_LAYOUT_CONFLICT'
+    throw error
+  }
+  const nodes = listNodes(db, graphId).map((node) => ({ runId: node.id }))
+  const cleanLayout = normalizeLayout(layout, nodes)
+  const cleanViewport = normalizeViewport(viewport)
+  const revision = currentRevision + 1
+  db.prepare(
+    'UPDATE run_graphs SET layout_json=?, viewport_json=?, layout_revision=? WHERE id=?'
+  ).run(JSON.stringify(cleanLayout), JSON.stringify(cleanViewport), revision, graphId)
+  return { layout: cleanLayout, viewport: cleanViewport, layoutRevision: revision }
 }
 
 function getGraphForParent(db, parentRunId) {
@@ -186,6 +264,7 @@ function summary(db, graphId) {
   if (!graph) return null
   const rawNodes = listNodes(db, graphId)
   const dependencies = listDependencies(db, graphId)
+  const layoutState = graphLayout(db, graphId)
   if (!rawNodes.length) {
     return {
       graphId,
@@ -194,6 +273,7 @@ function summary(db, graphId) {
       nodes: [],
       dependencies: [],
       layers: [],
+      ...layoutState,
       etag: createHash('sha1')
         .update(JSON.stringify({ status: graph.status }))
         .digest('hex')
@@ -259,13 +339,30 @@ function summary(db, graphId) {
     nodes,
     dependencies,
     layers,
+    ...layoutState,
     etag
   }
 }
 
-function mutateGraph(db, { graphId, etag, ops = [], isClaimed = () => false } = {}) {
+function mutateGraph(
+  db,
+  { graphId, etag, ops = [], isClaimed = () => false, createNode = null } = {}
+) {
   const current = summary(db, graphId)
   if (!current) throw new Error('任务图不存在')
+  const addOps = ops.filter((op) => op?.action === 'add')
+  for (const op of addOps) {
+    const clientId = String(op.clientId || '').trim()
+    if (!clientId || clientId.length > 100) throw new Error('新增节点请求标识无效')
+    const previous = db
+      .prepare('SELECT * FROM graph_node_requests WHERE graph_id=? AND client_id=?')
+      .get(graphId, clientId)
+    if (previous) {
+      if (ops.length === 1 && previous.fingerprint === addFingerprint(op))
+        return summary(db, graphId)
+      throw new Error('新增节点请求编号已用于其他内容')
+    }
+  }
   if (etag !== current.etag) {
     const error = new Error('任务图已变化，请刷新后重试')
     error.code = 'GRAPH_CONFLICT'
@@ -288,7 +385,57 @@ function mutateGraph(db, { graphId, etag, ops = [], isClaimed = () => false } = 
     ])
   )
   const removed = new Set()
+  const addedRequests = []
+  const addedPositions = new Map()
   for (const op of ops) {
+    if (op?.action === 'add') {
+      if (typeof createNode !== 'function') throw new Error('当前环境不支持动态新增节点')
+      const key = normalizeKey(op.key)
+      const goal = String(op.goal || '').trim()
+      if (!goal) throw new Error(`任务节点 ${key} 缺少目标`)
+      if ([...nodes.values()].some((node) => node.nodeKey === key))
+        throw new Error(`任务节点 key 重复：${key}`)
+      if (!Array.isArray(op.deps)) throw new Error('任务依赖格式无效')
+      const deps = [...new Set(op.deps.map((id) => String(id)))]
+      if (deps.some((id) => !nodes.has(id))) throw new Error('任务依赖了不存在的节点')
+      const runId = String(
+        createNode({
+          graphId,
+          parentRunId: current.parentRunId,
+          key,
+          goal,
+          deps,
+          clientId: String(op.clientId)
+        }) || ''
+      )
+      if (!runId || nodes.has(runId)) throw new Error('新增任务节点创建失败')
+      nodes.set(runId, {
+        runId,
+        nodeKey: key,
+        goal,
+        status: 'queued',
+        finishedReason: null,
+        depth: 0,
+        editable: true
+      })
+      dependencies.set(runId, deps)
+      addedRequests.push({
+        clientId: String(op.clientId),
+        runId,
+        fingerprint: addFingerprint(op)
+      })
+      if (
+        op.position &&
+        Number.isFinite(Number(op.position.x)) &&
+        Number.isFinite(Number(op.position.y))
+      ) {
+        addedPositions.set(runId, {
+          x: Math.max(-100000, Math.min(100000, Number(op.position.x))),
+          y: Math.max(-100000, Math.min(100000, Number(op.position.y)))
+        })
+      }
+      continue
+    }
     const node = nodes.get(op.runId)
     if (!node || removed.has(op.runId)) throw new Error('任务节点不存在')
     if (node.status !== 'queued' || isClaimed(op.runId))
@@ -363,6 +510,20 @@ function mutateGraph(db, { graphId, etag, ops = [], isClaimed = () => false } = 
         'INSERT OR IGNORE INTO run_dependencies(run_id,depends_on_run_id) VALUES(?,?)'
       ).run(runId, dependencyRunId)
   }
+  for (const request of addedRequests) {
+    db.prepare(
+      'INSERT INTO graph_node_requests(graph_id,client_id,run_id,fingerprint,created_at) VALUES(?,?,?,?,?)'
+    ).run(graphId, request.clientId, request.runId, request.fingerprint, Date.now())
+  }
+  if (addedPositions.size) {
+    const layoutState = graphLayout(db, graphId)
+    saveGraphLayout(db, {
+      graphId,
+      layout: { ...layoutState.layout, ...Object.fromEntries(addedPositions) },
+      viewport: layoutState.viewport,
+      baseRevision: layoutState.layoutRevision
+    })
+  }
   refreshGraph(db, graphId)
   return summary(db, graphId)
 }
@@ -375,6 +536,8 @@ module.exports = {
   createGraph,
   addDependencies,
   getGraph,
+  graphLayout,
+  saveGraphLayout,
   getGraphForParent,
   listNodes,
   listDependencies,

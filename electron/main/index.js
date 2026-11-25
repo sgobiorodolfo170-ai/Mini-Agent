@@ -70,7 +70,13 @@ function requestQuit() {
         await Promise.all([gateway.stopAllStreams(), agent.stopAllRuns()])
       }
     },
-    { name: '回收子进程', run: () => processRegistry.stopAll() },
+    {
+      name: '回收子进程',
+      run: () => {
+        agent.stopComputer()
+        processRegistry.stopAll()
+      }
+    },
     {
       name: '释放模型与窗口',
       run: async () => {

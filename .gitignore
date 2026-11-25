@@ -11,6 +11,7 @@ coverage/
 .tmp-spike-models/
 # e2e 运行产生的截图等产物（不覆盖 docs/ 下已归档的验收图）
 .e2e-artifacts/
+test-results/
 
 # logs
 *.log

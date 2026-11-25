@@ -11,7 +11,7 @@ describe('schema + settings', () => {
   it('migrates to the current schema and roundtrips settings', () => {
     const row = dbm.get().prepare('PRAGMA user_version').get()
     expect(row.user_version).toBe(dbm.SCHEMA_VERSION)
-    expect(dbm.SCHEMA_VERSION).toBe(14)
+    expect(dbm.SCHEMA_VERSION).toBe(18)
     repos.setSetting(dbm.get(), 'theme', 'dark')
     repos.setSetting(dbm.get(), 'agentAuthorizedDirs', ['C:\\a', 'C:\\b'])
     expect(repos.getSetting(dbm.get(), 'theme')).toBe('dark')

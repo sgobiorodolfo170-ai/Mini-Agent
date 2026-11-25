@@ -1,4 +1,7 @@
-import { describe, expect, it } from 'vitest'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { afterEach, describe, expect, it } from 'vitest'
 
 import {
   authorizeToolCall,
@@ -19,6 +22,17 @@ const baseMandate = (over = {}) => ({
   canDelegate: false,
   ...over
 })
+
+const tempDirs = []
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true })
+})
+
+function tempDir() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'miniagent-mandate-'))
+  tempDirs.push(dir)
+  return dir
+}
 
 describe('mandate 规范化（§4.2）', () => {
   it('空 mandate 返回 null（根 Run 由应用策略处理）', () => {
@@ -177,6 +191,38 @@ describe('路径校验（§4.4 第 3 点）', () => {
 
   it('UNC 路径不落入普通盘符目录', () => {
     expect(pathAllowed(['C:\\proj'], '\\\\server\\share\\a.txt')).toBe(false)
+  })
+
+  it('目录联接指向授权范围外时拒绝现有路径和将创建路径', () => {
+    const root = tempDir()
+    const allowed = path.join(root, 'allowed')
+    const outside = path.join(root, 'outside')
+    const link = path.join(allowed, 'escape')
+    fs.mkdirSync(allowed)
+    fs.mkdirSync(outside)
+    fs.symlinkSync(outside, link, process.platform === 'win32' ? 'junction' : 'dir')
+    fs.writeFileSync(path.join(outside, 'secret.txt'), 'secret')
+
+    expect(pathAllowed([allowed], path.join(link, 'secret.txt'))).toBe(false)
+    expect(pathAllowed([allowed], path.join(link, 'new.txt'))).toBe(false)
+  })
+
+  it('授权根本身是目录联接时按真实目录授权', () => {
+    const root = tempDir()
+    const real = path.join(root, 'real')
+    const link = path.join(root, 'alias')
+    fs.mkdirSync(real)
+    fs.symlinkSync(real, link, process.platform === 'win32' ? 'junction' : 'dir')
+
+    expect(pathAllowed([link], path.join(link, 'new.txt'))).toBe(true)
+    expect(pathAllowed([link], path.join(real, 'new.txt'))).toBe(true)
+  })
+
+  it('不存在的授权目录仍允许其内部新路径', () => {
+    const root = tempDir()
+    const allowed = path.join(root, 'future')
+    expect(pathAllowed([allowed], path.join(allowed, 'nested', 'new.txt'))).toBe(true)
+    expect(pathAllowed([allowed], path.join(allowed, 'new.txt'), { mustExist: true })).toBe(false)
   })
 
   it('写操作使用 write 目录，读目录不可写', () => {

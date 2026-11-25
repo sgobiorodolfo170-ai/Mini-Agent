@@ -43,6 +43,9 @@ function buildMain() {
       search: (q) => inv('conversations:search', q),
       messages: (id) => inv('conversations:messages', id)
     },
+    computer: {
+      stop: () => inv('computer:stop')
+    },
     projects: {
       list: () => inv('projects:list'),
       create: (o) => inv('projects:create', o),
@@ -52,6 +55,7 @@ function buildMain() {
     },
     chat: {
       send: (o) => inv('chat:send', o),
+      searchMessages: (o) => inv('chat:searchMessages', o),
       stop: (msgId) => inv('chat:stop', msgId),
       regenerate: (cid) => inv('chat:regenerate', cid),
       editResend: (o) => inv('chat:editResend', o),
@@ -90,6 +94,8 @@ function buildMain() {
       runs: () => inv('agent:runs'),
       calls: (runId) => inv('agent:calls', runId),
       graph: (runId) => inv('agent:graph', runId),
+      graphLayout: (runId) => inv('agent:graph:layout:get', runId),
+      saveGraphLayout: (o) => inv('agent:graph:layout:save', o),
       mutateGraph: (o) => inv('agent:graph:mutate', o)
     },
     browser: {
@@ -101,7 +107,16 @@ function buildMain() {
       close: (tabId) => inv('browser:close', { tabId }),
       command: (tabId, command) => inv('browser:command', { tabId, command }),
       toggleDevTools: (tabId) => inv('browser:toggleDevTools', { tabId }),
-      attach: (tabId, bounds) => inv('browser:attach', { tabId, bounds }),
+      selectElement: (tabId) => inv('browser:selectElement', { tabId }),
+      cancelElementSelection: (tabId) => inv('browser:cancelElementSelection', { tabId }),
+      inspectorState: (tabId) => inv('browser:inspectorState', { tabId }),
+      updateElementStyles: (tabId, elementId, styles, resetProperties) =>
+        inv('browser:updateElementStyles', { tabId, elementId, styles, resetProperties }),
+      resetElementStyles: (tabId, elementId) =>
+        inv('browser:resetElementStyles', { tabId, elementId }),
+      setDevice: (tabId, device) => inv('browser:setDevice', { tabId, device }),
+      clearDevice: (tabId) => inv('browser:clearDevice', { tabId }),
+      attach: (tabId, bounds, options) => inv('browser:attach', { tabId, bounds, options }),
       detach: () => inv('browser:detach'),
       takeover: (tabId) => inv('browser:takeover', { tabId }),
       release: (tabId) => inv('browser:release', { tabId }),

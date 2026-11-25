@@ -13,6 +13,7 @@ import { useSettingsStore } from '../stores/settings'
 import { useKbStore } from '../stores/kb'
 import { useUiStore } from '../stores/ui'
 import { useProjectsStore } from '../stores/projects'
+import { useComposerStore } from '../stores/composer'
 
 const chat = useChatStore()
 const settings = useSettingsStore()
@@ -20,9 +21,19 @@ const kb = useKbStore()
 const ui = useUiStore()
 const projects = useProjectsStore()
 const agent = useAgentStore()
+const composer = useComposerStore()
 
-const input = ref('')
+const input = computed({
+  get: () => composer.text,
+  set: (value) => {
+    composer.text = value
+  }
+})
+const composerRef = ref(null)
 const search = ref('')
+const searchMode = ref('conversations')
+const highlightedMessageId = ref('')
+let highlightTimer = null
 const sending = ref(false)
 const showKbPopover = ref(false)
 const kbPopoverEl = ref(null)
@@ -110,20 +121,76 @@ watch(
     scrollToBottom()
   }
 )
+watch(
+  () => composer.focusRevision,
+  async (revision) => {
+    if (!revision) return
+    await nextTick()
+    if (composerRef.value) composerRef.value.focus()
+  }
+)
 
-// ---------- 搜索（F03）：防抖 + 清空恢复，筛选不破坏当前会话 ----------
+// ---------- 搜索（F03 / P13）：会话筛选与全文消息检索 ----------
+let searchRevision = 0
 watch(search, (v) => {
   clearTimeout(searchTimer)
-  searchTimer = setTimeout(() => chat.setFilter(v), 300)
+  const revision = ++searchRevision
+  searchTimer = setTimeout(() => {
+    if (revision !== searchRevision) return
+    if (searchMode.value === 'messages') void runMessageSearch(v)
+    else chat.setFilter(v)
+  }, 250)
+})
+watch(searchMode, () => {
+  clearTimeout(searchTimer)
+  searchRevision += 1
+  chat.clearMessageSearch()
+  if (searchMode.value === 'conversations') chat.setFilter(search.value)
+  else if (search.value.trim()) void runMessageSearch(search.value)
 })
 function clearSearch() {
   search.value = ''
+  searchRevision += 1
   clearTimeout(searchTimer)
   chat.setFilter('')
+  chat.clearMessageSearch()
+}
+async function runMessageSearch(value = search.value) {
+  const query = String(value || '').trim()
+  if (!query) {
+    chat.clearMessageSearch()
+    return
+  }
+  try {
+    await chat.searchMessages(query)
+  } catch {
+    // 错误由 store 保留并在结果区展示
+  }
 }
 function searchNow() {
   clearTimeout(searchTimer)
-  chat.setFilter(search.value)
+  if (searchMode.value === 'messages') void runMessageSearch()
+  else chat.setFilter(search.value)
+}
+async function openMessageSearchResult(result) {
+  await chat.select(result.conversationId)
+  await nextTick()
+  if (!result.messageId) return
+  highlightedMessageId.value = result.messageId
+  const element = scrollEl.value?.querySelector(`[data-msg-id="${result.messageId}"]`)
+  element?.scrollIntoView({ block: 'center' })
+  clearTimeout(highlightTimer)
+  highlightTimer = setTimeout(() => {
+    highlightedMessageId.value = ''
+  }, 3000)
+}
+async function loadMoreMessageResults() {
+  if (!chat.messageSearch.nextCursor || chat.messageSearch.loading) return
+  try {
+    await chat.searchMessages(chat.messageSearch.query, chat.messageSearch.nextCursor, true)
+  } catch {
+    // 错误由 store 保留并在结果区展示
+  }
 }
 
 // 发送（F05/F06）：发送锁 + 失败恢复草稿。键盘行为（Enter / Shift+Enter / IME）由 ComposerInput 负责
@@ -141,8 +208,8 @@ async function send() {
     await nextTick()
     scrollToBottom()
   } catch (e) {
-    // 失败恢复：草稿和附件回到输入框（F06）
-    input.value = content
+    // 发送期间用户可能继续输入或从浏览器追加上下文，失败时不能覆盖新草稿。
+    composer.restoreSent(content)
     if (atts.length && !ui.pendingAttachment) ui.pendingAttachment = atts[0].dataUrl
     ui.toast('发送失败，内容已恢复到输入框', 'error')
   } finally {
@@ -671,6 +738,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('pointerdown', onDocPointerDown, true)
   if (stopBrowserResize) stopBrowserResize()
   clearTimeout(searchTimer)
+  clearTimeout(highlightTimer)
 })
 
 // 列表拖宽（220–320px）
@@ -773,6 +841,51 @@ function startBrowserResize(e) {
             @click="clearSearch"
           >
             <UiIcon name="close" :size="12" />
+          </button>
+        </div>
+        <button
+          class="mt-1.5 text-[11px] text-link hover:underline"
+          data-testid="conv-search-mode"
+          @click="searchMode = searchMode === 'conversations' ? 'messages' : 'conversations'"
+        >
+          {{ searchMode === 'conversations' ? '切换到全文消息检索' : '切换到会话筛选' }}
+        </button>
+        <div
+          v-if="searchMode === 'messages' && search.trim()"
+          class="mt-1.5 rounded-lg border border-line-subtle bg-panel p-1.5 space-y-1"
+          data-testid="message-search-results"
+        >
+          <div v-if="chat.messageSearch.loading" class="px-1 py-2 text-xs text-ink-muted">
+            检索中…
+          </div>
+          <div v-else-if="chat.messageSearch.error" class="px-1 py-2 text-xs text-bad-ink">
+            {{ chat.messageSearch.error }}
+          </div>
+          <div
+            v-else-if="!chat.messageSearch.results.length"
+            class="px-1 py-2 text-xs text-ink-muted"
+          >
+            无匹配消息
+          </div>
+          <button
+            v-for="result in chat.messageSearch.results"
+            :key="`${result.conversationId}:${result.messageId || 'title'}`"
+            class="block w-full rounded-md px-2 py-1.5 text-left hover:bg-subtle"
+            :data-testid="`message-search-result-${result.messageId || result.conversationId}`"
+            @click="openMessageSearchResult(result)"
+          >
+            <span class="block truncate text-xs font-medium text-ink-primary">
+              {{ result.conversationTitle }}
+            </span>
+            <span class="block line-clamp-2 text-[11px] text-ink-muted">{{ result.snippet }}</span>
+          </button>
+          <button
+            v-if="chat.messageSearch.nextCursor"
+            class="w-full px-2 py-1 text-left text-[11px] text-link hover:underline"
+            data-testid="message-search-more"
+            @click="loadMoreMessageResults"
+          >
+            加载更多
           </button>
         </div>
         <div v-if="chat.filtering" class="mt-1.5 text-xs text-ink-muted" aria-live="polite">
@@ -1117,6 +1230,7 @@ function startBrowserResize(e) {
                 :key="m.id"
                 :msg="m"
                 :is-last="i === chat.messages.length - 1"
+                :highlighted="highlightedMessageId === m.id"
               />
             </div>
           </div>
@@ -1134,6 +1248,7 @@ function startBrowserResize(e) {
         <div class="shrink-0 px-6 pb-5 pt-3 bg-surface">
           <div class="mx-auto w-full" style="max-width: 1136px">
             <AgentComposer
+              ref="composerRef"
               :variant="composerVariant"
               :placeholder="composerPlaceholder"
               :hint="composerHint"
@@ -1240,24 +1355,11 @@ function startBrowserResize(e) {
 
       <aside
         v-if="ui.browserPanelOpen"
-        class="shrink-0 min-h-0 flex flex-col my-3 mr-3 chat-surface overflow-hidden"
+        class="shrink-0 min-h-0 flex flex-col my-3 mr-3 pb-[22px] chat-surface overflow-hidden"
         :style="{ width: visibleBrowserPanelWidth + 'px' }"
         aria-label="内置浏览器侧栏"
         data-testid="chat-browser-panel"
       >
-        <div class="h-8 shrink-0 flex items-center gap-2 px-2 border-b border-line-subtle bg-panel">
-          <UiIcon name="globe" :size="14" class="text-brand-ink" />
-          <span class="text-xs font-medium text-ink-secondary flex-1">内置浏览器</span>
-          <button
-            class="icon-btn-sm !w-6 !h-6"
-            title="折叠浏览器"
-            aria-label="折叠内置浏览器"
-            data-testid="chat-browser-panel-close"
-            @click="ui.toggleBrowserPanel()"
-          >
-            <UiIcon name="panelRight" :size="14" />
-          </button>
-        </div>
         <BrowserView v-if="ui.view === 'chat'" class="flex-1 min-h-0" />
       </aside>
     </div>

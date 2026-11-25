@@ -7,6 +7,15 @@ const {
   isPrivateBrowserUrl,
   safeFilename
 } = require('./policy')
+const {
+  beginElementSelection,
+  getSelectedElement,
+  resetElementInspector,
+  setSelectedElementStyles,
+  resetSelectedElementStyles,
+  sanitizeElementInfo,
+  validateStyleChanges
+} = require('./element-inspector')
 
 const USER_PARTITION = 'persist:miniagent-browser'
 const DEFAULT_LOAD_TIMEOUT_MS = 30000
@@ -105,6 +114,7 @@ function createBrowserService(options = {}) {
       owner: tab.owner,
       crashed: tab.crashed,
       devToolsOpened: tab.webContents.isDevToolsOpened(),
+      device: tab.device ? { ...tab.device } : null,
       createdAt: tab.createdAt,
       bounds: tab.view.getBounds()
     }
@@ -308,7 +318,11 @@ function createBrowserService(options = {}) {
     wc.on('will-frame-navigate', onFrameNavigate)
     tab.cleanups.push(() => wc.removeListener('will-frame-navigate', onFrameNavigate))
 
-    const onStart = () => updateTab(tab, { loading: true, error: null })
+    const onStart = () => {
+      cancelSelection(tab)
+      tab.inspector.selected = null
+      updateTab(tab, { loading: true, error: null })
+    }
     const onStop = () => updateTab(tab, { loading: false })
     const onNavigate = (_event, url) => updateTab(tab, { url, error: null })
     const onTitle = (_event, title) => updateTab(tab, { title: String(title || '') })
@@ -320,6 +334,8 @@ function createBrowserService(options = {}) {
       })
     }
     const onGone = (_event, details) => {
+      cancelSelection(tab)
+      tab.inspector.selected = null
       updateTab(tab, {
         loading: false,
         crashed: true,
@@ -408,7 +424,10 @@ function createBrowserService(options = {}) {
       view,
       webContents: wc,
       cleanups: [],
-      navigationToken: 0
+      navigationToken: 0,
+      inspector: { selecting: false, selected: null, selectionToken: 0 },
+      device: null,
+      zoomBeforeDevice: null
     }
     tabs.set(tab.id, tab)
     if (kind === 'agent') runTabs.set(tab.runId, tab.id)
@@ -484,6 +503,8 @@ function createBrowserService(options = {}) {
 
   function closeTab(tabId) {
     const tab = requireTab(tabId)
+    cancelSelection(tab)
+    clearDevice(tab)
     closeDevTools(tab)
     tab.destroyed = true
     tabs.delete(tab.id)
@@ -525,6 +546,7 @@ function createBrowserService(options = {}) {
       const previous = tabs.get(attachedTabId)
       if (previous && previous.id !== tab.id) {
         previous.view.setVisible(false)
+        cancelSelection(previous)
         closeDevTools(previous)
       }
       attachedTabId = tab.id
@@ -534,19 +556,26 @@ function createBrowserService(options = {}) {
     return getState()
   }
 
-  function attachTab(tabId, bounds) {
+  function attachTab(tabId, bounds, options = {}) {
     const tab = requireTab(tabId)
     const rect = normalizeBounds(bounds)
     if (attachedTabId && attachedTabId !== tab.id) {
       const previous = tabs.get(attachedTabId)
       if (previous) {
         previous.view.setVisible(false)
+        cancelSelection(previous)
         closeDevTools(previous)
       }
     }
     activeTabId = tab.id
     attachedTabId = tab.id
     getMainWindow().contentView.addChildView(tab.view)
+    if (tab.device) {
+      const displayScale = Number(options.displayScale)
+      tab.webContents.setZoomFactor(
+        Number.isFinite(displayScale) ? Math.max(0.25, Math.min(1, displayScale)) : 1
+      )
+    }
     tab.view.setBounds(rect)
     tab.view.setVisible(true)
     emitState('state')
@@ -571,6 +600,7 @@ function createBrowserService(options = {}) {
       const tab = tabs.get(attachedTabId)
       if (tab) {
         tab.view.setVisible(false)
+        cancelSelection(tab)
         closeDevTools(tab)
       }
     }
@@ -618,6 +648,145 @@ function createBrowserService(options = {}) {
     }
   }
 
+  function cancelSelection(tab) {
+    if (!tab || tab.destroyed || tab.webContents.isDestroyed()) return
+    tab.inspector.selectionToken += 1
+    tab.inspector.selecting = false
+    void resetElementInspector(tab.webContents)
+  }
+
+  function clearDevice(tab) {
+    if (!tab || !tab.device || tab.destroyed || tab.webContents.isDestroyed()) return
+    if (tab.zoomBeforeDevice != null) tab.webContents.setZoomFactor(tab.zoomBeforeDevice)
+    tab.device = null
+    tab.zoomBeforeDevice = null
+  }
+
+  function normalizeDevice(value = {}) {
+    const width = Math.round(Number(value.width))
+    const height = Math.round(Number(value.height))
+    const scale = Math.round(Number(value.scale))
+    return {
+      width: Number.isFinite(width) ? Math.max(240, Math.min(3840, width)) : 1280,
+      height: Number.isFinite(height) ? Math.max(240, Math.min(2160, height)) : 800,
+      scale: Number.isFinite(scale) ? Math.max(25, Math.min(100, scale)) : 100
+    }
+  }
+
+  async function selectElement(tabId) {
+    const tab = requireTab(tabId)
+    if (tab.kind === 'agent' && tab.owner === 'agent') takeover(tab.id)
+    closeDevTools(tab)
+    cancelSelection(tab)
+    const token = ++tab.inspector.selectionToken
+    tab.inspector.selecting = true
+    const isCurrent = () =>
+      !tab.destroyed && tabs.get(tab.id) === tab && tab.inspector.selectionToken === token
+    try {
+      const task = await beginElementSelection(tab.webContents)
+      if (!isCurrent()) return { cancelled: true, reason: 'replaced', selected: null }
+      const result = await task.result
+      if (!isCurrent()) return { cancelled: true, reason: 'replaced', selected: null }
+      if (result && result.selected) {
+        tab.inspector.selected = sanitizeElementInfo(result.selected)
+        if (!tab.inspector.selected)
+          throw new BrowserError('元素信息无效', 'BROWSER_ELEMENT_INVALID')
+        return { cancelled: false, selected: tab.inspector.selected }
+      }
+      return {
+        cancelled: true,
+        reason: String((result && result.reason) || 'cancelled'),
+        selected: tab.inspector.selected
+      }
+    } finally {
+      if (isCurrent()) tab.inspector.selecting = false
+    }
+  }
+
+  async function cancelElementSelectionById(tabId) {
+    const tab = requireTab(tabId)
+    cancelSelection(tab)
+    return { cancelled: true, selected: tab.inspector.selected }
+  }
+
+  async function inspectorState(tabId) {
+    const tab = requireTab(tabId)
+    const token = tab.inspector.selectionToken
+    const selected = await getSelectedElement(tab.webContents)
+    if (tab.destroyed || tabs.get(tab.id) !== tab || token !== tab.inspector.selectionToken) {
+      return { selecting: tab.inspector.selecting, selected: tab.inspector.selected }
+    }
+    tab.inspector.selected = selected
+    return { selecting: tab.inspector.selecting, selected }
+  }
+
+  async function updateElementStyles(tabId, elementId, styles = {}, resetProperties = []) {
+    const tab = requireTab(tabId)
+    assertManualAccess(tab)
+    const changes = validateStyleChanges(styles, resetProperties)
+    const id = String(elementId)
+    if (!tab.inspector.selected || tab.inspector.selected.elementId !== id) {
+      throw new BrowserError('选中元素已失效，请重新选择', 'BROWSER_ELEMENT_STALE')
+    }
+    const token = tab.inspector.selectionToken
+    const selected = await setSelectedElementStyles(tab.webContents, id, changes)
+    if (
+      tab.destroyed ||
+      tabs.get(tab.id) !== tab ||
+      token !== tab.inspector.selectionToken ||
+      tab.inspector.selected?.elementId !== id
+    ) {
+      throw new BrowserError('选中元素已失效，请重新选择', 'BROWSER_ELEMENT_STALE')
+    }
+    if (!selected) {
+      tab.inspector.selected = null
+      throw new BrowserError('选中元素已失效，请重新选择', 'BROWSER_ELEMENT_STALE')
+    }
+    tab.inspector.selected = selected
+    return selected
+  }
+
+  async function resetElementStyles(tabId, elementId) {
+    const tab = requireTab(tabId)
+    assertManualAccess(tab)
+    const id = String(elementId)
+    if (!tab.inspector.selected || tab.inspector.selected.elementId !== id) {
+      throw new BrowserError('选中元素已失效，请重新选择', 'BROWSER_ELEMENT_STALE')
+    }
+    const token = tab.inspector.selectionToken
+    const selected = await resetSelectedElementStyles(tab.webContents, id)
+    if (
+      tab.destroyed ||
+      tabs.get(tab.id) !== tab ||
+      token !== tab.inspector.selectionToken ||
+      tab.inspector.selected?.elementId !== id
+    ) {
+      throw new BrowserError('选中元素已失效，请重新选择', 'BROWSER_ELEMENT_STALE')
+    }
+    if (!selected) {
+      tab.inspector.selected = null
+      throw new BrowserError('选中元素已失效，请重新选择', 'BROWSER_ELEMENT_STALE')
+    }
+    tab.inspector.selected = selected
+    return selected
+  }
+
+  function setDevice(tabId, value = {}) {
+    const tab = requireTab(tabId)
+    assertManualAccess(tab)
+    if (!tab.device) tab.zoomBeforeDevice = tab.webContents.getZoomFactor()
+    tab.device = normalizeDevice(value)
+    emitState('state', { tabId: tab.id })
+    return summarize(tab)
+  }
+
+  function clearDeviceById(tabId) {
+    const tab = requireTab(tabId)
+    clearDevice(tab)
+    emitState('state', { tabId: tab.id })
+    return summarize(tab)
+  }
+
   function closeDevTools(tab) {
     if (!tab || tab.destroyed || tab.webContents.isDestroyed()) return
     if (tab.webContents.isDevToolsOpened()) tab.webContents.closeDevTools()
@@ -628,7 +797,10 @@ function createBrowserService(options = {}) {
     const tab = requireTab(tabId)
     if (tab.kind === 'agent' && tab.owner === 'agent') tab.owner = 'user'
     if (tab.webContents.isDevToolsOpened()) tab.webContents.closeDevTools()
-    else tab.webContents.openDevTools({ mode: 'detach', title: 'Mini Agent 开发者工具' })
+    else {
+      cancelSelection(tab)
+      tab.webContents.openDevTools({ mode: 'detach', title: 'Mini Agent 开发者工具' })
+    }
     return summarize(tab)
   }
 
@@ -765,6 +937,81 @@ function createBrowserService(options = {}) {
     return summarize(tab)
   }
 
+  async function dispatchInput(input = {}) {
+    const tab = tabs.get(attachedTabId)
+    if (!tab || tab.kind !== 'user' || tab.destroyed || tab.crashed) {
+      throw new BrowserError('当前没有可见的用户浏览器标签', 'BROWSER_VIEW_UNAVAILABLE')
+    }
+    assertManualAccess(tab)
+    closeDevTools(tab)
+    const debuggerApi = tab.webContents.debugger
+    if (!debuggerApi || typeof debuggerApi.sendCommand !== 'function') {
+      throw new BrowserError('当前浏览器视图不支持 CDP 输入', 'BROWSER_VIEW_UNAVAILABLE')
+    }
+    const attachedHere = !debuggerApi.isAttached()
+    if (attachedHere) debuggerApi.attach('1.3')
+    const sendCommand = async (method, params) => {
+      let timer
+      try {
+        return await Promise.race([
+          debuggerApi.sendCommand(method, params),
+          new Promise((_, reject) => {
+            timer = setTimeout(
+              () => reject(new BrowserError('浏览器输入超时', 'BROWSER_INPUT_TIMEOUT')),
+              10000
+            )
+          })
+        ])
+      } finally {
+        clearTimeout(timer)
+      }
+    }
+    try {
+      if (['keyDown', 'keyUp', 'char', 'insertText'].includes(input.type)) {
+        const focus = await tab.webContents.executeJavaScript(`(() => {
+          const element = document.activeElement;
+          if (!element) return { blocked: true };
+          const type = String(element.getAttribute('type') || '').toLowerCase();
+          return { blocked: type === 'password' };
+        })()`)
+        if (!focus || focus.blocked !== false) {
+          throw new BrowserError('禁止向密码控件输入', 'BROWSER_PASSWORD_PROTECTED')
+        }
+      }
+      if (['mousePressed', 'mouseReleased', 'mouseMoved', 'mouseWheel'].includes(input.type)) {
+        await sendCommand('Input.dispatchMouseEvent', {
+          type: input.type,
+          x: Number(input.x) || 0,
+          y: Number(input.y) || 0,
+          button: input.button || 'none',
+          clickCount: Number(input.clickCount) || 0,
+          ...(input.type === 'mouseWheel'
+            ? { deltaX: Number(input.deltaX) || 0, deltaY: Number(input.deltaY) || 0 }
+            : {})
+        })
+      } else if (['keyDown', 'keyUp'].includes(input.type)) {
+        await sendCommand('Input.dispatchKeyEvent', {
+          type: input.type,
+          key: input.key || '',
+          code: input.code || ''
+        })
+      } else if (input.type === 'char') {
+        await sendCommand('Input.dispatchKeyEvent', {
+          type: 'char',
+          key: input.key || '',
+          text: input.text || ''
+        })
+      } else if (input.type === 'insertText') {
+        await sendCommand('Input.insertText', { text: input.text || '' })
+      } else {
+        throw new BrowserError('不支持的 CDP 输入类型', 'BROWSER_INVALID_TARGET')
+      }
+      return { ok: true }
+    } finally {
+      if (attachedHere && debuggerApi.isAttached()) debuggerApi.detach()
+    }
+  }
+
   async function screenshot(tabId) {
     const tab = requireTab(tabId)
     const image = await tab.webContents.capturePage()
@@ -817,10 +1064,18 @@ function createBrowserService(options = {}) {
     command: commandTab,
     toggleDevTools,
     toggleFocusedDevTools,
+    selectElement,
+    cancelElementSelection: cancelElementSelectionById,
+    inspectorState,
+    updateElementStyles,
+    resetElementStyles,
+    setDevice,
+    clearDevice: clearDeviceById,
     attach: attachTab,
     detach,
     takeover,
     release,
+    dispatchInput,
     screenshot,
     clearData,
     shutdown,

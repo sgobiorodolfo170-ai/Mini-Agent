@@ -1,6 +1,6 @@
 {
   "name": "miniagent",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Windows 桌面个人 AI 助理（自用）",
   "main": "out/main/index.js",
   "author": "miniagent",
@@ -14,6 +14,7 @@
     "test:coverage": "vitest run --coverage --no-file-parallelism",
     "test:e2e": "vitest run --config vitest.e2e.config.mjs",
     "test:e2e:mock": "vitest run --config vitest.e2e.config.mjs --exclude \"e2e/real-provider.spec.js\"",
+    "test:e2e:mobile": "vitest run --config vitest.e2e.config.mjs e2e/mobile.spec.js e2e/mobile-sync.spec.js",
     "lint": "eslint src electron tests --no-warn-ignored",
     "format": "prettier --check ."
   },
@@ -48,6 +49,7 @@
   "dependencies": {
     "@fastify/cookie": "^11.1.5",
     "@fastify/static": "^10.1.12",
+    "@xyflow/vue": "2.0.3",
     "faiss-node": "^0.5.1",
     "fastify": "^5.12.8",
     "node-forge": "^1.4.3",

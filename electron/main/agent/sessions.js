@@ -17,7 +17,6 @@ const { getHub } = require('../events/hub')
 const MAX_DEPTH = 2 // 人工会话(0) → 子会话(1) → 孙会话(2)
 const DEFAULT_WAIT_MS = 60000
 const MAX_WAIT_MS = 300000
-const POLL_MS = 500
 
 // 仍在推进中的状态：等待会话时不得当成终态。
 // 包含 Run 的 queued/waiting_child，以及消息的 streaming/pending。
@@ -247,35 +246,60 @@ function listSessions({ parentId, runId, limit = 20 } = {}) {
     .filter(Boolean)
 }
 
-// 有界轮询等待：等到 run 进入终态或超时。
-// 用轮询而非长连接，是因为子会话可能由另一条 IPC 链路驱动，
-// 事件订阅拿不到「刚结束」的确定性通知；轮询语义简单且可预期。
-async function waitForSession({
-  conversationId,
-  timeoutMs = DEFAULT_WAIT_MS,
-  pollMs = POLL_MS,
-  signal
-}) {
+// 事件驱动有界等待：先读快照，再订阅进程内状态事件，超时返回当前快照。
+async function waitForSession({ conversationId, timeoutMs = DEFAULT_WAIT_MS, signal } = {}) {
   const limit = Math.min(MAX_WAIT_MS, Math.max(1000, Number(timeoutMs) || DEFAULT_WAIT_MS))
-  const interval = Math.max(200, Number(pollMs) || POLL_MS)
   const started = Date.now()
   const selection = getSessionStatus({ conversationId })
-  for (;;) {
-    if (signal?.aborted) throw new Error('任务已停止')
-    const last = sessionView(deps.dbm.get(), conversationId, selection)
-    if (!last) throw new Error('会话不存在')
-    if (last.status && !ACTIVE_STATUSES.has(last.status)) {
-      return { ...last, waited: Date.now() - started, timedOut: false }
+  return new Promise((resolve, reject) => {
+    let settled = false
+    let timer
+    let unsubscribe
+    function cleanup() {
+      if (unsubscribe) unsubscribe()
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', abort)
     }
-    if (Date.now() - started >= limit) {
-      return { ...last, waited: Date.now() - started, timedOut: true }
+    function abort() {
+      if (settled) return
+      settled = true
+      cleanup()
+      reject(Object.assign(new Error('任务已停止'), { name: 'AbortError' }))
     }
-    await require('node:timers/promises').setTimeout(
-      Math.min(interval, Math.max(1, limit - (Date.now() - started))),
-      undefined,
-      { signal }
-    )
-  }
+    function check(timedOut = false) {
+      if (settled) return
+      try {
+        const last = sessionView(deps.dbm.get(), conversationId, selection)
+        if (!last) throw new Error('会话不存在')
+        if (!timedOut && last.status && !ACTIVE_STATUSES.has(last.status)) {
+          settled = true
+          cleanup()
+          resolve({ ...last, waited: Date.now() - started, timedOut: false })
+        } else if (timedOut) {
+          settled = true
+          cleanup()
+          resolve({ ...last, waited: Date.now() - started, timedOut: true })
+        }
+      } catch (error) {
+        settled = true
+        cleanup()
+        reject(error)
+      }
+    }
+    const hub = getHub()
+    unsubscribe = hub.on('*', ({ name, payload }) => {
+      if (
+        payload.conversationId === conversationId ||
+        (selection.runId && payload.runId === selection.runId)
+      ) {
+        check()
+      } else if (name.startsWith('session.')) check()
+    })
+    timer = setTimeout(() => check(true), limit)
+    signal?.addEventListener('abort', abort, { once: true })
+    if (signal?.aborted) abort()
+    else check()
+  })
 }
 
 // 取运行结果：最终回答 + 最近的工具调用摘要

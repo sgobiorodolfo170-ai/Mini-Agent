@@ -13,6 +13,11 @@ function stubApi() {
       respond: vi.fn(async () => ({})),
       recovery: vi.fn(async () => ({ runId: 'r1', canResume: true })),
       mutateGraph: vi.fn(async () => ({ graphId: 'g1', etag: 'e2', nodes: [] })),
+      saveGraphLayout: vi.fn(async () => ({
+        layout: { n1: { x: 120, y: 80 } },
+        viewport: { x: 0, y: 0, zoom: 1 },
+        layoutRevision: 2
+      })),
       resumeInterrupted: vi.fn(async () => ({ id: 'r1', status: 'queued' })),
       retryInterrupted: vi.fn(async () => ({ runId: 'r2', retryOfRunId: 'r1' })),
       acceptanceDecide: vi.fn(async () => ({ id: 'r1', acceptance_status: 'accepted' }))
@@ -129,6 +134,19 @@ describe('agent store', () => {
     expect(window.api.agent.mutateGraph).toHaveBeenCalledWith(input)
     expect(result.etag).toBe('e2')
     expect(s.graph.etag).toBe('e2')
+  })
+
+  it('saveGraphLayout 保存布局并更新本地图状态', async () => {
+    const s = useAgentStore()
+    s.graph = { graphId: 'g1', layoutRevision: 1 }
+    const input = {
+      runId: 'r1',
+      layout: { n1: { x: 120, y: 80 } },
+      viewport: { x: 0, y: 0, zoom: 1 }
+    }
+    await s.saveGraphLayout(input)
+    expect(window.api.agent.saveGraphLayout).toHaveBeenCalledWith(input)
+    expect(s.graph).toMatchObject({ layoutRevision: 2, layout: { n1: { x: 120, y: 80 } } })
   })
 
   it('done 事件清掉该运行遗留的确认卡（含停止/出错路径）', () => {

@@ -452,6 +452,64 @@ function searchConversations(db, q) {
   return ids.map((id) => getConversation(db, id)).filter(Boolean)
 }
 
+function escapeLike(value) {
+  return String(value).replace(/[\\%_]/g, '\\$&')
+}
+
+function searchMessages(db, { query, conversationId = null, limit = 50, cursor = 0 } = {}) {
+  const text = String(query || '')
+    .trim()
+    .slice(0, 200)
+  if (!text) return { results: [], nextCursor: null }
+  const size = Math.max(1, Math.min(100, Number(limit) || 50))
+  const offset = Math.max(0, Math.min(10000, Number(cursor) || 0))
+  const like = `%${escapeLike(text)}%`
+  let messageSql
+  let params
+  if (Array.from(text).length >= 3) {
+    const phrase = `"${text.replace(/"/g, '""')}"`
+    messageSql = `SELECT 1 AS kind,m.id AS messageId,m.conversation_id AS conversationId,
+      c.title AS conversationTitle,m.role AS role,m.seq AS seq,
+      CASE WHEN instr(lower(m.content),lower(?))>0 THEN 'content' ELSE 'tool_calls' END AS matchField,
+      CASE WHEN instr(lower(m.content),lower(?))>0
+        THEN substr(m.content,max(1,instr(lower(m.content),lower(?))-60),240)
+        ELSE substr(COALESCE(m.tool_calls,''),1,240) END AS snippet,m.created_at AS createdAt
+      FROM messages_fts JOIN messages m ON m.rowid=messages_fts.rowid
+      JOIN conversations c ON c.id=m.conversation_id
+      WHERE messages_fts MATCH ? AND m.deleted_at IS NULL AND c.deleted_at IS NULL
+        AND (? IS NULL OR m.conversation_id=?)`
+    params = [text, text, text, phrase, conversationId, conversationId]
+  } else {
+    messageSql = `SELECT 1 AS kind,m.id AS messageId,m.conversation_id AS conversationId,
+      c.title AS conversationTitle,m.role AS role,m.seq AS seq,
+      CASE WHEN m.content LIKE ? ESCAPE '\\' THEN 'content' ELSE 'tool_calls' END AS matchField,
+      CASE WHEN instr(lower(m.content),lower(?))>0
+        THEN substr(m.content,max(1,instr(lower(m.content),lower(?))-60),240)
+        ELSE substr(COALESCE(m.tool_calls,''),1,240) END AS snippet,m.created_at AS createdAt
+      FROM messages m JOIN conversations c ON c.id=m.conversation_id
+      WHERE m.deleted_at IS NULL AND c.deleted_at IS NULL
+        AND (m.content LIKE ? ESCAPE '\\' OR COALESCE(m.tool_calls,'') LIKE ? ESCAPE '\\')
+        AND (? IS NULL OR m.conversation_id=?)`
+    params = [like, text, text, like, like, conversationId, conversationId]
+  }
+  const titleSql = `SELECT 0 AS kind,NULL AS messageId,c.id AS conversationId,c.title AS conversationTitle,
+    NULL AS role,NULL AS seq,'title' AS matchField,
+    substr(COALESCE(NULLIF(c.title,''),c.system_prompt,''),1,240) AS snippet,c.updated_at AS createdAt
+    FROM conversations c WHERE c.deleted_at IS NULL
+      AND (c.title LIKE ? ESCAPE '\\' OR COALESCE(c.system_prompt,'') LIKE ? ESCAPE '\\')`
+  const rows = db
+    .prepare(
+      `SELECT * FROM (${messageSql} UNION ALL ${titleSql})
+       ORDER BY createdAt DESC,conversationId,messageId LIMIT ? OFFSET ?`
+    )
+    .all(...params, like, like, size + 1, offset)
+  const hasMore = rows.length > size
+  return {
+    results: rows.slice(0, size),
+    nextCursor: hasMore ? offset + size : null
+  }
+}
+
 // ---------- messages ----------
 function listMessages(db, conversationId) {
   return db
@@ -1083,6 +1141,7 @@ module.exports = {
   softDeleteConversation,
   assertNoActiveRun,
   searchConversations,
+  searchMessages,
   listMessages,
   nextSeq,
   insertMessage,

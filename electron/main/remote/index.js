@@ -14,6 +14,7 @@ const { RemoteCommandRouter } = require('./router')
 const { parseEnvelope, remoteError, secretEqual, tokenHash } = require('./protocol')
 const repos = require('../../store/repos')
 const certificates = require('./certificate-service')
+const { createSyncService } = require('../sync/service')
 
 function networkInterfaces() {
   const out = []
@@ -75,6 +76,7 @@ class RemoteControlManager {
     this.events.authService = this.auth
     globalThis.__miniagentRemoteEvents = this.events
     this.router = new RemoteCommandRouter({ db, auth: this.auth, events: this.events })
+    this.sync = createSyncService({ db, authService: this.auth })
     this.state = {
       status: 'stopped',
       host: null,
@@ -100,7 +102,8 @@ class RemoteControlManager {
       devices: this.auth.listDevices(),
       pairings: this.auth.listPairings(),
       connectionCount: this.clients.size,
-      eventEpoch: this.events.epoch()
+      eventEpoch: this.events.epoch(),
+      sync: this.sync.status({ deviceId: 'local', role: 'operator' })
     }
   }
   async qrCode() {
@@ -116,14 +119,15 @@ class RemoteControlManager {
       fingerprint: this.state.fingerprint
     }
   }
-  rateLimit(ip, limit = 30) {
+  rateLimit(ip, limit = 30, scope = 'api') {
     const now = Date.now()
-    const bucket = this.rate.get(ip) || []
+    const key = `${scope}:${ip}`
+    const bucket = this.rate.get(key) || []
     const recent = bucket.filter((t) => now - t < 60000)
     if (recent.length >= limit)
       throw remoteError('RATE_LIMITED', '请求过于频繁，请稍后重试', 429, true)
     recent.push(now)
-    this.rate.set(ip, recent)
+    this.rate.set(key, recent)
   }
   async start({ host, port = 37651, transport = 'tls', allowPlain = false } = {}) {
     try {
@@ -196,10 +200,8 @@ class RemoteControlManager {
     })
     app.addHook('preHandler', async (req) => {
       if (req.url.startsWith('/api/v1/')) {
-        this.rateLimit(
-          req.ip,
-          req.url.includes('/pair/') || req.url.includes('/auth/session') ? 10 : 120
-        )
+        const authRoute = req.url.includes('/pair/') || req.url.includes('/auth/session')
+        this.rateLimit(req.ip, authRoute ? 10 : 120, authRoute ? 'auth' : 'api')
         if (
           req.url !== '/api/v1/auth/status' &&
           !req.url.startsWith('/api/v1/pair/') &&
@@ -273,6 +275,31 @@ class RemoteControlManager {
     app.get('/api/v1/conversations/:id/messages', async (req) =>
       this.events.messages(req.remoteAuth, req.params.id)
     )
+    app.get('/api/v1/messages/search', async (req) =>
+      repos.searchMessages(this.db, {
+        query: req.query.q,
+        cursor: req.query.cursor,
+        limit: req.query.limit
+      })
+    )
+    app.get('/api/v1/sync/status', async (req) => this.sync.status(req.remoteAuth))
+    app.get('/api/v1/sync/changes', async (req) =>
+      this.sync.pull(req.remoteAuth, {
+        after: Number(req.query.after) || 0,
+        limit: Number(req.query.limit) || 100
+      })
+    )
+    app.post('/api/v1/sync/lease', async (req) =>
+      this.sync.acquireLease(req.remoteAuth, req.body || {})
+    )
+    app.post('/api/v1/sync/push', async (req) => this.sync.push(req.remoteAuth, req.body || {}))
+    app.get('/api/v1/sync/conflicts', async (req) => this.sync.listConflicts(req.remoteAuth))
+    app.post('/api/v1/sync/conflicts/:id/resolve', async (req) =>
+      this.sync.resolveConflict(req.remoteAuth, {
+        id: req.params.id,
+        resolution: req.body?.resolution
+      })
+    )
     app.get('/api/v1/runs', async (req) => this.events.runs(req.remoteAuth))
     app.get('/api/v1/runs/:id/result', async (req) => {
       const run = repos.getRun(this.db, req.params.id)
@@ -291,10 +318,11 @@ class RemoteControlManager {
     app.get('/api/v1/events', async (req) =>
       this.events.since(req.remoteAuth, req.query.after, req.query.epoch)
     )
-    // 生产 HTML 引用 ../../assets/，开发/测试环境也必须用构建产物，不能用 src 源码目录
-    const root =
-      this.mobileRoot ||
-      (process.resourcesPath
+    // 生产 HTML 引用 ../../assets/，开发/测试环境也必须用构建产物，不能用 src 源码目录。
+    // Electron 开发进程同样有 resourcesPath，但那里没有 app.asar；因此按真实存在性择优。
+    const rootCandidates = [
+      this.mobileRoot,
+      process.resourcesPath
         ? path.join(
             process.resourcesPath,
             'app.asar',
@@ -303,12 +331,20 @@ class RemoteControlManager {
             'entries',
             'remote-mobile'
           )
-        : path.join(__dirname, '../../../out/renderer/entries/remote-mobile'))
-    const hasMobile = fs.existsSync(root) && fs.existsSync(path.join(root, 'index.html'))
-    const assetsRoot =
-      hasMobile && fs.existsSync(path.join(root, '../../assets'))
+        : null,
+      path.join(__dirname, '../../renderer/entries/remote-mobile'),
+      path.join(__dirname, '../../../out/renderer/entries/remote-mobile'),
+      path.resolve(process.cwd(), 'out/renderer/entries/remote-mobile')
+    ].filter(Boolean)
+    const root = rootCandidates.find(
+      (candidate) => fs.existsSync(candidate) && fs.existsSync(path.join(candidate, 'index.html'))
+    )
+    const hasMobile = Boolean(root)
+    const assetsRoot = hasMobile
+      ? fs.existsSync(path.join(root, '../../assets'))
         ? path.join(root, '../../assets')
         : path.join(root, 'assets')
+      : null
     if (hasMobile) {
       // electron-vite 多入口 HTML 用 ../../assets/<name> 引用共享资源，浏览器会规范化成 /assets/<name>。
       // 在 static 插件之前显式注册 /assets/*，避免被 SPA fallback 或路径遍历拦截。

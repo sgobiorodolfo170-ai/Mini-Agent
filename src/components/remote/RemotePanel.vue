@@ -1,10 +1,13 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import { useRemoteStore } from '../../stores/remote'
+import { useSettingsStore } from '../../stores/settings'
 import { useUiStore } from '../../stores/ui'
 
 const remote = useRemoteStore()
+const settings = useSettingsStore()
 const ui = useUiStore()
+const syncEnabled = ref(settings.settings.syncEnabled === true)
 const selectedHost = ref('')
 const selectedPort = ref(37651)
 
@@ -49,6 +52,18 @@ async function startPlain() {
     ui.toast('已启动受限明文模式（仅普通消息）', 'warn')
   } catch (e) {
     ui.toast('启动失败：' + String(e.message || e), 'error')
+  }
+}
+
+async function toggleSync() {
+  syncEnabled.value = !syncEnabled.value
+  try {
+    await settings.set('syncEnabled', syncEnabled.value)
+    await remote.refresh()
+    ui.toast(syncEnabled.value ? '设备数据同步已启用' : '设备数据同步已停用', 'success')
+  } catch (error) {
+    syncEnabled.value = !syncEnabled.value
+    ui.toast('同步开关保存失败：' + String(error.message || error), 'error')
   }
 }
 
@@ -123,6 +138,32 @@ async function changeRole(d, role) {
         当前为明文兼容模式，仅支持普通消息，高危操作已禁用。
       </p>
       <p v-if="remote.error" class="text-xs text-bad m-0">{{ remote.error }}</p>
+    </section>
+
+    <!-- 数据同步 -->
+    <section class="rounded-xl border border-line-subtle bg-surface p-4 flex flex-col gap-3">
+      <div class="flex items-center justify-between gap-3">
+        <div>
+          <h3 class="text-sm font-medium text-ink-primary m-0">设备数据同步</h3>
+          <p class="text-[11px] text-ink-muted m-0">
+            会话、消息和项目；单写租约、幂等与冲突副本。API Key 和任务运行不同步。
+          </p>
+        </div>
+        <button
+          class="btn-compact text-xs shrink-0"
+          data-testid="remote-sync-toggle"
+          :aria-pressed="syncEnabled"
+          @click="toggleSync"
+        >
+          {{ syncEnabled ? '已启用' : '已停用' }}
+        </button>
+      </div>
+      <div class="text-[11px] text-ink-muted flex flex-wrap gap-x-4 gap-y-1">
+        <span>待推送 {{ remote.sync?.pending ?? 0 }}</span>
+        <span>未解决冲突 {{ remote.sync?.conflicts ?? 0 }}</span>
+        <span>游标 {{ remote.sync?.lastSeq ?? 0 }}</span>
+        <span>设备 {{ remote.sync?.deviceId?.slice(0, 8) || '—' }}…</span>
+      </div>
     </section>
 
     <!-- 二维码 -->

@@ -45,6 +45,15 @@ export const useAgentStore = defineStore('agent', {
       this.graph = window.api.agent.graph && id ? await window.api.agent.graph(id) : null
       return this.graph
     },
+    async saveGraphLayout(input) {
+      const result = await window.api.agent.saveGraphLayout(plain(input))
+      if (this.graph) {
+        this.graph.layout = result.layout
+        this.graph.viewport = result.viewport
+        this.graph.layoutRevision = result.layoutRevision
+      }
+      return result
+    },
     async mutateGraph(input) {
       const graph = await window.api.agent.mutateGraph(plain(input))
       this.graph = graph

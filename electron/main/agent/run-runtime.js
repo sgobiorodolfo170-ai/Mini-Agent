@@ -63,9 +63,9 @@ function waitForRuns(db, { runIds, resolveRunIds, timeoutMs, signal }) {
   const timeout = Math.min(300000, Math.max(1, Number(timeoutMs) || 60000))
   return new Promise((resolve, reject) => {
     function cleanup() {
-      unsubscribe()
+      unsubscribeRun()
+      unsubscribeGraph()
       clearTimeout(timer)
-      clearInterval(poll)
       signal?.removeEventListener('abort', abort)
     }
     function abort() {
@@ -94,9 +94,9 @@ function waitForRuns(db, { runIds, resolveRunIds, timeoutMs, signal }) {
         reject(error)
       }
     }
-    const unsubscribe = getHub().on('run.end', () => check())
+    const unsubscribeRun = getHub().on('run.end', () => check())
+    const unsubscribeGraph = getHub().on('graph.updated', () => check())
     const timer = setTimeout(() => check(true), timeout)
-    const poll = setInterval(() => check(), 500)
     signal?.addEventListener('abort', abort, { once: true })
     if (signal?.aborted) abort()
     else check()

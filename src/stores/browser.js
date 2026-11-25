@@ -70,8 +70,34 @@ export const useBrowserStore = defineStore('browser', {
       await this.load()
       return tab
     },
-    async attach(tabId, bounds) {
-      const state = await window.api.browser.attach(tabId, bounds)
+    async selectElement(tabId = this.activeTabId) {
+      if (!tabId) return null
+      return window.api.browser.selectElement(tabId)
+    },
+    async cancelElementSelection(tabId = this.activeTabId) {
+      if (!tabId) return null
+      return window.api.browser.cancelElementSelection(tabId)
+    },
+    async inspectorState(tabId = this.activeTabId) {
+      if (!tabId) return { selecting: false, selected: null }
+      return window.api.browser.inspectorState(tabId)
+    },
+    async updateElementStyles(tabId, elementId, styles, resetProperties) {
+      return window.api.browser.updateElementStyles(tabId, elementId, styles, resetProperties)
+    },
+    async resetElementStyles(tabId, elementId) {
+      return window.api.browser.resetElementStyles(tabId, elementId)
+    },
+    async setDevice(tabId, device) {
+      await window.api.browser.setDevice(tabId, device)
+      return this.load()
+    },
+    async clearDevice(tabId) {
+      await window.api.browser.clearDevice(tabId)
+      return this.load()
+    },
+    async attach(tabId, bounds, options) {
+      const state = await window.api.browser.attach(tabId, bounds, options)
       this.apply(state)
       return state
     },

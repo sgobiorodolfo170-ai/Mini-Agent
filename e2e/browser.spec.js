@@ -87,6 +87,41 @@ async function activateBrowserDevToolsMenu(electronApp) {
   })
 }
 
+async function clickGuestElement(electronApp, url, selector) {
+  return electronApp.evaluate(
+    ({ webContents }, { target, query }) => {
+      const guest = webContents.getAllWebContents().find((contents) => contents.getURL() === target)
+      if (!guest) throw new Error('guest not found')
+      const rect = guest.executeJavaScript(`(() => {
+        const element = document.querySelector(${JSON.stringify(query)});
+        if (!element) return null;
+        const box = element.getBoundingClientRect();
+        return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+      })()`)
+      return rect.then((point) => {
+        if (!point) throw new Error('element not found')
+        guest.sendInputEvent({ type: 'mouseMove', x: point.x, y: point.y })
+        guest.sendInputEvent({
+          type: 'mouseDown',
+          x: point.x,
+          y: point.y,
+          button: 'left',
+          clickCount: 1
+        })
+        guest.sendInputEvent({
+          type: 'mouseUp',
+          x: point.x,
+          y: point.y,
+          button: 'left',
+          clickCount: 1
+        })
+        return point
+      })
+    },
+    { target: url, query: selector }
+  )
+}
+
 async function sendBrowserGoal(win) {
   await win.getByTestId('nav-chat').click()
   await win.getByTestId('new-conv').click()
@@ -251,13 +286,151 @@ describe('内置浏览器原生开发者工具', () => {
     await focusGuestDevTools(electronApp, pageUrl)
     expect(await activateBrowserDevToolsMenu(electronApp)).toBe('F12')
     await waitFor(async () => !(await isGuestDevToolsOpened(electronApp, pageUrl)))
-    await win.getByTestId('browser-devtools').click()
-    await waitFor(async () => !(await isGuestDevToolsOpened(electronApp, pageUrl)))
 
     await win.getByTestId('browser-devtools').click()
     await waitFor(() => isGuestDevToolsOpened(electronApp, pageUrl))
     await win.getByTestId('nav-chat').click()
     await waitFor(async () => !(await isGuestDevToolsOpened(electronApp, pageUrl)))
+    expect(unexpectedErrors(consoleErrors)).toEqual([])
+  })
+})
+
+describe('内置浏览器元素检查器与设备工具栏', () => {
+  it('selects an element, edits styles live, emulates a viewport and appends context to chat', async () => {
+    const { electronApp, win, consoleErrors } = ctx
+    await win.getByTestId('chat-input').fill('已有草稿')
+    await win.getByTestId('nav-browser').click()
+    await win.getByTestId('browser-view').waitFor()
+    await win.getByTestId('browser-address').fill(pageUrl)
+    await win.getByTestId('browser-go').click()
+    await waitFor(async () =>
+      (await readGuestBody(electronApp, pageUrl))?.includes('内置浏览器测试页')
+    )
+
+    await win.getByTestId('browser-select-element').click()
+    await waitFor(() =>
+      win.evaluate(async () => {
+        const state = await window.api.browser.state()
+        const inspector = await window.api.browser.inspectorState(state.activeTabId)
+        return inspector.selecting === true
+      })
+    )
+    await clickGuestElement(electronApp, pageUrl, '#go')
+    await win.getByTestId('browser-element-menu').waitFor()
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    expect(pageState.result).toBe(null)
+    await win.getByTestId('browser-select-element').click()
+    await waitFor(() =>
+      win.evaluate(async () => {
+        const state = await window.api.browser.state()
+        const inspector = await window.api.browser.inspectorState(state.activeTabId)
+        return inspector.selecting === true
+      })
+    )
+    await clickGuestElement(electronApp, pageUrl, '#name')
+    await win.getByTestId('browser-element-menu').waitFor()
+    expect(await win.getByTestId('browser-element-add-comment').isVisible()).toBe(true)
+    expect(await win.getByTestId('browser-element-add-chat').isVisible()).toBe(true)
+
+    await win.getByTestId('browser-inspector-toggle').click()
+    await win.getByTestId('browser-inspector').waitFor()
+    expect(await win.getByTestId('browser-inspector-tag').textContent()).toBe('input')
+    await win.getByTestId('browser-inspector-width').fill('240')
+    await win.getByTestId('browser-inspector-width').press('Tab')
+    await waitFor(async () => {
+      const width = await electronApp.evaluate(({ webContents }, target) => {
+        const guest = webContents
+          .getAllWebContents()
+          .find((contents) => contents.getURL() === target)
+        return guest?.executeJavaScript('getComputedStyle(document.querySelector("#name")).width')
+      }, pageUrl)
+      return width === '240px'
+    })
+    expect(
+      await electronApp.evaluate(({ webContents }, target) => {
+        const guest = webContents
+          .getAllWebContents()
+          .find((contents) => contents.getURL() === target)
+        return guest.executeJavaScript('getComputedStyle(document.querySelector("#name")).width')
+      }, pageUrl)
+    ).toBe('240px')
+
+    await win.getByTestId('browser-inspector-tab-css').click()
+    await win.getByTestId('browser-inspector-css').fill('background-color: rgb(255, 0, 0);')
+    await win.getByTestId('browser-inspector-css-apply').click()
+    await waitFor(async () => {
+      const color = await electronApp.evaluate(({ webContents }, target) => {
+        const guest = webContents
+          .getAllWebContents()
+          .find((contents) => contents.getURL() === target)
+        return guest?.executeJavaScript(
+          'getComputedStyle(document.querySelector("#name")).backgroundColor'
+        )
+      }, pageUrl)
+      return color === 'rgb(255, 0, 0)'
+    })
+    expect(
+      await electronApp.evaluate(({ webContents }, target) => {
+        const guest = webContents
+          .getAllWebContents()
+          .find((contents) => contents.getURL() === target)
+        return guest.executeJavaScript(
+          'getComputedStyle(document.querySelector("#name")).backgroundColor'
+        )
+      }, pageUrl)
+    ).toBe('rgb(255, 0, 0)')
+
+    await win.getByTestId('browser-inspector-close').click()
+    await win.getByTestId('browser-device-toggle').click()
+    await win.getByTestId('browser-device-toolbar').waitFor()
+    await win.getByTestId('browser-device-width').fill('800')
+    await win.getByTestId('browser-device-width').press('Tab')
+    await win.getByTestId('browser-device-height').fill('600')
+    await win.getByTestId('browser-device-height').press('Tab')
+    await waitFor(async () => {
+      const viewport = await electronApp.evaluate(({ webContents }, target) => {
+        const guest = webContents
+          .getAllWebContents()
+          .find((contents) => contents.getURL() === target)
+        return guest?.executeJavaScript('({ width: innerWidth, height: innerHeight })')
+      }, pageUrl)
+      return viewport?.width === 800 && viewport?.height === 600
+    })
+    expect(
+      await electronApp.evaluate(({ webContents }, target) => {
+        const guest = webContents
+          .getAllWebContents()
+          .find((contents) => contents.getURL() === target)
+        return guest.executeJavaScript('({ width: innerWidth, height: innerHeight })')
+      }, pageUrl)
+    ).toEqual({ width: 800, height: 600 })
+
+    await win.getByTestId('browser-device-swap').click()
+    await waitFor(async () => {
+      const viewport = await electronApp.evaluate(({ webContents }, target) => {
+        const guest = webContents
+          .getAllWebContents()
+          .find((contents) => contents.getURL() === target)
+        return guest?.executeJavaScript('({ width: innerWidth, height: innerHeight })')
+      }, pageUrl)
+      return viewport?.width === 600 && viewport?.height === 800
+    })
+    expect(
+      await electronApp.evaluate(({ webContents }, target) => {
+        const guest = webContents
+          .getAllWebContents()
+          .find((contents) => contents.getURL() === target)
+        return guest.executeJavaScript('({ width: innerWidth, height: innerHeight })')
+      }, pageUrl)
+    ).toEqual({ width: 600, height: 800 })
+
+    await win.getByTestId('browser-device-close').click()
+    await win.getByTestId('browser-element-add-chat').click()
+    const draft = await win.getByTestId('chat-input').inputValue()
+    expect(draft).toContain('已有草稿')
+    expect(draft).toContain('网页元素上下文')
+    expect(draft).toContain('#name')
+    expect(pageState.result).toBe(null)
     expect(unexpectedErrors(consoleErrors)).toEqual([])
   })
 })
@@ -381,6 +554,9 @@ describe('内置浏览器 P5 登录态与文件能力', () => {
     await win.getByTestId('browser-address').fill(pageUrl)
     await win.getByTestId('browser-go').click()
     await waitFor(async () => pageState.userCookie === 'miniagent_user=secret')
+    await waitFor(async () =>
+      (await readGuestBody(electronApp, pageUrl))?.includes('内置浏览器测试页')
+    )
 
     const info = await win.evaluate(() => window.api.app.info())
     await electronApp.evaluate(({ webContents }, url) => {
@@ -494,6 +670,7 @@ describe.skipIf(process.env.MINIAGENT_E2E_PUBLIC_BROWSER !== '1')('真实公网�
 describe('聊天右侧内置浏览器侧栏', () => {
   it('expands to the right, shrinks chat and coexists with the standalone browser view', async () => {
     const { win, consoleErrors } = ctx
+    await win.bringToFront()
     await win.getByTestId('nav-chat').click()
     await win.getByTestId('new-conv').click()
     const before = await win.getByTestId('chat-main').boundingBox()
@@ -523,6 +700,7 @@ describe('聊天右侧内置浏览器侧栏', () => {
       async () =>
         (await win.getByTestId('chat-browser-panel').boundingBox()).width > panelBefore.width + 40
     )
+    await win.waitForTimeout(150)
     const widened = await win.getByTestId('chat-main').boundingBox()
     const widenedPanel = await win.getByTestId('chat-browser-panel').boundingBox()
     expect(widened.width).toBeLessThan(after.width - 40)
@@ -537,10 +715,10 @@ describe('聊天右侧内置浏览器侧栏', () => {
       steps: 6
     })
     await win.mouse.up()
-    await waitFor(
-      async () =>
-        (await win.getByTestId('chat-browser-panel').boundingBox()).width < widenedPanel.width - 20
-    )
+    await waitFor(async () => {
+      const panel = await win.getByTestId('chat-browser-panel').boundingBox()
+      return !!panel && panel.width < widenedPanel.width - 20
+    })
     const narrowedPanel = await win.getByTestId('chat-browser-panel').boundingBox()
 
     await win.getByTestId('chat-browser-divider').focus()
@@ -559,7 +737,7 @@ describe('聊天右侧内置浏览器侧栏', () => {
 
     await win.getByTestId('nav-chat').click()
     await win.getByTestId('chat-browser-panel').waitFor()
-    await win.getByTestId('chat-browser-panel-close').click()
+    await win.getByTestId('chat-browser-panel-toggle').click()
     await waitFor(async () => {
       const state = await win.evaluate(() => window.api.browser.state())
       return state.attachedTabId === null

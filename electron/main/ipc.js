@@ -213,6 +213,7 @@ function registerIpc(ctx) {
     return true
   })
   h('conversations:search', (q) => repos.searchConversations(dbm.get(), q))
+  h('chat:searchMessages', (o) => repos.searchMessages(dbm.get(), o || {}))
   h('conversations:messages', (id) => repos.listMessages(dbm.get(), id).map(gateway.msgOut))
 
   // projects（项目工作目录：会话分类 + Agent 命令执行目录）
@@ -431,7 +432,16 @@ function registerIpc(ctx) {
   h('agent:runs', () => repos.listRuns(dbm.get(), 50))
   h('agent:calls', (runId) => repos.getRunCalls(dbm.get(), runId))
   h('agent:graph', (runId) => agent.getGraphForParent(runId))
+  h('agent:graph:layout:get', (runId) => agent.getGraphLayoutForParent(runId))
+  h('agent:graph:layout:save', (o) =>
+    agent.saveGraphLayoutForParent(o && o.runId, {
+      layout: o && o.layout,
+      viewport: o && o.viewport,
+      baseRevision: o && o.baseRevision
+    })
+  )
   h('agent:graph:mutate', (o) => agent.mutateRunGraph(o || {}))
+  h('computer:stop', () => agent.stopComputer())
 
   // 内置浏览器：仅主窗口可调用，Agent 通过主进程 BrowserService 访问自己的临时标签。
   const requireBrowser = () => {
@@ -458,7 +468,22 @@ function registerIpc(ctx) {
   bh('browser:close', ({ tabId } = {}) => requireBrowser().close(tabId))
   bh('browser:command', ({ tabId, command } = {}) => requireBrowser().command(tabId, command))
   bh('browser:toggleDevTools', ({ tabId } = {}) => requireBrowser().toggleDevTools(tabId))
-  bh('browser:attach', ({ tabId, bounds } = {}) => requireBrowser().attach(tabId, bounds))
+  bh('browser:selectElement', ({ tabId } = {}) => requireBrowser().selectElement(tabId))
+  bh('browser:cancelElementSelection', ({ tabId } = {}) =>
+    requireBrowser().cancelElementSelection(tabId)
+  )
+  bh('browser:inspectorState', ({ tabId } = {}) => requireBrowser().inspectorState(tabId))
+  bh('browser:updateElementStyles', ({ tabId, elementId, styles, resetProperties } = {}) =>
+    requireBrowser().updateElementStyles(tabId, elementId, styles, resetProperties)
+  )
+  bh('browser:resetElementStyles', ({ tabId, elementId } = {}) =>
+    requireBrowser().resetElementStyles(tabId, elementId)
+  )
+  bh('browser:setDevice', ({ tabId, device } = {}) => requireBrowser().setDevice(tabId, device))
+  bh('browser:clearDevice', ({ tabId } = {}) => requireBrowser().clearDevice(tabId))
+  bh('browser:attach', ({ tabId, bounds, options } = {}) =>
+    requireBrowser().attach(tabId, bounds, options)
+  )
   bh('browser:detach', () => requireBrowser().detach())
   bh('browser:takeover', ({ tabId } = {}) => requireBrowser().takeover(tabId))
   bh('browser:release', ({ tabId } = {}) => requireBrowser().release(tabId))

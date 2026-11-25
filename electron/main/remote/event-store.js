@@ -16,7 +16,8 @@ function messageOut(m) {
 }
 function safeMeta(v) {
   try {
-    return v ? JSON.parse(v) : {}
+    const parsed = v ? JSON.parse(v) : {}
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
   } catch {
     return {}
   }

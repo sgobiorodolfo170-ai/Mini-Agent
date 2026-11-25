@@ -5,6 +5,7 @@
 // 2. 校验发生在主进程真正执行工具之前，Prompt 与 Hook 只作辅助；
 // 3. 被拒绝时记录客观审计，不推导任何"法律责任"结论。
 
+const fs = require('fs')
 const path = require('path')
 
 // 高风险工具：缺少显式授权时默认拒绝。
@@ -19,6 +20,12 @@ const HIGH_RISK_TOOLS = new Set([
   'browser_click',
   'browser_type',
   'browser_close',
+  'computer_click',
+  'computer_type',
+  'computer_key',
+  'computer_input',
+  'computer_scroll',
+  'computer_stop',
   'mcp_call_tool',
   'spawn_agent'
 ])
@@ -41,21 +48,49 @@ function normPath(p) {
     .toLowerCase()
 }
 
-// 路径校验：不只做字符串前缀，处理路径穿越与大小写。
-// 符号链接/目录联接需要真实 fs 存在性检查；此处做静态规范化，
-// 对不存在的路径（即将创建的写目标）仍能正确判定父目录归属。
+// 解析已存在路径及最近存在祖先的真实位置；缺失的尾部仍按原路径拼接。
+// realpath 失败且不是“尚不存在”时拒绝解析，避免悬空链接绕过检查。
+function resolveRealPath(target) {
+  let current = path.resolve(String(target))
+  const missing = []
+  for (;;) {
+    try {
+      return path.resolve(fs.realpathSync.native(current), ...missing.reverse())
+    } catch (error) {
+      if (!['ENOENT', 'ENOTDIR'].includes(error.code)) return null
+      try {
+        if (fs.lstatSync(current).isSymbolicLink()) return null
+      } catch (statError) {
+        if (statError.code !== 'ENOENT') return null
+      }
+      const parent = path.dirname(current)
+      if (parent === current) return null
+      missing.push(path.basename(current))
+      current = parent
+    }
+  }
+}
+
+// 路径校验同时比较词法位置与真实位置，覆盖 Windows 目录联接和符号链接。
 function pathAllowed(allowedDirs, target, { mustExist = false } = {}) {
   const list = Array.isArray(allowedDirs) ? allowedDirs : []
   if (!list.length) return false
-  const t = normPath(target)
-  for (const d of list) {
-    const dir = normPath(d)
-    if (t === dir) return true
-    if (t.startsWith(dir + path.sep) || t.startsWith(dir + '/')) return true
-    // 兜底：用 relative 判断，覆盖不同分隔符与盘符大小写
-    if (isPathInside(dir, t)) return true
+  const lexicalTarget = path.resolve(String(target))
+  if (mustExist && !fs.existsSync(lexicalTarget)) return false
+  const targetRoot = path.parse(lexicalTarget).root.toLowerCase()
+  if (
+    !list.some(
+      (allowed) => path.parse(path.resolve(String(allowed))).root.toLowerCase() === targetRoot
+    )
+  ) {
+    return false
   }
-  if (mustExist) return false
+  const realTarget = resolveRealPath(lexicalTarget)
+  if (!realTarget) return false
+  for (const allowed of list) {
+    const realDir = resolveRealPath(path.resolve(String(allowed)))
+    if (realDir && isPathInside(realDir, realTarget)) return true
+  }
   return false
 }
 

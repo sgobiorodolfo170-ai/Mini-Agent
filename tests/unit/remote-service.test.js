@@ -91,7 +91,8 @@ async function createCookieSession() {
   expect(login.body.csrf.length).toBeGreaterThan(0)
   return {
     cookie: String(login.headers['set-cookie'][0]).split(';')[0],
-    csrf: login.body.csrf
+    csrf: login.body.csrf,
+    deviceId
   }
 }
 
@@ -119,6 +120,16 @@ afterEach(async () => {
 })
 
 describe('远程服务 HTTPS/WSS 集成', () => {
+  it('普通 API 与配对认证使用独立限流桶', () => {
+    for (let index = 0; index < 120; index++) {
+      manager.rateLimit('127.0.0.1', 120, 'api')
+    }
+    for (let index = 0; index < 10; index++) {
+      expect(() => manager.rateLimit('127.0.0.1', 10, 'auth')).not.toThrow()
+    }
+    expect(() => manager.rateLimit('127.0.0.1', 10, 'auth')).toThrow(/请求过于频繁/)
+  })
+
   it('未认证请求被拒绝，扫码即连接→会话→全部会话授权全链路可用', async () => {
     const denied = await request('GET', '/api/v1/conversations')
     expect(denied.status).toBe(401)
@@ -178,6 +189,61 @@ describe('远程服务 HTTPS/WSS 集成', () => {
     })
     expect(valid.status).toBe(200)
     expect(valid.body.conversation.title).toBe(body.title)
+  })
+
+  it('同步 API 提供游标、租约和幂等写入，并保留 CSRF 门禁', async () => {
+    repos.setSetting(dbm.get(), 'syncEnabled', true)
+    const { cookie, csrf, deviceId } = await createCookieSession()
+    const status = await request('GET', '/api/v1/sync/status', { cookie })
+    expect(status.status).toBe(200)
+    expect(status.body).toMatchObject({ enabled: true, deviceId: expect.any(String) })
+
+    const changes = await request('GET', '/api/v1/sync/changes?after=0&limit=10', { cookie })
+    expect(changes.status).toBe(200)
+    expect(changes.body.changes.length).toBeGreaterThan(0)
+
+    const missingCsrf = await request('POST', '/api/v1/sync/lease', {
+      cookie,
+      body: { conversationId: conv.id, ttlMs: 5000 }
+    })
+    expectCsrfInvalid(missingCsrf)
+    const lease = await request('POST', '/api/v1/sync/lease', {
+      cookie,
+      body: { conversationId: conv.id, ttlMs: 5000 },
+      headers: { 'x-csrf-token': csrf }
+    })
+    expect(lease.body).toMatchObject({ ownerDeviceId: deviceId, epoch: 1 })
+
+    const change = {
+      changeId: 'remote-sync-message-1',
+      deviceId,
+      entity: 'messages',
+      entityId: 'remote-message-1',
+      op: 'insert',
+      baseVersion: null,
+      newVersion: 10,
+      leaseEpoch: lease.body.epoch,
+      payload: {
+        id: 'remote-message-1',
+        conversation_id: conv.id,
+        role: 'user',
+        content: '离线同步消息',
+        seq: 1,
+        created_at: 10,
+        updated_at: 10
+      }
+    }
+    const pushed = await request('POST', '/api/v1/sync/push', {
+      cookie,
+      body: { changes: [change] },
+      headers: { 'x-csrf-token': csrf }
+    })
+    expect(pushed.body.applied).toHaveLength(1)
+    expect(
+      dbm.get().prepare('SELECT content FROM messages WHERE id=?').get('remote-message-1')
+    ).toEqual({
+      content: '离线同步消息'
+    })
   })
 
   it('logout 必须携带正确 CSRF Token，拒绝请求不会撤销会话', async () => {

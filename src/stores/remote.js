@@ -13,6 +13,7 @@ export const useRemoteStore = defineStore('remote', {
     pairings: [],
     connectionCount: 0,
     eventEpoch: '',
+    sync: null,
     qrDataUrl: '',
     qrExpiresAt: 0,
     loading: false

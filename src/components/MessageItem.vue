@@ -7,6 +7,7 @@ import { useUiStore } from '../stores/ui'
 
 const props = defineProps({
   msg: { type: Object, required: true },
+  highlighted: { type: Boolean, default: false },
   // 后端 regenerate 只处理末条回答：按钮只在末条 assistant 上展示，保证目标一致（F07）
   isLast: { type: Boolean, default: false }
 })
@@ -76,8 +77,11 @@ function onEditKeydown(e) {
 
 <template>
   <div
-    class="flex flex-col w-full"
-    :class="isUser ? 'items-end' : 'items-start'"
+    class="flex flex-col w-full rounded-lg transition-colors"
+    :class="[
+      isUser ? 'items-end' : 'items-start',
+      highlighted ? 'bg-brand-soft ring-2 ring-brand' : ''
+    ]"
     :data-msg-id="msg.id"
   >
     <div class="max-w-[85%] min-w-0 group" :class="isUser ? '' : 'max-w-full w-full'">

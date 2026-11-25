@@ -1,6 +1,7 @@
 <script setup>
 import { computed, ref } from 'vue'
 import StatusBadge from '../components/StatusBadge.vue'
+import TaskGraphEditor from '../components/agent/TaskGraphEditor.vue'
 import UiIcon from '../components/UiIcon.vue'
 import UiDialog from '../components/UiDialog.vue'
 import { useAgentStore } from '../stores/agent'
@@ -110,6 +111,7 @@ const editingNodeId = ref(null)
 const editingGoal = ref('')
 const editingDeps = ref([])
 const graphBusy = ref(false)
+const graphCanvasOpen = ref(true)
 function openGraphEditor(node) {
   if (!node.editable || !agent.graph || agent.graph.status !== 'running') return
   editingNodeId.value = node.runId
@@ -427,8 +429,33 @@ async function copyResult(c) {
               <span class="text-ink-secondary">任务图</span>
               <span class="text-ink-muted">{{ agent.graph.status }}</span>
               <span class="text-ink-muted">仅排队节点可编辑目标和依赖</span>
+              <div class="ml-auto flex gap-1">
+                <button
+                  class="btn-compact !h-6 !px-2 text-[11px]"
+                  data-testid="graph-view-canvas"
+                  :aria-pressed="graphCanvasOpen"
+                  @click="graphCanvasOpen = true"
+                >
+                  画布
+                </button>
+                <button
+                  class="btn-compact !h-6 !px-2 text-[11px]"
+                  data-testid="graph-view-list"
+                  :aria-pressed="!graphCanvasOpen"
+                  @click="graphCanvasOpen = false"
+                >
+                  列表
+                </button>
+              </div>
             </div>
-            <div class="max-h-64 overflow-auto space-y-2">
+            <TaskGraphEditor
+              v-if="graphCanvasOpen"
+              :graph="agent.graph"
+              :busy="graphBusy"
+              @edit-node="openGraphEditor"
+              @error="(message) => ui.toast(message, 'error')"
+            />
+            <div v-else class="max-h-64 overflow-auto space-y-2">
               <template v-for="(layer, layerIndex) in agent.graph.layers" :key="layerIndex">
                 <div class="flex flex-wrap items-start justify-center gap-2">
                   <div

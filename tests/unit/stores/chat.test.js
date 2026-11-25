@@ -30,7 +30,11 @@ function stubApi() {
       stop: vi.fn(async () => ({})),
       regenerate: vi.fn(async () => ({})),
       editResend: vi.fn(async () => ({})),
-      deleteMessage: vi.fn(async () => true)
+      deleteMessage: vi.fn(async () => true),
+      searchMessages: vi.fn(async ({ query, cursor }) => ({
+        results: [{ messageId: `m-${query}-${cursor}`, conversationId: 'c1', snippet: query }],
+        nextCursor: cursor ? null : 1
+      }))
     },
     agent: { run: vi.fn(async () => ({})) }
   }
@@ -48,6 +52,22 @@ describe('chat store 会话操作', () => {
     const s = useChatStore()
     await s.loadConversations()
     expect(s.conversations).toEqual([c1, c2])
+  })
+
+  it('全文检索保留查询、分页与错误状态', async () => {
+    const s = useChatStore()
+    await s.searchMessages('报销')
+    expect(window.api.chat.searchMessages).toHaveBeenCalledWith({
+      query: '报销',
+      cursor: 0,
+      limit: 50
+    })
+    expect(s.messageSearch.results[0].snippet).toBe('报销')
+    await s.searchMessages('报销', 1, true)
+    expect(s.messageSearch.results).toHaveLength(2)
+    expect(s.messageSearch.nextCursor).toBe(null)
+    s.clearMessageSearch()
+    expect(s.messageSearch.results).toEqual([])
   })
 
   it('select 设置 activeId 并加载消息', async () => {

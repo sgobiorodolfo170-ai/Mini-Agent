@@ -9,3 +9,5 @@ package-lock.json
 *.md
 docs/架构总览.html
 docs/项目框架总览.html
+native/computer-uia/bin
+native/computer-uia/obj

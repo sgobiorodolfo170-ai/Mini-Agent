@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { createBrowserService } from '../../electron/main/browser/service'
 
 class FakeWebContents extends EventEmitter {
@@ -14,6 +14,33 @@ class FakeWebContents extends EventEmitter {
     this.devToolsFocused = false
     this.devToolsOptions = []
     this.devToolsWebContents = null
+    this.pickerResult = null
+    this.installGate = null
+    this.selectedGate = null
+    this.styleGate = null
+    this.styleResult = undefined
+    this.selectedInfo = null
+    this.focusBlocked = false
+    this.zoomFactor = 1
+    this.zoomHistory = []
+    this.debugger = {
+      attached: false,
+      commands: [],
+      isAttached() {
+        return this.attached
+      },
+      attach(version) {
+        this.attached = true
+        this.version = version
+      },
+      detach() {
+        this.attached = false
+      },
+      async sendCommand(method, params) {
+        this.commands.push({ method, params })
+        return {}
+      }
+    }
   }
 
   isDestroyed() {
@@ -46,6 +73,21 @@ class FakeWebContents extends EventEmitter {
   }
 
   async executeJavaScript(code) {
+    if (code.includes('function installController')) {
+      if (this.installGate) await this.installGate
+      return true
+    }
+    if (code.includes('.arm(')) return true
+    if (code.includes('.wait()')) return this.pickerResult || { cancelled: true, reason: 'timeout' }
+    if (code.includes('controller.setStyles') || code.includes('controller.resetStyles')) {
+      if (this.styleGate) await this.styleGate
+      return this.styleResult ?? { stale: true }
+    }
+    if (code.includes('controller.getSelected')) {
+      if (this.selectedGate) await this.selectedGate
+      return this.selectedInfo
+    }
+    if (code.includes('document.activeElement')) return { blocked: this.focusBlocked }
     if (code.includes('document.title')) {
       return {
         title: '测试页面',
@@ -97,6 +139,15 @@ class FakeWebContents extends EventEmitter {
 
   isDevToolsFocused() {
     return this.devToolsFocused
+  }
+
+  getZoomFactor() {
+    return this.zoomFactor
+  }
+
+  setZoomFactor(value) {
+    this.zoomFactor = value
+    this.zoomHistory.push(value)
   }
 
   close() {
@@ -254,6 +305,181 @@ describe('browser service', () => {
     expect(service.toggleFocusedDevTools()).toBe(null)
     service.toggleDevTools(tab.id)
     expect(wc.isDevToolsOpened()).toBe(false)
+  })
+
+  it('selects an element and applies validated style updates', async () => {
+    const { service, children } = harness()
+    const tab = service.open({ kind: 'user' })
+    const wc = children[0].webContents
+    const selected = {
+      elementId: 'el-test-123',
+      tagName: 'button',
+      id: 'go',
+      className: 'primary',
+      selector: '#go',
+      text: '提交',
+      html: '<button id="go">提交</button>',
+      href: '',
+      url: 'https://example.com/',
+      title: 'Example',
+      rect: { x: 10, y: 20, width: 80, height: 32 },
+      styles: { width: '80px', display: 'inline-block' },
+      customStyles: {}
+    }
+    wc.pickerResult = { selected }
+    expect(await service.selectElement(tab.id)).toEqual({ cancelled: false, selected })
+
+    wc.selectedInfo = selected
+    expect(await service.inspectorState(tab.id)).toEqual({ selecting: false, selected })
+    wc.styleResult = {
+      ...selected,
+      styles: { ...selected.styles, width: '240px' },
+      customStyles: { width: '240px' }
+    }
+    expect(
+      await service.updateElementStyles(tab.id, selected.elementId, { width: '240px' })
+    ).toMatchObject({ customStyles: { width: '240px' } })
+    await expect(
+      service.updateElementStyles(tab.id, selected.elementId, { width: '1px;color:red' })
+    ).rejects.toThrow(/不安全/)
+    await expect(
+      service.updateElementStyles(tab.id, selected.elementId, { unknown: '1px' })
+    ).rejects.toThrow(/不支持/)
+
+    wc.styleResult = undefined
+    await expect(
+      service.updateElementStyles(tab.id, selected.elementId, { width: '300px' })
+    ).rejects.toMatchObject({ code: 'BROWSER_ELEMENT_STALE' })
+  })
+
+  it('discards a selection result when cancelled during controller installation', async () => {
+    const { service, children } = harness()
+    const tab = service.open({ kind: 'user' })
+    const wc = children[0].webContents
+    let release
+    wc.installGate = new Promise((resolve) => {
+      release = resolve
+    })
+    const pending = service.selectElement(tab.id)
+    await Promise.resolve()
+    await service.cancelElementSelection(tab.id)
+    release()
+
+    expect(await pending).toEqual({ cancelled: true, reason: 'replaced', selected: null })
+    expect(await service.inspectorState(tab.id)).toEqual({ selecting: false, selected: null })
+  })
+
+  it('discards an in-flight inspector result after a newer selection', async () => {
+    const { service, children } = harness()
+    const tab = service.open({ kind: 'user' })
+    const wc = children[0].webContents
+    const first = {
+      elementId: 'el-first-123',
+      tagName: 'button',
+      selector: '#first',
+      rect: {},
+      styles: {},
+      customStyles: {}
+    }
+    const second = { ...first, elementId: 'el-second-123', selector: '#second' }
+    wc.pickerResult = { selected: first }
+    await service.selectElement(tab.id)
+
+    let release
+    wc.styleGate = new Promise((resolve) => {
+      release = resolve
+    })
+    wc.styleResult = { ...first, customStyles: { width: '240px' } }
+    const update = service.updateElementStyles(tab.id, first.elementId, { width: '240px' })
+    await Promise.resolve()
+    wc.pickerResult = { selected: second }
+    await service.selectElement(tab.id)
+    release()
+
+    await expect(update).rejects.toMatchObject({ code: 'BROWSER_ELEMENT_STALE' })
+    wc.selectedInfo = second
+    expect(await service.inspectorState(tab.id)).toMatchObject({ selected: second })
+  })
+
+  it('dispatches CDP mouse and keyboard input only to the visible user tab', async () => {
+    const { service, children } = harness()
+    const tab = service.open({ kind: 'user' })
+    service.attach(tab.id, { x: 0, y: 0, width: 800, height: 600 })
+    const debuggerApi = children[0].webContents.debugger
+
+    await service.dispatchInput({
+      type: 'mousePressed',
+      x: 10,
+      y: 20,
+      button: 'left',
+      clickCount: 1
+    })
+    await service.dispatchInput({ type: 'keyDown', key: 'a', code: 'KeyA' })
+    await service.dispatchInput({ type: 'insertText', text: 'hello' })
+    expect(debuggerApi.commands).toEqual([
+      {
+        method: 'Input.dispatchMouseEvent',
+        params: { type: 'mousePressed', x: 10, y: 20, button: 'left', clickCount: 1 }
+      },
+      { method: 'Input.dispatchKeyEvent', params: { type: 'keyDown', key: 'a', code: 'KeyA' } },
+      { method: 'Input.insertText', params: { text: 'hello' } }
+    ])
+    expect(debuggerApi.isAttached()).toBe(false)
+
+    children[0].webContents.focusBlocked = true
+    await expect(
+      service.dispatchInput({ type: 'insertText', text: 'secret' })
+    ).rejects.toMatchObject({
+      code: 'BROWSER_PASSWORD_PROTECTED'
+    })
+    await expect(
+      service.dispatchInput({ type: 'keyDown', key: 'a', code: 'KeyA' })
+    ).rejects.toMatchObject({ code: 'BROWSER_PASSWORD_PROTECTED' })
+    expect(debuggerApi.commands).toHaveLength(3)
+
+    children[0].webContents.focusBlocked = false
+    const agent = service.forRun('run-input')
+    await agent.navigate({ url: 'https://agent.example/' })
+    service.attach(agent.tabs()[0].id, { x: 0, y: 0, width: 800, height: 600 })
+    await expect(service.dispatchInput({ type: 'insertText', text: 'no' })).rejects.toMatchObject({
+      code: 'BROWSER_VIEW_UNAVAILABLE'
+    })
+  })
+
+  it('times out stuck CDP input and detaches the debugger', async () => {
+    vi.useFakeTimers()
+    try {
+      const { service, children } = harness()
+      const tab = service.open({ kind: 'user' })
+      service.attach(tab.id, { x: 0, y: 0, width: 800, height: 600 })
+      const debuggerApi = children[0].webContents.debugger
+      debuggerApi.sendCommand = () => new Promise(() => {})
+      const rejection = expect(
+        service.dispatchInput({ type: 'mouseMoved', x: 1, y: 2 })
+      ).rejects.toMatchObject({ code: 'BROWSER_INPUT_TIMEOUT' })
+      await vi.advanceTimersByTimeAsync(10000)
+      await rejection
+      expect(debuggerApi.isAttached()).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('normalizes device viewports, applies display zoom and restores the original zoom', () => {
+    const { service, children } = harness()
+    const tab = service.open({ kind: 'user' })
+    const wc = children[0].webContents
+    wc.zoomFactor = 1.25
+    service.attach(tab.id, { x: 0, y: 0, width: 900, height: 600 })
+
+    service.setDevice(tab.id, { width: 99999, height: 100, scale: 200 })
+    expect(service.getState().tabs[0].device).toEqual({ width: 3840, height: 240, scale: 100 })
+    service.attach(tab.id, { x: 0, y: 0, width: 400, height: 300 }, { displayScale: 0.5 })
+    expect(wc.zoomFactor).toBe(0.5)
+
+    service.clearDevice(tab.id)
+    expect(service.getState().tabs[0].device).toBe(null)
+    expect(wc.zoomFactor).toBe(1.25)
   })
 
   it('closes DevTools when switching, detaching or closing its tab', () => {

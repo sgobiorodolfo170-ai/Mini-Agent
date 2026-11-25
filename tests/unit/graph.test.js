@@ -93,6 +93,33 @@ describe('任务依赖图', () => {
     expect(sum.nodes.map((n) => n.nodeKey)).toEqual(['a', 'b', 'c'])
   })
 
+  it('持久化布局与视口且不改变执行 etag', () => {
+    const graphId = graph.createGraph(db, { parentRunId: 'layout-parent', conversationId })
+    const a = addRun(graphId, 'a')
+    const before = graph.summary(db, graphId)
+    const saved = graph.saveGraphLayout(db, {
+      graphId,
+      layout: { [a]: { x: 120, y: 80 }, unknown: { x: 1, y: 2 } },
+      viewport: { x: -20, y: 10, zoom: 9 },
+      baseRevision: 0
+    })
+    expect(saved).toEqual({
+      layout: { [a]: { x: 120, y: 80 } },
+      viewport: { x: -20, y: 10, zoom: 2 },
+      layoutRevision: 1
+    })
+    expect(graph.graphLayout(db, graphId)).toEqual(saved)
+    expect(graph.summary(db, graphId)).toMatchObject({
+      layout: saved.layout,
+      viewport: saved.viewport,
+      layoutRevision: 1,
+      etag: before.etag
+    })
+    expect(() =>
+      graph.saveGraphLayout(db, { graphId, layout: {}, viewport: {}, baseRevision: 0 })
+    ).toThrow(/布局已变化/)
+  })
+
   it('验收未结束时图保持 running，拒绝后收口为 stopped', () => {
     const graphId = graph.createGraph(db, { parentRunId: 'p3' })
     const a = addRun(graphId, 'a', 'done')
@@ -209,6 +236,131 @@ describe('任务依赖图', () => {
         ops: [{ action: 'update', runId: ids.get('a'), goal: '过期编辑' }]
       })
     ).toThrow(/已变化/)
+  })
+
+  it('运行中可幂等新增节点并在同一事务写入依赖', () => {
+    const parentConversation = repos.createConversation(db, { title: '父会话' })
+    const parentRunId = repos.createRun(db, {
+      conversationId: parentConversation.id,
+      goal: '父任务',
+      status: 'running'
+    })
+    const graphId = graph.createGraph(db, { parentRunId, conversationId: parentConversation.id })
+    const a = addRun(graphId, 'a', 'done')
+    const b = addRun(graphId, 'b', 'queued')
+    graph.addDependencies(
+      db,
+      [
+        { key: 'a', deps: [] },
+        { key: 'b', deps: ['a'] }
+      ],
+      new Map([
+        ['a', a],
+        ['b', b]
+      ])
+    )
+    const before = graph.summary(db, graphId)
+    let created = 0
+    const createNode = ({ key, goal }) => {
+      created += 1
+      const child = repos.createConversation(db, {
+        title: key,
+        parentId: parentConversation.id
+      })
+      return repos.createRun(db, {
+        conversationId: child.id,
+        goal,
+        status: 'queued',
+        parentRunId,
+        controlMode: 'delegated',
+        graphId,
+        nodeKey: key
+      })
+    }
+    const op = {
+      action: 'add',
+      clientId: 'client-add-1',
+      key: 'c',
+      goal: '动态节点 C',
+      deps: [b],
+      position: { x: 620, y: 40 }
+    }
+    const added = transaction(db, () =>
+      graph.mutateGraph(db, { graphId, etag: before.etag, ops: [op], createNode })
+    )
+    const nodeC = added.nodes.find((node) => node.nodeKey === 'c')
+    expect(nodeC).toMatchObject({ status: 'queued', editable: true, depth: 3 })
+    expect(added.dependencies).toContainEqual({ runId: nodeC.runId, dependsOnRunId: b })
+    expect(added.layout[nodeC.runId]).toEqual({ x: 620, y: 40 })
+
+    const replayed = graph.mutateGraph(db, {
+      graphId,
+      etag: before.etag,
+      ops: [op],
+      createNode
+    })
+    expect(replayed.nodes.filter((node) => node.nodeKey === 'c')).toHaveLength(1)
+    expect(created).toBe(1)
+    expect(() =>
+      graph.mutateGraph(db, {
+        graphId,
+        etag: before.etag,
+        ops: [{ ...op, goal: '不同内容' }],
+        createNode
+      })
+    ).toThrow(/请求编号/)
+  })
+
+  it('动态新增超过深度限制时整个事务回滚', () => {
+    const parentConversation = repos.createConversation(db, { title: '父会话' })
+    const parentRunId = repos.createRun(db, {
+      conversationId: parentConversation.id,
+      goal: '父任务',
+      status: 'running'
+    })
+    const graphId = graph.createGraph(db, { parentRunId, conversationId: parentConversation.id })
+    const ids = new Map()
+    for (const key of ['a', 'b', 'c']) {
+      const runId = addRun(graphId, key, key === 'a' ? 'done' : 'queued')
+      ids.set(key, runId)
+    }
+    graph.addDependencies(
+      db,
+      [
+        { key: 'a', deps: [] },
+        { key: 'b', deps: ['a'] },
+        { key: 'c', deps: ['b'] }
+      ],
+      ids
+    )
+    const before = graph.summary(db, graphId)
+    expect(() =>
+      transaction(db, () =>
+        graph.mutateGraph(db, {
+          graphId,
+          etag: before.etag,
+          ops: [
+            {
+              action: 'add',
+              clientId: 'too-deep',
+              key: 'd',
+              goal: '过深节点',
+              deps: [ids.get('c')]
+            }
+          ],
+          createNode: ({ key, goal }) =>
+            repos.createRun(db, {
+              conversationId,
+              goal,
+              status: 'queued',
+              graphId,
+              nodeKey: key
+            })
+        })
+      )
+    ).toThrow(/深度/)
+    expect(graph.summary(db, graphId).nodes).toHaveLength(3)
+    expect(db.prepare('SELECT COUNT(*) AS count FROM graph_node_requests').get().count).toBe(0)
   })
 
   it('运行中节点和队列已认领节点不可修改', () => {
