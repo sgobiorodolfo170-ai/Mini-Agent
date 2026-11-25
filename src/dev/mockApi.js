@@ -467,6 +467,27 @@ function install() {
     }
   }
 
+  // 工作区文件 / 终端 / 侧边任务：浏览器预览用的内存实现
+  const mockFiles = new Map()
+  const termTimers = new Map()
+  const sideTimers = new Map()
+  const MOCK_ROOT = 'D:\\github\\Mini-Agent'
+  const mockTree = {
+    [MOCK_ROOT]: [
+      { name: 'src', dir: true },
+      { name: 'electron', dir: true },
+      { name: 'README.md', dir: false },
+      { name: 'package.json', dir: false }
+    ],
+    [MOCK_ROOT + '\\src']: [
+      { name: 'views', dir: true },
+      { name: 'main.js', dir: false },
+      { name: 'App.vue', dir: false }
+    ],
+    [MOCK_ROOT + '\\electron']: [{ name: 'main', dir: true }],
+    [MOCK_ROOT + '\\electron\\main']: [{ name: 'ipc.js', dir: false }]
+  }
+
   const api = {
     settings: {
       get: (k) => clone(settings[k]),
@@ -1223,6 +1244,199 @@ function install() {
       }),
       check: () => api.updater.state()
     },
+    workspace: {
+      roots: () => [{ id: 'mock-ws', name: 'Mini Agent 开发', path: MOCK_ROOT }],
+      // 渲染层传入字符串路径，preload 会包成 { path }；这里两种入参都兼容
+      list: async (arg) => {
+        const p = typeof arg === 'string' ? arg : (arg && arg.path) || ''
+        return (mockTree[String(p)] || []).map((e) => ({ ...e, path: String(p) + '\\' + e.name }))
+      },
+      read: async (arg) => {
+        const key = String(typeof arg === 'string' ? arg : (arg && arg.path) || '')
+        if (mockFiles.has(key)) {
+          const content = mockFiles.get(key)
+          return { content, size: content.length, mtime: Date.now() }
+        }
+        const content =
+          key.endsWith('package.json')
+            ? JSON.stringify({ name: 'miniagent', version: '1.5.0', private: true }, null, 2)
+            : `// 浏览器预览环境的模拟文件\n// ${key}\n\nexport const preview = true\n`
+        return { content, size: content.length, mtime: Date.now() }
+      },
+      write: async (arg, contentArg) => {
+        const p = typeof arg === 'string' ? arg : (arg && arg.path) || ''
+        const content = typeof arg === 'string' ? contentArg : arg && arg.content
+        const text = String(content == null ? '' : content)
+        mockFiles.set(String(p), text)
+        return { size: text.length }
+      }
+    },
+    terminal: {
+      run: ({ id, command, cwd } = {}) => {
+        const runId = String(id || '')
+        const chunks = [
+          `预览环境执行：${String(command || '')}\n`,
+          `工作目录：${cwd || '默认目录'}\n`,
+          'hello from mock terminal\n'
+        ]
+        let i = 0
+        const timer = setInterval(() => {
+          if (i >= chunks.length) {
+            clearInterval(timer)
+            termTimers.delete(runId)
+            emit('terminal:event', { id: runId, type: 'exit', code: 0 })
+            return
+          }
+          emit('terminal:event', { id: runId, type: 'data', stream: 'stdout', text: chunks[i++] })
+        }, 220)
+        termTimers.set(runId, timer)
+        return { ok: true }
+      },
+      stop: ({ id } = {}) => {
+        const runId = String(id || '')
+        const timer = termTimers.get(runId)
+        if (!timer) return { stopped: false }
+        clearInterval(timer)
+        termTimers.delete(runId)
+        emit('terminal:event', { id: runId, type: 'exit', code: 130 })
+        return { stopped: true }
+      }
+    },
+    side: {
+      send: ({ id, content, useContext } = {}) => {
+        const runId = String(id || '')
+        const reply = [
+          `（预览环境）收到侧边任务：${String(content || '')}`,
+          useContext === false ? '当前未引用主会话上下文。' : '已引用主会话上下文进行解读。',
+          '- 关键结论：此处为 mock bridge 的模拟输出\n- 建议：在 Electron 窗口中验证真实模型结果'
+        ].join('\n\n')
+        let i = 0
+        emit('side:event', { type: 'start', id: runId })
+        const timer = setInterval(() => {
+          if (i >= reply.length) {
+            clearInterval(timer)
+            sideTimers.delete(runId)
+            emit('side:event', { type: 'done', id: runId, content: reply })
+            return
+          }
+          const delta = reply.slice(i, i + 4)
+          i += 4
+          emit('side:event', { type: 'delta', id: runId, delta })
+        }, 24)
+        sideTimers.set(runId, timer)
+        return { ok: true }
+      },
+      stop: ({ id } = {}) => {
+        const runId = String(id || '')
+        const timer = sideTimers.get(runId)
+        if (!timer) return { stopped: false }
+        clearInterval(timer)
+        sideTimers.delete(runId)
+        emit('side:event', { type: 'stopped', id: runId, content: '' })
+        return { stopped: true }
+      }
+    },
+    browser: (() => {
+      // 极简浏览器 mock：只为预览环境提供标签页状态，内部页面（miniagent://）可正常打开
+      let bEnabled = true
+      let bTabs = []
+      let bActive = null
+      let bAttached = null
+      const INTERNAL_TITLES = { files: '工作区文件', terminal: '终端', side: '临时会话' }
+      const bState = () => ({
+        enabled: bEnabled,
+        tabs: bTabs.map((t) => ({ ...t, bounds: null, devToolsOpened: false })),
+        activeTabId: bActive,
+        attachedTabId: bAttached,
+        policy: { allowPrivateNetwork: false, maxTabs: 6 }
+      })
+      const bEmit = () => emit('browser:event', { type: 'state', state: bState() })
+      const browserTab = (url) => {
+        const raw = String(url || 'about:blank')
+        const internal = raw.startsWith('miniagent://')
+          ? raw.slice('miniagent://'.length).replace(/\/+$/, '')
+          : null
+        return {
+          id: uid('tab'),
+          kind: 'user',
+          owner: 'user',
+          title: internal ? INTERNAL_TITLES[internal] || '内部页面' : raw === 'about:blank' ? '新标签页' : raw,
+          url: raw,
+          internal: internal || null,
+          loading: false,
+          error: null,
+          crashed: false,
+          device: null,
+          createdAt: now()
+        }
+      }
+      const bFind = (id) => bTabs.find((t) => t.id === id) || null
+      return {
+        state: () => bState(),
+        setEnabled: (v) => {
+          bEnabled = v !== false
+          bEmit()
+          return bState()
+        },
+        open: ({ url } = {}) => {
+          const tab = browserTab(url)
+          bTabs.push(tab)
+          bActive = tab.id
+          bEmit()
+          return clone(tab)
+        },
+        navigate: ({ tabId, url } = {}) => {
+          const tab = bFind(tabId)
+          if (!tab) throw new Error('标签不存在')
+          if (tab.internal) throw new Error('内部页面不支持地址导航')
+          const next = browserTab(url)
+          tab.url = next.url
+          tab.title = next.title
+          bEmit()
+          return clone(tab)
+        },
+        activate: (tabId) => {
+          if (bFind(tabId)) {
+            bActive = tabId
+            bAttached = tabId
+            bEmit()
+          }
+          return bState()
+        },
+        close: (tabId) => {
+          bTabs = bTabs.filter((t) => t.id !== tabId)
+          if (bActive === tabId) bActive = bTabs.length ? bTabs[bTabs.length - 1].id : null
+          if (bAttached === tabId) bAttached = null
+          bEmit()
+          return bState()
+        },
+        command: () => bState(),
+        toggleDevTools: (tabId) => clone(bFind(tabId)),
+        selectElement: () => ({ selecting: true, selected: null }),
+        cancelElementSelection: () => ({ selecting: false, selected: null }),
+        inspectorState: () => ({ selecting: false, selected: null }),
+        updateElementStyles: () => ({ selected: null }),
+        resetElementStyles: () => ({ selected: null }),
+        setDevice: () => bState(),
+        clearDevice: () => bState(),
+        attach: (tabId) => {
+          if (bFind(tabId)) bAttached = tabId
+          bEmit()
+          return bState()
+        },
+        detach: () => {
+          bAttached = null
+          bEmit()
+          return bState()
+        },
+        takeover: () => bState(),
+        release: () => bState(),
+        screenshot: () => {
+          throw new Error('预览环境不支持截图')
+        },
+        clearData: () => bState()
+      }
+    })(),
     on
   }
 

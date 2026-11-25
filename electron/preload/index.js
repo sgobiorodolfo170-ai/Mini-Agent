@@ -180,10 +180,25 @@ function buildMain() {
       state: () => inv('updater:state'),
       check: (o) => inv('updater:check', o || {})
     },
+    workspace: {
+      roots: () => inv('workspace:roots'),
+      list: (p) => inv('workspace:list', { path: p }),
+      read: (p) => inv('workspace:read', { path: p }),
+      write: (p, content) => inv('workspace:write', { path: p, content })
+    },
+    terminal: {
+      run: (o) => inv('terminal:run', o || {}),
+      stop: (id) => inv('terminal:stop', { id })
+    },
+    side: {
+      send: (o) => inv('side:send', o || {}),
+      stop: (id) => inv('side:stop', { id })
+    },
     window: {
       minimize: () => inv('win:minimize'),
       toggleMaximize: () => inv('win:toggleMaximize'),
       isMaximized: () => inv('win:isMaximized'),
+      resizeForPanel: (delta) => inv('win:resizeForPanel', delta),
       close: () => inv('win:close', 'main'),
       hide: () => inv('win:hide', 'main')
     },

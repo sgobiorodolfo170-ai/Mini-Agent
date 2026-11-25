@@ -6,6 +6,9 @@ import { useComposerStore } from '../stores/composer'
 import BrowserInspectorPanel from '../components/browser/BrowserInspectorPanel.vue'
 import DeviceToolbar from '../components/browser/DeviceToolbar.vue'
 import UiIcon from '../components/UiIcon.vue'
+import FilesView from './FilesView.vue'
+import TerminalView from './TerminalView.vue'
+import SideTaskView from './SideTaskView.vue'
 
 const browser = useBrowserStore()
 const ui = useUiStore()
@@ -25,8 +28,14 @@ const canvasSize = ref({ width: 0, height: 0 })
 let observer = null
 let attachFrame = 0
 let selectionRevision = 0
+let viewInstance = 0
+const attachOwner = `browser-view-${++viewInstance}`
 
 const activeTab = computed(() => browser.activeTab)
+// 内部页面标签（miniagent://files 等）：由渲染层直接渲染组件，不挂载原生视图
+const internalPage = computed(() => activeTab.value?.internal || null)
+// 启动页：无标签或空白标签时展示
+const isLaunchPage = computed(() => !activeTab.value || activeTab.value.url === 'about:blank')
 const fitScale = computed(() => {
   if (!device.value || !canvasSize.value.width || !canvasSize.value.height) return 1
   return Math.max(
@@ -63,7 +72,9 @@ const pageError = computed(() => {
 watch(
   () => activeTab.value && activeTab.value.url,
   (url) => {
-    address.value = url && url !== 'about:blank' ? url : ''
+    // 内部页面地址不可编辑，输入框保持空白
+    address.value = url && url !== 'about:blank' && !url.startsWith('miniagent://') ? url : ''
+    scheduleAttach()
   }
 )
 
@@ -107,6 +118,18 @@ function scheduleAttach() {
 
 async function attachActive() {
   if (!browser.enabled || !browser.activeTabId || !viewport.value) return
+  const tab = activeTab.value
+  // 内部页面与空白启动页不挂载原生视图，避免遮挡渲染层内容
+  if (!tab || tab.internal || tab.url === 'about:blank') {
+    if (browser.attachedTabId) {
+      try {
+        await browser.detach(attachOwner)
+      } catch {
+        // 视图可能已销毁
+      }
+    }
+    return
+  }
   const rect = viewport.value.getBoundingClientRect()
   if (rect.width < 2 || rect.height < 2) return
   try {
@@ -118,7 +141,8 @@ async function attachActive() {
         width: rect.width,
         height: rect.height
       },
-      device.value ? { displayScale: displayScale.value } : undefined
+      device.value ? { displayScale: displayScale.value } : undefined,
+      attachOwner
     )
   } catch (error) {
     localError.value = String(error.message || error)
@@ -141,7 +165,7 @@ async function initialize() {
 
 async function submitAddress() {
   const value = address.value.trim()
-  if (!value || busy.value) return
+  if (!value) return
   busy.value = true
   localError.value = ''
   try {
@@ -151,6 +175,30 @@ async function submitAddress() {
   } finally {
     busy.value = false
   }
+}
+
+// 内部页面：借用独立标签页承载工作区工具
+const INTERNAL_PAGES = {
+  files: 'miniagent://files',
+  terminal: 'miniagent://terminal',
+  side: 'miniagent://side'
+}
+
+async function openInternal(name) {
+  localError.value = ''
+  try {
+    const tab = await browser.open(INTERNAL_PAGES[name])
+    await browser.activate(tab.id)
+    await nextTick()
+    scheduleAttach()
+  } catch (error) {
+    localError.value = String(error.message || error)
+  }
+}
+
+function canUseWebTools() {
+  const tab = activeTab.value
+  return !!tab && !tab.internal && tab.url !== 'about:blank'
 }
 
 async function newTab() {
@@ -197,6 +245,7 @@ async function toggleDevTools() {
 
 function handleF12(event) {
   if (event.key !== 'F12' || event.repeat || !browser.activeTabId) return
+  if (!canUseWebTools()) return
   event.preventDefault()
   void toggleDevTools()
 }
@@ -210,7 +259,7 @@ function measureCanvas() {
 async function loadInspector() {
   const tab = activeTab.value
   const revision = selectionRevision
-  if (!tab || tab.url === 'about:blank') {
+  if (!tab || tab.internal || tab.url === 'about:blank') {
     selected.value = null
     selecting.value = false
     return
@@ -402,7 +451,7 @@ onBeforeUnmount(async () => {
   if (attachFrame) cancelAnimationFrame(attachFrame)
   if (observer) observer.disconnect()
   try {
-    await browser.detach()
+    await browser.detach(attachOwner)
   } catch {
     // 主窗口关闭时视图可能已经销毁
   }
@@ -425,7 +474,7 @@ onBeforeUnmount(async () => {
     </div>
 
     <template v-else>
-      <div class="h-9 shrink-0 flex items-center gap-1 px-2 border-b border-line-subtle bg-panel">
+      <div class="h-9 shrink-0 flex items-center gap-1 px-2 border-b border-line-subtle bg-surface">
         <div
           v-for="tab in browser.tabs"
           :key="tab.id"
@@ -467,7 +516,8 @@ onBeforeUnmount(async () => {
       </div>
 
       <div
-        class="min-h-9 shrink-0 flex items-center gap-1.5 px-2 py-1.5 border-b border-line-subtle bg-panel"
+        v-if="!internalPage"
+        class="min-h-9 shrink-0 flex items-center gap-1.5 px-2 py-1.5 border-b border-line-subtle bg-surface"
       >
         <button
           class="icon-btn-sm"
@@ -505,12 +555,7 @@ onBeforeUnmount(async () => {
             aria-label="浏览器地址"
             spellcheck="false"
           />
-          <button
-            class="btn-compact !h-8 !px-3 text-xs"
-            data-testid="browser-go"
-            type="submit"
-            :disabled="busy"
-          >
+          <button class="btn-compact !h-8 !px-3 text-xs" data-testid="browser-go" type="submit">
             {{ busy ? '打开中' : '打开' }}
           </button>
         </form>
@@ -672,11 +717,104 @@ onBeforeUnmount(async () => {
               :style="viewportStyle"
               data-testid="browser-viewport"
             >
+              <!-- 启动页：无标签或空白标签时展示，入口以独立标签页打开 -->
               <div
-                v-if="!activeTab"
-                class="absolute inset-0 grid place-items-center text-sm text-ink-muted"
+                v-if="isLaunchPage"
+                class="absolute inset-0 overflow-y-auto flex items-center justify-center p-6"
+                data-testid="browser-launch-page"
               >
-                新建标签开始浏览
+                <div class="w-full max-w-[360px] space-y-3">
+                  <div class="mb-1 text-center">
+                    <div class="text-sm font-semibold text-ink-primary">启动页</div>
+                  </div>
+
+                  <button
+                    class="w-full flex items-center gap-3 px-4 py-3.5 rounded-2xl border border-line-subtle bg-surface text-left transition-colors hover:bg-subtle"
+                    data-testid="browser-quick-standalone"
+                    @click="ui.view = 'browser'"
+                  >
+                    <span
+                      class="w-10 h-10 shrink-0 grid place-items-center rounded-xl bg-subtle text-ink-secondary"
+                    >
+                      <UiIcon name="globe" :size="18" />
+                    </span>
+                    <span class="min-w-0 flex-1">
+                      <span class="block text-sm font-semibold text-ink-primary">
+                        打开独立浏览器页
+                      </span>
+                      <span class="block mt-0.5 text-xs text-ink-muted truncate">
+                        在整页中浏览与调试
+                      </span>
+                    </span>
+                  </button>
+
+                  <button
+                    class="w-full flex items-center gap-3 px-4 py-3.5 rounded-2xl border border-line-subtle bg-surface text-left transition-colors hover:bg-subtle"
+                    data-testid="browser-quick-files"
+                    @click="openInternal('files')"
+                  >
+                    <span
+                      class="w-10 h-10 shrink-0 grid place-items-center rounded-xl bg-subtle text-ink-secondary"
+                    >
+                      <UiIcon name="folder" :size="18" />
+                    </span>
+                    <span class="min-w-0 flex-1">
+                      <span class="block text-sm font-semibold text-ink-primary">
+                        打开工作区文件
+                      </span>
+                      <span class="block mt-0.5 text-xs text-ink-muted truncate">
+                        浏览与编辑项目文件
+                      </span>
+                    </span>
+                  </button>
+
+                  <button
+                    class="w-full flex items-center gap-3 px-4 py-3.5 rounded-2xl border border-line-subtle bg-surface text-left transition-colors hover:bg-subtle"
+                    data-testid="browser-quick-terminal"
+                    @click="openInternal('terminal')"
+                  >
+                    <span
+                      class="w-10 h-10 shrink-0 grid place-items-center rounded-xl bg-subtle text-ink-secondary"
+                    >
+                      <UiIcon name="terminal" :size="18" />
+                    </span>
+                    <span class="min-w-0 flex-1">
+                      <span class="block text-sm font-semibold text-ink-primary">打开终端</span>
+                      <span class="block mt-0.5 text-xs text-ink-muted truncate">
+                        在项目目录执行命令
+                      </span>
+                    </span>
+                  </button>
+
+                  <button
+                    class="w-full flex items-center gap-3 px-4 py-3.5 rounded-2xl border border-line-subtle bg-surface text-left transition-colors hover:bg-subtle"
+                    data-testid="browser-quick-side"
+                    @click="openInternal('side')"
+                  >
+                    <span
+                      class="w-10 h-10 shrink-0 grid place-items-center rounded-xl bg-subtle text-ink-secondary"
+                    >
+                      <UiIcon name="panelRight" :size="18" />
+                    </span>
+                    <span class="min-w-0 flex-1">
+                      <span class="block text-sm font-semibold text-ink-primary">临时会话</span>
+                      <span class="block mt-0.5 text-xs text-ink-muted truncate">
+                        临时子会话，不计入主上下文
+                      </span>
+                    </span>
+                  </button>
+                </div>
+              </div>
+
+              <!-- 内部页面：借用独立标签页承载，内容由渲染层直接渲染 -->
+              <div
+                v-else-if="internalPage"
+                class="absolute inset-0 flex bg-surface"
+                data-testid="browser-internal-page"
+              >
+                <FilesView v-if="internalPage === 'files'" />
+                <TerminalView v-else-if="internalPage === 'terminal'" />
+                <SideTaskView v-else-if="internalPage === 'side'" />
               </div>
             </div>
           </div>

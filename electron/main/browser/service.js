@@ -23,6 +23,17 @@ const DEFAULT_MAX_TABS = 6
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36'
 
+// 内部页面标签：不创建 WebContentsView，由渲染层在标签内容区渲染对应组件
+const INTERNAL_PREFIX = 'miniagent://'
+const INTERNAL_PAGES = { files: '工作区文件', terminal: '终端', side: '临时会话' }
+
+function parseInternalUrl(rawUrl) {
+  const value = String(rawUrl || '')
+  if (!value.startsWith(INTERNAL_PREFIX)) return null
+  const name = value.slice(INTERNAL_PREFIX.length).replace(/\/+$/, '')
+  return Object.prototype.hasOwnProperty.call(INTERNAL_PAGES, name) ? name : null
+}
+
 function navigationErrorMessage(error, code, desc) {
   if (error instanceof BrowserError) return error.message
   const match = String((error && error.message) || '').match(/ERR_[A-Z_]+/)
@@ -113,10 +124,11 @@ function createBrowserService(options = {}) {
       error: tab.error,
       owner: tab.owner,
       crashed: tab.crashed,
-      devToolsOpened: tab.webContents.isDevToolsOpened(),
+      internal: tab.internal || null,
+      devToolsOpened: !!(tab.webContents && tab.webContents.isDevToolsOpened()),
       device: tab.device ? { ...tab.device } : null,
       createdAt: tab.createdAt,
-      bounds: tab.view.getBounds()
+      bounds: tab.view ? tab.view.getBounds() : null
     }
   }
 
@@ -327,7 +339,8 @@ function createBrowserService(options = {}) {
     const onNavigate = (_event, url) => updateTab(tab, { url, error: null })
     const onTitle = (_event, title) => updateTab(tab, { title: String(title || '') })
     const onFail = (_event, code, desc, url, isMainFrame) => {
-      if (!isMainFrame || code === -3) return
+      if (!isMainFrame || code === -3 || tab.queuedNavigation) return
+      if (code === -2 && Date.now() < tab.suppressNavigationFailureUntil) return
       updateTab(tab, {
         loading: false,
         error: navigationErrorMessage(null, code, desc)
@@ -390,6 +403,35 @@ function createBrowserService(options = {}) {
       throw new BrowserError('标签类型无效', 'BROWSER_TAB_NOT_FOUND')
     if (tabs.size >= maxTabs)
       throw new BrowserError(`最多只能打开 ${maxTabs} 个标签`, 'BROWSER_TAB_LIMIT')
+    const internal = parseInternalUrl(url)
+    if (internal) {
+      // 内部页面标签：无 WebContentsView，渲染层按 internal 字段渲染对应页面
+      const tab = {
+        id: idFactory(),
+        kind,
+        runId: kind === 'agent' ? String(runId) : null,
+        internal,
+        title: INTERNAL_PAGES[internal],
+        url: `${INTERNAL_PREFIX}${internal}`,
+        loading: false,
+        error: null,
+        owner: kind === 'agent' ? 'agent' : 'user',
+        crashed: false,
+        destroyed: false,
+        createdAt: now(),
+        view: null,
+        webContents: null,
+        cleanups: [],
+        navigationToken: 0,
+        inspector: { selecting: false, selected: null, selectionToken: 0 },
+        device: null,
+        zoomBeforeDevice: null,
+        navigationRunning: false,
+        queuedNavigation: null
+      }
+      tabs.set(tab.id, tab)
+      return tab
+    }
     const partition = partitionFor(kind, runId)
     configureSession(partition, kind)
     const view = webContents
@@ -427,7 +469,11 @@ function createBrowserService(options = {}) {
       navigationToken: 0,
       inspector: { selecting: false, selected: null, selectionToken: 0 },
       device: null,
-      zoomBeforeDevice: null
+      zoomBeforeDevice: null,
+      navigationRunning: false,
+      queuedNavigation: null,
+      activeNavigationCancel: null,
+      suppressNavigationFailureUntil: 0
     }
     tabs.set(tab.id, tab)
     if (kind === 'agent') runTabs.set(tab.runId, tab.id)
@@ -440,6 +486,48 @@ function createBrowserService(options = {}) {
   }
 
   async function navigateTab(tab, rawUrl) {
+    if (tab.internal) {
+      throw new BrowserError('内部页面不支持地址导航', 'BROWSER_INVALID_TARGET')
+    }
+    if (tab.destroyed || tab.webContents.isDestroyed()) {
+      throw new BrowserError('浏览器标签已关闭', 'BROWSER_TAB_NOT_FOUND')
+    }
+    if (tab.navigationRunning) {
+      if (tab.queuedNavigation) tab.queuedNavigation.resolve(summarize(tab))
+      const pending = new Promise((resolve, reject) => {
+        tab.queuedNavigation = { url: rawUrl, resolve, reject }
+      })
+      tab.activeNavigationCancel?.()
+      tab.suppressNavigationFailureUntil = Date.now() + 250
+      try {
+        tab.webContents.stop()
+      } catch {
+        // 当前可能尚未开始加载，stop 为空操作
+      }
+      return pending
+    }
+    return runNavigation(tab, rawUrl)
+  }
+
+  async function runNavigation(tab, rawUrl) {
+    let cancel
+    const canceled = new Promise((resolve) => {
+      cancel = resolve
+    })
+    tab.activeNavigationCancel = cancel
+    tab.navigationRunning = true
+    try {
+      return await performNavigation(tab, rawUrl, canceled)
+    } finally {
+      if (tab.activeNavigationCancel === cancel) tab.activeNavigationCancel = null
+      tab.navigationRunning = false
+      const next = tab.queuedNavigation
+      tab.queuedNavigation = null
+      if (next) navigateTab(tab, next.url).then(next.resolve, next.reject)
+    }
+  }
+
+  async function performNavigation(tab, rawUrl, canceled) {
     let url
     try {
       const session = electronApi.session.fromPartition(partitionFor(tab.kind, tab.runId))
@@ -450,28 +538,32 @@ function createBrowserService(options = {}) {
           typeof session.resolveHost === 'function' ? session.resolveHost.bind(session) : null
       })
     } catch (error) {
+      if (tab.queuedNavigation) return summarize(tab)
       updateTab(tab, { loading: false, error: navigationErrorMessage(error) })
       throw error
     }
+    if (tab.queuedNavigation) return summarize(tab)
     if (tab.destroyed || tab.webContents.isDestroyed()) {
       throw new BrowserError('浏览器标签已关闭', 'BROWSER_TAB_NOT_FOUND')
     }
     const token = ++tab.navigationToken
     updateTab(tab, { url, loading: true, error: null, crashed: false })
+    const navigationCancelled = Symbol('navigation-cancelled')
     let timer = null
     try {
-      await Promise.race([
+      const result = await Promise.race([
         tab.webContents.loadURL(url),
+        canceled.then(() => navigationCancelled),
         new Promise((_, reject) => {
           timer = setTimeout(() => {
             reject(new BrowserError('页面加载超时', 'BROWSER_NAVIGATION_TIMEOUT'))
           }, loadTimeoutMs)
         })
       ])
-      if (token !== tab.navigationToken) return summarize(tab)
+      if (result === navigationCancelled || token !== tab.navigationToken) return summarize(tab)
       updateTab(tab, { url: tab.webContents.getURL() || url, loading: false })
     } catch (error) {
-      if (token !== tab.navigationToken) return summarize(tab)
+      if (token !== tab.navigationToken || tab.queuedNavigation) return summarize(tab)
       if (error && error.code === 'BROWSER_NAVIGATION_TIMEOUT') {
         try {
           tab.webContents.stop()
@@ -488,11 +580,17 @@ function createBrowserService(options = {}) {
   }
 
   function openTab({ url = 'about:blank', kind = 'user', runId = null } = {}) {
-    const normalized = normalizeBrowserUrl(url, { allowBlank: true })
+    const internal = parseInternalUrl(url)
+    if (!internal && String(url || '').startsWith(INTERNAL_PREFIX)) {
+      throw new BrowserError('未知的内部页面', 'BROWSER_TAB_NOT_FOUND')
+    }
+    const normalized = internal
+      ? `${INTERNAL_PREFIX}${internal}`
+      : normalizeBrowserUrl(url, { allowBlank: true })
     const tab = createTab({ kind, runId, url: normalized })
     activeTabId = tab.id
     emitState('tab.created', { tabId: tab.id })
-    if (normalized !== 'about:blank') {
+    if (normalized !== 'about:blank' && !tab.internal) {
       navigateTab(tab, normalized).catch((error) => {
         updateTab(tab, { loading: false, error: String(error.message || error) })
         emitState('blocked', { tabId: tab.id, reason: String(error.message || error) })
@@ -503,6 +601,11 @@ function createBrowserService(options = {}) {
 
   function closeTab(tabId) {
     const tab = requireTab(tabId)
+    if (tab.queuedNavigation) {
+      const pending = tab.queuedNavigation
+      tab.queuedNavigation = null
+      pending.reject(new BrowserError('浏览器标签已关闭', 'BROWSER_TAB_NOT_FOUND'))
+    }
     cancelSelection(tab)
     clearDevice(tab)
     closeDevTools(tab)
@@ -512,10 +615,10 @@ function createBrowserService(options = {}) {
     if (activeTabId === tab.id) activeTabId = [...tabs.keys()].at(-1) || null
     if (attachedTabId === tab.id) {
       attachedTabId = null
-      tab.view.setVisible(false)
+      if (tab.view) tab.view.setVisible(false)
     }
     try {
-      getMainWindow().contentView.removeChildView(tab.view)
+      if (tab.view) getMainWindow().contentView.removeChildView(tab.view)
     } catch {
       // 主窗口可能已经销毁
     }
@@ -527,12 +630,12 @@ function createBrowserService(options = {}) {
       }
     }
     try {
-      if (!tab.webContents.isDestroyed()) tab.webContents.close()
+      if (tab.webContents && !tab.webContents.isDestroyed()) tab.webContents.close()
     } catch {
       // 强制销毁兜底
     }
     setImmediate(() => {
-      if (!tab.webContents.isDestroyed()) tab.webContents.destroy()
+      if (tab.webContents && !tab.webContents.isDestroyed()) tab.webContents.destroy()
     })
     releaseSessionIfUnused(partitionFor(tab.kind, tab.runId))
     emitState('tab.closed', { tabId: tab.id })
@@ -545,12 +648,12 @@ function createBrowserService(options = {}) {
     if (attachedTabId) {
       const previous = tabs.get(attachedTabId)
       if (previous && previous.id !== tab.id) {
-        previous.view.setVisible(false)
+        if (previous.view) previous.view.setVisible(false)
         cancelSelection(previous)
         closeDevTools(previous)
       }
       attachedTabId = tab.id
-      tab.view.setVisible(true)
+      if (tab.view) tab.view.setVisible(true)
     }
     emitState('state')
     return getState()
@@ -558,11 +661,18 @@ function createBrowserService(options = {}) {
 
   function attachTab(tabId, bounds, options = {}) {
     const tab = requireTab(tabId)
+    // 内部页面由渲染层直接渲染，无需挂载原生视图
+    if (tab.internal) {
+      activeTabId = tab.id
+      attachedTabId = tab.id
+      emitState('state')
+      return getState()
+    }
     const rect = normalizeBounds(bounds)
     if (attachedTabId && attachedTabId !== tab.id) {
       const previous = tabs.get(attachedTabId)
       if (previous) {
-        previous.view.setVisible(false)
+        if (previous.view) previous.view.setVisible(false)
         cancelSelection(previous)
         closeDevTools(previous)
       }
@@ -599,7 +709,7 @@ function createBrowserService(options = {}) {
     if (attachedTabId) {
       const tab = tabs.get(attachedTabId)
       if (tab) {
-        tab.view.setVisible(false)
+        if (tab.view) tab.view.setVisible(false)
         cancelSelection(tab)
         closeDevTools(tab)
       }
@@ -615,6 +725,8 @@ function createBrowserService(options = {}) {
     if (!['back', 'forward', 'reload', 'stop'].includes(command)) {
       throw new BrowserError('未知浏览器命令', 'BROWSER_TAB_NOT_FOUND')
     }
+    // 内部页面没有历史与加载状态，命令直接忽略
+    if (tab.internal) return summarize(tab)
     if (command === 'back') tab.webContents.goBack()
     if (command === 'forward') tab.webContents.goForward()
     if (command === 'reload') {
@@ -649,14 +761,15 @@ function createBrowserService(options = {}) {
   }
 
   function cancelSelection(tab) {
-    if (!tab || tab.destroyed || tab.webContents.isDestroyed()) return
+    if (!tab || tab.destroyed || !tab.webContents || tab.webContents.isDestroyed()) return
     tab.inspector.selectionToken += 1
     tab.inspector.selecting = false
     void resetElementInspector(tab.webContents)
   }
 
   function clearDevice(tab) {
-    if (!tab || !tab.device || tab.destroyed || tab.webContents.isDestroyed()) return
+    if (!tab || !tab.device || tab.destroyed || !tab.webContents || tab.webContents.isDestroyed())
+      return
     if (tab.zoomBeforeDevice != null) tab.webContents.setZoomFactor(tab.zoomBeforeDevice)
     tab.device = null
     tab.zoomBeforeDevice = null
@@ -675,6 +788,8 @@ function createBrowserService(options = {}) {
 
   async function selectElement(tabId) {
     const tab = requireTab(tabId)
+    if (!tab.webContents)
+      throw new BrowserError('内部页面不支持元素选择', 'BROWSER_VIEW_UNAVAILABLE')
     if (tab.kind === 'agent' && tab.owner === 'agent') takeover(tab.id)
     closeDevTools(tab)
     cancelSelection(tab)
@@ -711,6 +826,7 @@ function createBrowserService(options = {}) {
 
   async function inspectorState(tabId) {
     const tab = requireTab(tabId)
+    if (!tab.webContents) return { selecting: false, selected: null }
     const token = tab.inspector.selectionToken
     const selected = await getSelectedElement(tab.webContents)
     if (tab.destroyed || tabs.get(tab.id) !== tab || token !== tab.inspector.selectionToken) {
@@ -774,6 +890,7 @@ function createBrowserService(options = {}) {
   function setDevice(tabId, value = {}) {
     const tab = requireTab(tabId)
     assertManualAccess(tab)
+    if (!tab.webContents) return summarize(tab)
     if (!tab.device) tab.zoomBeforeDevice = tab.webContents.getZoomFactor()
     tab.device = normalizeDevice(value)
     emitState('state', { tabId: tab.id })
@@ -788,13 +905,14 @@ function createBrowserService(options = {}) {
   }
 
   function closeDevTools(tab) {
-    if (!tab || tab.destroyed || tab.webContents.isDestroyed()) return
+    if (!tab || tab.destroyed || !tab.webContents || tab.webContents.isDestroyed()) return
     if (tab.webContents.isDevToolsOpened()) tab.webContents.closeDevTools()
   }
 
   function toggleDevTools(tabId = attachedTabId || activeTabId) {
     if (!tabId) return null
     const tab = requireTab(tabId)
+    if (!tab.webContents) return summarize(tab)
     if (tab.kind === 'agent' && tab.owner === 'agent') tab.owner = 'user'
     if (tab.webContents.isDevToolsOpened()) tab.webContents.closeDevTools()
     else {
@@ -806,8 +924,8 @@ function createBrowserService(options = {}) {
 
   function toggleFocusedDevTools() {
     const tab = tabs.get(attachedTabId || activeTabId)
-    if (!tab || !tab.webContents.isDevToolsOpened() || !tab.webContents.isDevToolsFocused())
-      return null
+    if (!tab || !tab.webContents) return null
+    if (!tab.webContents.isDevToolsOpened() || !tab.webContents.isDevToolsFocused()) return null
     return toggleDevTools(tab.id)
   }
 
@@ -1014,6 +1132,7 @@ function createBrowserService(options = {}) {
 
   async function screenshot(tabId) {
     const tab = requireTab(tabId)
+    if (!tab.webContents) throw new BrowserError('内部页面不支持截图', 'BROWSER_VIEW_UNAVAILABLE')
     const image = await tab.webContents.capturePage()
     const size = image.getSize()
     fs.mkdirSync(artifactDir, { recursive: true })

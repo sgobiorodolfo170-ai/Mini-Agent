@@ -36,8 +36,7 @@ const updateOpen = ref(false)
 const navs = [
   { key: 'chat', icon: 'chat', label: '会话' },
   { key: 'kb', icon: 'kb', label: '知识库' },
-  { key: 'agent', icon: 'terminal', label: '执行' },
-  { key: 'browser', icon: 'globe', label: '浏览器' },
+  { key: 'agent', icon: 'cluster', label: '执行' },
   { key: 'remote', icon: 'monitor', label: '远程' },
   { key: 'settings', icon: 'settings', label: '设置' }
 ]
@@ -231,7 +230,7 @@ async function closeWindow() {
     <div class="flex-1 min-h-0 flex">
       <!-- 全局导航：64px，图标 + 12px 文字（F21），当前项有语义标记（F20） -->
       <nav
-        class="w-16 shrink-0 flex flex-col items-center pt-4 pb-3 border-r border-line-subtle bg-panel"
+        class="w-16 shrink-0 flex flex-col items-center pt-4 pb-3 border-r border-line-subtle bg-panel overflow-y-auto"
         aria-label="主导航"
       >
         <button

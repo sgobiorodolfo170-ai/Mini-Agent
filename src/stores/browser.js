@@ -17,6 +17,7 @@ export const useBrowserStore = defineStore('browser', {
     activeTabId: null,
     attachedTabId: null,
     policy: { allowPrivateNetwork: false, maxTabs: 6 },
+    attachOwner: null,
     lastEvent: null
   }),
   getters: {
@@ -96,13 +97,16 @@ export const useBrowserStore = defineStore('browser', {
       await window.api.browser.clearDevice(tabId)
       return this.load()
     },
-    async attach(tabId, bounds, options) {
+    async attach(tabId, bounds, options, owner = null) {
       const state = await window.api.browser.attach(tabId, bounds, options)
+      if (owner) this.attachOwner = owner
       this.apply(state)
       return state
     },
-    async detach() {
+    async detach(owner = null) {
+      if (owner && this.attachOwner && this.attachOwner !== owner) return this.load()
       const state = await window.api.browser.detach()
+      if (!owner || this.attachOwner === owner) this.attachOwner = null
       this.apply(state)
       return state
     },

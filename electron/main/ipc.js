@@ -1,5 +1,6 @@
-const { app, clipboard, dialog, ipcMain, shell } = require('electron')
+const { app, clipboard, dialog, ipcMain, screen, shell } = require('electron')
 const fs = require('fs')
+const pathMod = require('path')
 const dbm = require('../store/db')
 const repos = require('../store/repos')
 const { encryptSecret, decryptSecret } = require('../store/keys')
@@ -15,6 +16,9 @@ const { captureRegion } = require('./sys/capture')
 const { captureSelectedText } = require('./sys/selection')
 const exporter = require('./exporter')
 const windows = require('./windows')
+const terminal = require('./terminal')
+const sideTask = require('./side-task')
+const { isPathAllowed } = require('./agent/guard')
 const { broadcast } = require('./notify')
 const scheduler = require('./gateway/scheduler')
 const sessionsApi = require('./agent/sessions')
@@ -215,6 +219,68 @@ function registerIpc(ctx) {
   h('conversations:search', (q) => repos.searchConversations(dbm.get(), q))
   h('chat:searchMessages', (o) => repos.searchMessages(dbm.get(), o || {}))
   h('conversations:messages', (id) => repos.listMessages(dbm.get(), id).map(gateway.msgOut))
+
+  // 工作区文件：浏览 / 读取 / 保存，路径限制在项目工作目录与 Agent 授权目录内
+  const workspaceRoots = () => {
+    const db = dbm.get()
+    const projects = repos.listProjects(db).map((p) => ({ id: p.id, name: p.name, path: p.path }))
+    const raw = repos.getSetting(db, 'agentAuthorizedDirs')
+    const extra = Array.isArray(raw) ? raw : []
+    return [
+      ...projects,
+      ...extra.map((p, i) => ({
+        id: 'dir-' + i,
+        name: pathMod.basename(String(p)) || String(p),
+        path: String(p)
+      }))
+    ]
+  }
+  const assertWorkspace = (target) => {
+    const p = String(target || '')
+    if (!p) throw new Error('缺少文件路径')
+    if (!isPathAllowed(workspaceRoots().map((r) => r.path), p)) {
+      throw new Error('路径不在项目工作区内：' + p)
+    }
+    return p
+  }
+  h('workspace:roots', () => workspaceRoots())
+  h('workspace:list', async ({ path: p } = {}) => {
+    const dir = assertWorkspace(p)
+    const entries = await fs.promises.readdir(dir, { withFileTypes: true })
+    return entries
+      .map((e) => ({ name: e.name, path: pathMod.join(dir, e.name), dir: e.isDirectory() }))
+      .sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name))
+      .slice(0, 500)
+  })
+  h('workspace:read', async ({ path: p } = {}) => {
+    const file = assertWorkspace(p)
+    const st = await fs.promises.stat(file)
+    if (st.isDirectory()) throw new Error('目标是目录，无法作为文件打开')
+    if (st.size > 2 * 1024 * 1024) throw new Error('文件超过 2MB，暂不支持在编辑器中打开')
+    return {
+      content: (await fs.promises.readFile(file)).toString('utf8'),
+      size: st.size,
+      mtime: st.mtimeMs
+    }
+  })
+  h('workspace:write', async ({ path: p, content } = {}) => {
+    const file = assertWorkspace(p)
+    const text = String(content == null ? '' : content)
+    await fs.promises.writeFile(file, text, 'utf8')
+    return { size: Buffer.byteLength(text) }
+  })
+
+  // 终端控制台：执行目录同样限制在工作区内
+  h('terminal:run', ({ id, command, cwd } = {}) => {
+    const dir = cwd ? assertWorkspace(cwd) : undefined
+    return terminal.run({ id, command, cwd: dir })
+  })
+  h('terminal:stop', (o) => terminal.stop(o || {}))
+
+  // 侧边任务：临时子会话，只做流式回传，不写入主会话历史
+  h('side:send', (o) => sideTask.send(o || {}))
+  h('side:stop', (o) => sideTask.stop(o || {}))
+
 
   // projects（项目工作目录：会话分类 + Agent 命令执行目录）
   h('projects:list', () => {
@@ -625,6 +691,45 @@ function registerIpc(ctx) {
   h('win:isMaximized', () => {
     const win = windows.get('main')
     return !!(win && !win.isDestroyed() && win.isMaximized())
+  })
+  // 内置浏览器面板占用横向空间时，主窗口临时拓宽同样的宽度，
+  // 保证会话区宽度不因展开/折叠而跳变；折叠时只回收此前实际加宽的部分。
+  let panelGrow = { width: 0, x: null }
+  h('win:resizeForPanel', (delta) => {
+    const win = windows.get('main')
+    if (!win || win.isDestroyed()) return { applied: 0 }
+    const d = Math.round(Number(delta) || 0)
+    if (!d) return { applied: 0 }
+    // 最大化/全屏时无法调整尺寸；收起面板时清空记录，避免之后按过期加宽量回收
+    if (win.isMaximized() || win.isFullScreen()) {
+      if (d < 0) panelGrow = { width: 0, x: null }
+      return { applied: 0 }
+    }
+    const b = win.getBounds()
+    const wa = screen.getDisplayMatching(b).workArea
+    if (d > 0) {
+      if (panelGrow.x === null) panelGrow.x = b.x
+      // 优先向右扩展，右侧到屏幕边缘后向左补足，始终不越出可用工作区
+      const growRight = Math.min(d, Math.max(0, wa.x + wa.width - (b.x + b.width)))
+      const growLeft = Math.min(d - growRight, Math.max(0, b.x - wa.x))
+      const grown = growRight + growLeft
+      if (!grown) return { applied: 0 }
+      panelGrow.width += grown
+      win.setBounds({ x: b.x - growLeft, y: b.y, width: b.width + grown, height: b.height })
+      return { applied: grown }
+    }
+    const minWidth = win.getMinimumSize()[0] || 0
+    const applied = Math.min(panelGrow.width, -d, Math.max(0, b.width - minWidth))
+    if (!applied) return { applied: 0 }
+    const width = b.width - applied
+    const x =
+      panelGrow.x === null
+        ? b.x
+        : Math.min(Math.max(panelGrow.x, wa.x), Math.max(wa.x, wa.x + wa.width - width))
+    panelGrow.width -= applied
+    if (!panelGrow.width) panelGrow.x = null
+    win.setBounds({ x, y: b.y, width, height: b.height })
+    return { applied }
   })
   h('app:info', () => ({
     version: ctx.version,

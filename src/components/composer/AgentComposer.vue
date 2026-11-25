@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import UiIcon from '../UiIcon.vue'
 import ComposerInput from './ComposerInput.vue'
 import ComposerMenu from './ComposerMenu.vue'
@@ -29,11 +29,10 @@ const props = defineProps({
   addAction: { type: Object, default: null },
   // { label, icon, enabled, active, hint } —— Agent 集群开关
   clusterAction: { type: Object, default: null },
-  // { value: 0..1, label } —— 上下文占用比例，null 时不渲染状态环
+  // { value: 0..1, label, used, limit, rows } —— 上下文占用，null 时不渲染状态环
   contextUsage: { type: Object, default: null },
   // { label, icon, enabled }
   voiceAction: { type: Object, default: null },
-  runtimeState: { type: String, default: 'idle' }, // idle | running | success | error
   // 提示词优化进行中：按钮置灰并给出忙碌状态
   optimizing: { type: Boolean, default: false },
   sendLabel: { type: String, default: '发送' },
@@ -62,7 +61,6 @@ const inputRef = ref(null)
 const canSend = computed(
   () => !props.disabled && !props.submitting && !props.streaming && props.value.trim().length > 0
 )
-const runtimeRunning = computed(() => props.runtimeState === 'running' || props.streaming === true)
 const showModel = computed(() => !!(props.model && (props.model.name || props.model.id)))
 const modelInteractive = computed(
   () => showModel.value && props.modelGroups.length > 0 && !props.disabled
@@ -130,6 +128,70 @@ const ringStyle = computed(() => {
   return {
     background: `conic-gradient(${color} ${deg}deg, color-mix(in srgb, var(--text-muted) 34%, transparent) ${deg}deg 360deg)`
   }
+})
+
+// ---------- 上下文窗口弹层：点击占用环展开真实占用明细 ----------
+const usageOpen = ref(false)
+const usageAnchorEl = ref(null)
+
+const usageBarWidth = computed(() => {
+  const v = usagePct.value
+  if (!v || v <= 0) return '0%'
+  // 有占用时至少给 2% 可见宽度，避免少量内容完全看不到进度
+  return `${Math.max(2, Math.round(v * 1000) / 10)}%`
+})
+const usageRows = computed(() => {
+  const info = props.contextUsage
+  const limit = info && Number(info.limit)
+  const rows = info && Array.isArray(info.rows) ? info.rows : []
+  return rows.map((row, i) => ({
+    id: row.id || i,
+    label: row.label,
+    pct: formatPct(row.chars, limit),
+    chars: row.chars || 0
+  }))
+})
+const usageFoot = computed(() => {
+  const info = props.contextUsage
+  if (!info || typeof info.used !== 'number' || !info.limit) return null
+  return { remain: Math.max(0, info.limit - info.used) }
+})
+// 头部右侧：已用 / 上限（占比），与参考图排布一致
+const usageHead = computed(() => {
+  const info = props.contextUsage
+  if (info && typeof info.used === 'number' && info.limit) {
+    return `${info.used} / ${info.limit} (${usageDisplayPct.value}%)`
+  }
+  return `${usageDisplayPct.value}%`
+})
+
+// 明细占比：不足 1% 时按参考图显示为 <1%，整数去掉小数点
+function formatPct(chars, limit) {
+  if (!chars || !limit) return '0%'
+  const pct = (chars / limit) * 100
+  if (pct < 1) return '<1%'
+  const rounded = Math.round(pct * 10) / 10
+  return `${rounded}%`
+}
+
+function toggleUsage() {
+  usageOpen.value = !usageOpen.value
+}
+function closeUsageOnOutside(e) {
+  if (!usageOpen.value) return
+  if (usageAnchorEl.value && usageAnchorEl.value.contains(e.target)) return
+  usageOpen.value = false
+}
+function closeUsageOnEscape(e) {
+  if (e.key === 'Escape' && usageOpen.value) usageOpen.value = false
+}
+onMounted(() => {
+  document.addEventListener('pointerdown', closeUsageOnOutside, true)
+  window.addEventListener('keydown', closeUsageOnEscape)
+})
+onBeforeUnmount(() => {
+  document.removeEventListener('pointerdown', closeUsageOnOutside, true)
+  window.removeEventListener('keydown', closeUsageOnEscape)
 })
 
 function submit() {
@@ -287,27 +349,51 @@ defineExpose({
         </div>
 
         <div class="ac-right">
-          <!-- 运行状态指示：仅真实进行中显示并旋转 -->
-          <span
-            v-if="runtimeRunning"
-            class="ac-ring"
-            role="img"
-            aria-label="正在执行"
-            data-testid="composer-runtime"
-          />
+          <!-- 上下文状态环：仅在业务层给出真实占用比例时显示；点击展开占用明细 -->
+          <div v-if="usagePct !== null" ref="usageAnchorEl" class="ac-anchor">
+            <button
+              class="ac-usage"
+              :class="`ac-usage--${usageTone}`"
+              type="button"
+              data-testid="composer-usage"
+              aria-haspopup="dialog"
+              :aria-expanded="usageOpen ? 'true' : 'false'"
+              :aria-label="`上下文已用 ${usageDisplayPct}%${contextUsage.label ? '，' + contextUsage.label : ''}`"
+              :title="`上下文已用 ${usageDisplayPct}%${contextUsage.label ? '（' + contextUsage.label + '）' : ''}`"
+              @click="toggleUsage"
+            >
+              <span class="ac-usage__ring" :style="ringStyle" aria-hidden="true" />
+            </button>
 
-          <!-- 上下文状态环：仅在业务层给出真实占用比例时显示 -->
-          <span
-            v-if="usagePct !== null"
-            class="ac-usage"
-            :class="`ac-usage--${usageTone}`"
-            role="img"
-            data-testid="composer-usage"
-            :aria-label="`上下文已用 ${usageDisplayPct}%${contextUsage.label ? '，' + contextUsage.label : ''}`"
-            :title="`上下文已用 ${usageDisplayPct}%${contextUsage.label ? '（' + contextUsage.label + '）' : ''}`"
-          >
-            <span class="ac-usage__ring" :style="ringStyle" aria-hidden="true" />
-          </span>
+            <div
+              v-if="usageOpen"
+              class="ac-usage-pop"
+              role="dialog"
+              aria-label="上下文窗口"
+              data-testid="composer-usage-popover"
+            >
+              <div class="ac-usage-pop__head">
+                <span class="ac-usage-pop__title">上下文窗口</span>
+                <span class="ac-usage-pop__pct">{{ usageHead }}</span>
+              </div>
+              <div class="ac-usage-pop__bar">
+                <span :style="{ width: usageBarWidth }" />
+              </div>
+              <ul class="ac-usage-pop__list">
+                <li v-for="row in usageRows" :key="row.id" class="ac-usage-pop__row">
+                  <span class="ac-usage-pop__dot" aria-hidden="true" />
+                  <span class="ac-usage-pop__row-label">{{ row.label }}</span>
+                  <span class="ac-usage-pop__row-val" :title="row.chars + ' 字符'">
+                    {{ row.pct }}
+                  </span>
+                </li>
+              </ul>
+              <div v-if="usageFoot" class="ac-usage-pop__foot">
+                <span>剩余上下文</span>
+                <span>{{ usageFoot.remain }} 字符</span>
+              </div>
+            </div>
+          </div>
 
           <div v-if="showModel" class="ac-anchor ac-model">
             <button

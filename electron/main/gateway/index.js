@@ -102,20 +102,34 @@ function isVisionModel(provider, model) {
   return !!(m && m.vision)
 }
 
+function withTextAttachments(content, atts) {
+  const texts = atts.filter((a) => a && a.type === 'text' && a.content)
+  if (!texts.length) return content || ''
+  const quoted = texts.map((a) => `[选中文字]\n${a.content}`).join('\n\n')
+  return content ? `${content}\n\n${quoted}` : quoted
+}
+
+// attachments 可能是数据库里的 JSON 字符串，也可能是上下文构建时已解析的数组
+function attachmentsOf(value) {
+  if (Array.isArray(value)) return value
+  return safeJson(value, []) || []
+}
+
 function toApiMessages(rows) {
   return rows.map((m) => {
-    const atts = safeJson(m.attachments, []) || []
+    const atts = attachmentsOf(m.attachments)
     const images = atts.filter((a) => a && a.type === 'image' && a.dataUrl)
+    const content = m.role === 'user' ? withTextAttachments(m.content, atts) : m.content || ''
     if (m.role === 'user' && images.length) {
       return {
         role: 'user',
         content: [
-          { type: 'text', text: m.content || '' },
+          { type: 'text', text: content },
           ...images.map((a) => ({ type: 'image_url', image_url: { url: a.dataUrl } }))
         ]
       }
     }
-    return { role: m.role === 'tool' ? 'assistant' : m.role, content: m.content || '' }
+    return { role: m.role === 'tool' ? 'assistant' : m.role, content }
   })
 }
 
@@ -228,7 +242,10 @@ async function startStream({ conversationId, assistantMsgId, kbIds, attachments 
       kbBlocks
     })
     const apiMsgs = toApiMessages(messages)
-    if ((attachments || []).length && !isVisionModel(provider, model)) {
+    if (
+      (attachments || []).some((a) => a && a.type === 'image') &&
+      !isVisionModel(provider, model)
+    ) {
       warnings.push('当前模型未标记为「支持视觉」，图片可能无法识别')
     }
 

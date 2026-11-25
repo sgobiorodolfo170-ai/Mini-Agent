@@ -14,6 +14,8 @@ import { useKbStore } from '../stores/kb'
 import { useUiStore } from '../stores/ui'
 import { useProjectsStore } from '../stores/projects'
 import { useComposerStore } from '../stores/composer'
+import { useBrowserStore } from '../stores/browser'
+import { useSideTaskStore } from '../stores/sideTask'
 
 const chat = useChatStore()
 const settings = useSettingsStore()
@@ -22,6 +24,8 @@ const ui = useUiStore()
 const projects = useProjectsStore()
 const agent = useAgentStore()
 const composer = useComposerStore()
+const browser = useBrowserStore()
+const sideTask = useSideTaskStore()
 
 const input = computed({
   get: () => composer.text,
@@ -41,6 +45,13 @@ const showMoreMenu = ref(false)
 const editingTitleId = ref(null)
 const scrollEl = ref(null)
 const stickBottom = ref(true)
+// 消息内选中文字后弹出的横向菜单（添加到对话 / 在临时会话提问）
+const selectionMenu = ref({ visible: false, x: 0, y: 0, text: '' })
+const selectionMenuEl = ref(null)
+let selectionTimer = 0
+// 以附件形式待发送的选中文字
+const textAttachments = ref([])
+let textAttachmentSeq = 0
 let searchTimer = null
 // 提示词优化 / 分组折叠 / 提示词定位
 const optimizing = ref(false)
@@ -100,6 +111,7 @@ function scrollToBottom() {
 function onScroll() {
   const el = scrollEl.value
   stickBottom.value = el ? el.scrollHeight - el.scrollTop - el.clientHeight < 60 : true
+  hideSelectionMenu()
 }
 function backToBottom() {
   stickBottom.value = true
@@ -198,9 +210,15 @@ async function send() {
   if (sending.value || chat.hasStreaming) return
   const content = input.value.trim()
   if (!content) return
-  const atts = ui.pendingAttachment ? [{ type: 'image', dataUrl: ui.pendingAttachment }] : []
+  const imageData = ui.pendingAttachment
+  const sentTextAttachments = textAttachments.value
+  const atts = [
+    ...(imageData ? [{ type: 'image', dataUrl: imageData }] : []),
+    ...sentTextAttachments.map((a) => ({ type: 'text', content: a.text }))
+  ]
   sending.value = true
   ui.pendingAttachment = null
+  textAttachments.value = []
   input.value = ''
   try {
     await chat.send(content, atts)
@@ -210,7 +228,10 @@ async function send() {
   } catch (e) {
     // 发送期间用户可能继续输入或从浏览器追加上下文，失败时不能覆盖新草稿。
     composer.restoreSent(content)
-    if (atts.length && !ui.pendingAttachment) ui.pendingAttachment = atts[0].dataUrl
+    if (imageData && !ui.pendingAttachment) ui.pendingAttachment = imageData
+    if (sentTextAttachments.length) {
+      textAttachments.value = [...sentTextAttachments, ...textAttachments.value]
+    }
     ui.toast('发送失败，内容已恢复到输入框', 'error')
   } finally {
     sending.value = false
@@ -639,8 +660,26 @@ const activeModelParams = computed(() => {
 const contextUsage = computed(() => {
   const limit = Number(activeModelParams.value.maxChars) || 12000
   if (!limit) return null
-  const used = chat.messages.reduce((n, m) => n + (m.content ? m.content.length : 0), 0)
-  return { value: Math.min(1, used / limit), label: `${used} / ${limit} 字符` }
+  const userChars = chat.messages.reduce(
+    (n, m) => n + (m.role === 'user' && m.content ? m.content.length : 0),
+    0
+  )
+  const assistantChars = chat.messages.reduce(
+    (n, m) => n + (m.role === 'assistant' && m.content ? m.content.length : 0),
+    0
+  )
+  const used = userChars + assistantChars
+  return {
+    value: Math.min(1, used / limit),
+    label: `${used} / ${limit} 字符`,
+    used,
+    limit,
+    // 明细供输入区「上下文窗口」弹层展示，均为真实字符统计
+    rows: [
+      { id: 'user', label: '用户消息', chars: userChars },
+      { id: 'assistant', label: '助手回复', chars: assistantChars }
+    ]
+  }
 })
 
 // 顶部状态徽标：来自 agent.runs 的真实计数，无数据时整体不渲染
@@ -705,14 +744,84 @@ const composerStatusItems = computed(() => {
   return items
 })
 
-// 运行状态指示：仅在真实流式执行中为 running
-const runtimeState = computed(() => (chat.hasStreaming ? 'running' : 'idle'))
 function stopComposer() {
   stopStream()
 }
 
+// 消息内选中文字：自动弹出横向菜单
+function hideSelectionMenu() {
+  if (selectionMenu.value.visible) selectionMenu.value.visible = false
+}
+function updateSelectionMenu() {
+  const selection = window.getSelection()
+  if (!selection || selection.isCollapsed || !selection.rangeCount) {
+    hideSelectionMenu()
+    return
+  }
+  const text = selection.toString().trim()
+  const anchor = selection.anchorNode
+  const anchorEl = anchor && (anchor.nodeType === 1 ? anchor : anchor.parentElement)
+  if (!text || !anchorEl || !scrollEl.value || !scrollEl.value.contains(anchorEl)) {
+    hideSelectionMenu()
+    return
+  }
+  // 只在消息正文内响应，避免误选时间、按钮等界面元素
+  if (!anchorEl.closest('.message-text')) {
+    hideSelectionMenu()
+    return
+  }
+  const rect = selection.getRangeAt(0).getBoundingClientRect()
+  const width = 232
+  selectionMenu.value = {
+    visible: true,
+    text: text.slice(0, 8000),
+    x: Math.max(12, Math.min(rect.left + rect.width / 2 - width / 2, window.innerWidth - width - 12)),
+    y: Math.max(12, Math.min(rect.bottom + 8, window.innerHeight - 52))
+  }
+}
+function onMessageMouseUp() {
+  clearTimeout(selectionTimer)
+  selectionTimer = setTimeout(updateSelectionMenu, 0)
+}
+function addSelectionToChat() {
+  const text = selectionMenu.value.text
+  hideSelectionMenu()
+  if (!text) return
+  textAttachments.value.push({
+    id: `chat-selection-${(textAttachmentSeq += 1)}`,
+    text,
+    preview: text.length > 80 ? `${text.slice(0, 80)}…` : text
+  })
+  const selection = window.getSelection()
+  if (selection) selection.removeAllRanges()
+  composerRef.value?.focus?.()
+}
+async function askSelectionInSideTask() {
+  const text = selectionMenu.value.text
+  hideSelectionMenu()
+  if (!text) return
+  sideTask.addSelection(text)
+  const selection = window.getSelection()
+  if (selection) selection.removeAllRanges()
+  try {
+    // 先创建/复用内部标签，再展开面板：避免面板初始化时额外打开空白标签
+    const existing = browser.tabs.find((tab) => tab.internal === 'side')
+    const tab = existing || (await browser.open('miniagent://side'))
+    if (!ui.browserPanelOpen) await toggleBrowserPanel()
+    await browser.activate(tab.id)
+  } catch (e) {
+    ui.toast('打开临时会话失败：' + String((e && e.message) || e), 'error')
+  }
+}
+function removeTextAttachment(id) {
+  textAttachments.value = textAttachments.value.filter((a) => a.id !== id)
+}
+
 // 点击面板外部关闭知识库面板（Esc 由 onWindowKeydown 处理）
 function onDocPointerDown(e) {
+  if (selectionMenu.value.visible) {
+    if (!selectionMenuEl.value || !selectionMenuEl.value.contains(e.target)) hideSelectionMenu()
+  }
   if (!showKbPopover.value) return
   if (kbPopoverEl.value && kbPopoverEl.value.contains(e.target)) return
   const trigger = e.target && e.target.closest ? e.target.closest('[data-testid="kb-chip"]') : null
@@ -722,6 +831,7 @@ function onDocPointerDown(e) {
 function onWindowKeydown(e) {
   if (e.key !== 'Escape' || ui.confirmState) return
   // 输入区弹出的面板优先关闭，且不清空输入文本（规范 §5.2）
+  if (selectionMenu.value.visible) hideSelectionMenu()
   if (showKbPopover.value) showKbPopover.value = false
 }
 function onWindowResize() {
@@ -739,6 +849,7 @@ onBeforeUnmount(() => {
   if (stopBrowserResize) stopBrowserResize()
   clearTimeout(searchTimer)
   clearTimeout(highlightTimer)
+  clearTimeout(selectionTimer)
 })
 
 // 列表拖宽（220–320px）
@@ -757,8 +868,29 @@ function startResize(e) {
   window.addEventListener('mouseup', up)
 }
 
-function toggleBrowserPanel() {
+// 展开/折叠内置浏览器：Electron 下同步拓宽/回收主窗口相同宽度，
+// 会话区宽度不因面板开合而跳变；窗口无法调整时（最大化/屏幕放不下）按原行为收缩
+async function toggleBrowserPanel() {
   showMoreMenu.value = false
+  const opening = !ui.browserPanelOpen
+  const panelWidth = visibleBrowserPanelWidth.value
+  // 面板占用的横向空间 = 面板宽度 + 右侧外边距（mr-3）
+  const delta = panelWidth + 12
+  const winApi = window.api && window.api.window
+  if (winApi && typeof winApi.resizeForPanel === 'function') {
+    try {
+      const res = await winApi.resizeForPanel(opening ? delta : -delta)
+      // 屏幕空间不足以完整拓宽时，按缺口收窄面板宽度，继续保证会话区宽度不变
+      if (opening && res && typeof res.applied === 'number' && res.applied < delta) {
+        const shortfall = delta - res.applied
+        if (panelWidth - shortfall >= 360) {
+          ui.setBrowserPanelWidth(panelWidth - shortfall, false)
+        }
+      }
+    } catch {
+      // 窗口调整失败不阻断面板开合
+    }
+  }
   ui.toggleBrowserPanel()
 }
 
@@ -1073,10 +1205,11 @@ function startBrowserResize(e) {
       />
     </aside>
 
-    <div class="flex-1 min-w-0 min-h-0 flex">
+    <div class="relative flex-1 min-w-0 min-h-0 flex">
       <!-- 聊天主区：整个右区为白底悬浮卡片（含页头、消息与输入区） -->
+      <!-- 内边距用于露出卡片自身的白边，便于在元素选择器中直接选中整张卡片 -->
       <section
-        class="flex-1 min-w-0 flex flex-col m-3 chat-surface overflow-hidden"
+        class="flex-1 min-w-0 flex flex-col m-3 p-2 chat-surface overflow-hidden"
         data-testid="chat-main"
       >
         <!-- 页头：列表开关 / 标题 / 生效模型 / 更多（设置入口统一在侧栏「设置」） -->
@@ -1178,6 +1311,7 @@ function startBrowserResize(e) {
             ref="scrollEl"
             class="absolute inset-0 overflow-y-auto px-4 md:px-6 py-4 bg-surface"
             @scroll.passive="onScroll"
+            @mouseup="onMessageMouseUp"
           >
             <div class="max-w-[840px] mx-auto w-full space-y-4">
               <!-- 空态（F12）：无服务给配置清单，有服务给开始入口 -->
@@ -1246,7 +1380,8 @@ function startBrowserResize(e) {
 
         <!-- 输入区（AgentComposer）：状态徽标 + 单张白卡（上层输入 / 下层操作栏） -->
         <div class="shrink-0 px-6 pb-5 pt-3 bg-surface">
-          <div class="mx-auto w-full" style="max-width: 1136px">
+          <!-- 与消息列等宽：输入卡与上方 840px 对话内容对齐 -->
+          <div class="mx-auto w-full max-w-[840px]">
             <AgentComposer
               ref="composerRef"
               :variant="composerVariant"
@@ -1263,7 +1398,6 @@ function startBrowserResize(e) {
               :add-action="addAction"
               :cluster-action="clusterAction"
               :context-usage="contextUsage"
-              :runtime-state="runtimeState"
               :optimizing="optimizing"
               :send-label="chat.agentMode ? '开始任务' : '发送'"
               @update:value="input = $event"
@@ -1292,6 +1426,23 @@ function startBrowserResize(e) {
                   <button class="text-link hover:underline" @click="ui.pendingAttachment = null">
                     移除
                   </button>
+                </div>
+                <div
+                  v-if="textAttachments.length"
+                  class="mb-2 flex flex-col gap-1"
+                  data-testid="composer-text-attachments"
+                >
+                  <div
+                    v-for="a in textAttachments"
+                    :key="a.id"
+                    class="flex items-start gap-2 rounded-lg border border-line-subtle bg-subtle/40 px-2.5 py-1.5 text-xs"
+                  >
+                    <span class="shrink-0 font-medium text-ink-secondary">选中文字</span>
+                    <span class="min-w-0 flex-1 truncate text-ink-muted">{{ a.preview }}</span>
+                    <button class="shrink-0 text-link hover:underline" @click="removeTextAttachment(a.id)">
+                      移除
+                    </button>
+                  </div>
                 </div>
               </template>
               <template #context-panel>
@@ -1332,9 +1483,11 @@ function startBrowserResize(e) {
         </div>
       </section>
 
+      <!-- 分区宽度调节：热区覆盖两区交界（含两侧卡片边缘），不额外占用布局宽度、无可见分隔条 -->
       <div
         v-if="ui.browserPanelOpen"
-        class="group w-2 shrink-0 my-3 flex items-center justify-center cursor-col-resize"
+        class="absolute top-3 bottom-3 z-10 w-4 cursor-col-resize"
+        :style="{ right: visibleBrowserPanelWidth + 10 + 'px' }"
         role="separator"
         tabindex="0"
         aria-orientation="vertical"
@@ -1349,9 +1502,7 @@ function startBrowserResize(e) {
         @keydown.right.prevent="resizeBrowserPanelBy(16)"
         @keydown.home.prevent="setBrowserPanelWidth(360)"
         @keydown.end.prevent="setBrowserPanelWidth(browserPanelMaxWidth)"
-      >
-        <div class="h-full w-0.5 rounded bg-line-subtle group-hover:bg-brand transition-colors" />
-      </div>
+      />
 
       <aside
         v-if="ui.browserPanelOpen"
@@ -1362,6 +1513,33 @@ function startBrowserResize(e) {
       >
         <BrowserView v-if="ui.view === 'chat'" class="flex-1 min-h-0" />
       </aside>
+
+      <!-- 消息内选中文字后的横向操作菜单 -->
+      <Teleport to="body">
+        <div
+          v-if="selectionMenu.visible"
+          ref="selectionMenuEl"
+          class="fixed z-50 flex h-9 items-center gap-1 rounded-lg border border-line-subtle bg-surface px-1 text-xs shadow-menu"
+          :style="{ left: selectionMenu.x + 'px', top: selectionMenu.y + 'px' }"
+          data-testid="message-selection-menu"
+        >
+          <button
+            class="h-7 rounded-md px-2.5 text-ink-secondary hover:bg-subtle hover:text-ink-primary"
+            data-testid="selection-add-to-chat"
+            @click="addSelectionToChat"
+          >
+            添加到对话
+          </button>
+          <span class="h-4 w-px bg-line-subtle" aria-hidden="true"></span>
+          <button
+            class="h-7 rounded-md px-2.5 text-ink-secondary hover:bg-subtle hover:text-ink-primary"
+            data-testid="selection-ask-side"
+            @click="askSelectionInSideTask"
+          >
+            在临时会话提问
+          </button>
+        </div>
+      </Teleport>
     </div>
 
     <!-- 添加项目工作目录（替代设置页的命令工作目录） -->

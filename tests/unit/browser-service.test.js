@@ -281,6 +281,97 @@ describe('browser service', () => {
     expect(children).toHaveLength(0)
   })
 
+  it('follows an intercepted HTTP redirect without surfacing ERR_FAILED', async () => {
+    const { service, children } = harness()
+    const tab = service.open({ url: 'about:blank' })
+    const wc = children[0].webContents
+    let rejectRedirect
+    wc.loadURL = async (url) => {
+      wc.loads.push(url)
+      wc.url = url
+      wc.emit('did-start-loading')
+      if (url === 'https://redirect.example/') {
+        const pending = new Promise((_, reject) => {
+          rejectRedirect = reject
+        })
+        let prevented = false
+        wc.emit(
+          'will-redirect',
+          {
+            preventDefault() {
+              prevented = true
+            }
+          },
+          'https://final.example/'
+        )
+        expect(prevented).toBe(true)
+        setTimeout(() => {
+          wc.emit('did-fail-load', {}, -2, 'ERR_FAILED', 'https://final.example/', true)
+          rejectRedirect(Object.assign(new Error('ERR_FAILED (-2)'), { code: -2 }))
+        }, 0)
+        return pending
+      }
+      wc.emit('did-navigate', {}, url)
+      wc.emit('did-stop-loading')
+    }
+
+    await service.navigate(tab.id, 'https://redirect.example/')
+    await vi.waitFor(() => {
+      const current = service.getState().tabs[0]
+      expect(current.url).toBe('https://final.example/')
+      expect(current.loading).toBe(false)
+      expect(current.error).toBe(null)
+    })
+    expect(wc.loads).toEqual(['https://redirect.example/', 'https://final.example/'])
+  })
+
+  it('cancels a slow navigation when a newer URL is submitted', async () => {
+    const { service, children } = harness()
+    const tab = service.open({ url: 'about:blank' })
+    const wc = children[0].webContents
+    let rejectSlow
+    wc.loadURL = (url) => {
+      wc.loads.push(url)
+      wc.url = url
+      wc.emit('did-start-loading')
+      if (url === 'https://slow.example/') {
+        return new Promise((_, reject) => {
+          rejectSlow = reject
+        })
+      }
+      wc.emit('did-navigate', {}, url)
+      wc.emit('did-stop-loading')
+      return Promise.resolve()
+    }
+    wc.stop = () => {
+      wc.commands.push('stop')
+      rejectSlow?.(Object.assign(new Error('ERR_ABORTED (-3)'), { code: -3 }))
+    }
+
+    const first = service.navigate(tab.id, 'https://slow.example/').catch(() => null)
+    await vi.waitFor(() => expect(wc.loads).toContain('https://slow.example/'))
+    const second = service.navigate(tab.id, 'https://fast.example/')
+    let outcome
+    try {
+      outcome = await Promise.race([
+        second.then(() => 'loaded'),
+        new Promise((resolve) => setTimeout(() => resolve('blocked'), 50))
+      ])
+    } finally {
+      rejectSlow?.(Object.assign(new Error('ERR_ABORTED (-3)'), { code: -3 }))
+    }
+    await first
+    await second
+
+    expect(outcome).toBe('loaded')
+    expect(wc.commands).toContain('stop')
+    expect(service.getState().tabs[0]).toMatchObject({
+      url: 'https://fast.example/',
+      loading: false,
+      error: null
+    })
+  })
+
   it('toggles detached native DevTools with F12 and the focused menu command', () => {
     const { service, children } = harness()
     const tab = service.open({ kind: 'user' })

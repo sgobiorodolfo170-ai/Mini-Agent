@@ -9,6 +9,7 @@ let pageServer
 let pageUrl
 let popupUrl
 let pageState
+let slowRequested = false
 
 async function listen(server) {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
@@ -122,6 +123,19 @@ async function clickGuestElement(electronApp, url, selector) {
   )
 }
 
+async function openBrowserPage(win) {
+  // 左侧导航已移除浏览器入口：从会话页的内置浏览器面板启动独立浏览器页
+  await win.getByTestId('nav-chat').click()
+  const panel = win.getByTestId('chat-browser-panel')
+  if (!(await panel.isVisible().catch(() => false))) {
+    await win.getByTestId('chat-browser-panel-toggle').click()
+  }
+  await panel.waitFor({ timeout: 10000 })
+  const standalone = win.getByTestId('browser-quick-standalone')
+  if (await standalone.isVisible().catch(() => false)) await standalone.click()
+  await win.getByTestId('browser-view').waitFor({ timeout: 10000 })
+}
+
 async function sendBrowserGoal(win) {
   await win.getByTestId('nav-chat').click()
   await win.getByTestId('new-conv').click()
@@ -133,7 +147,17 @@ async function sendBrowserGoal(win) {
 
 beforeEach(async () => {
   pageState = { result: null, userCookie: null, agentCookie: null }
+  slowRequested = false
   pageServer = http.createServer((req, res) => {
+    if (req.url === '/slow') {
+      slowRequested = true
+      setTimeout(() => {
+        if (res.writableEnded || res.destroyed) return
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+        res.end('<!doctype html><title>Slow</title><body>SLOW_PAGE</body>')
+      }, 4000)
+      return
+    }
     if (req.url === '/' || req.url.startsWith('/?')) {
       if (req.url.includes('agent=1')) pageState.agentCookie = req.headers.cookie || ''
       else pageState.userCookie = req.headers.cookie || ''
@@ -145,6 +169,7 @@ beforeEach(async () => {
         <h1>内置浏览器测试页</h1>
         <input id="name" value="MiniAgent" />
         <button id="go">提交</button>
+        <a id="redirect-link" href="/redirect">重定向测试</a>
         <div id="result"></div>
         <script>
           document.querySelector('#go').addEventListener('click', () => {
@@ -154,6 +179,11 @@ beforeEach(async () => {
           })
         </script>
       </body></html>`)
+      return
+    }
+    if (req.url === '/redirect') {
+      res.writeHead(302, { Location: '/popup' })
+      res.end()
       return
     }
     if (req.url === '/popup') {
@@ -195,7 +225,7 @@ afterEach(async () => {
 describe('内置浏览器 P1 技术 spike', () => {
   it('embeds a real WebContentsView, tracks resize and adopts popups as tabs', async () => {
     const { electronApp, win, consoleErrors } = ctx
-    await win.getByTestId('nav-browser').click()
+    await openBrowserPage(win)
     await win.getByTestId('browser-view').waitFor()
     await waitFor(
       async () => (await win.evaluate(() => window.api.browser.state())).tabs.length === 1
@@ -245,10 +275,7 @@ describe('内置浏览器 P1 技术 spike', () => {
     await waitFor(async () => (await readGuestBody(electronApp, popupUrl)) === 'POPUP_OK')
 
     await win.getByTestId('nav-chat').click()
-    await waitFor(
-      async () => (await win.evaluate(() => window.api.browser.state())).attachedTabId === null
-    )
-    await win.getByTestId('nav-browser').click()
+    await openBrowserPage(win)
     await waitFor(async () => {
       const current = await win.evaluate(() => window.api.browser.state())
       return current.attachedTabId === current.activeTabId && !!current.activeTabId
@@ -256,12 +283,58 @@ describe('内置浏览器 P1 技术 spike', () => {
 
     expect(unexpectedErrors(consoleErrors)).toEqual([])
   })
+  it('follows a clicked link through an HTTP redirect without a stale error', async () => {
+    const { electronApp, win, consoleErrors } = ctx
+    await openBrowserPage(win)
+    await win.getByTestId('browser-view').waitFor()
+    await waitFor(
+      async () => (await win.evaluate(() => window.api.browser.state())).tabs.length === 1
+    )
+
+    await win.getByTestId('browser-address').fill(pageUrl)
+    await win.getByTestId('browser-go').click()
+    await waitFor(async () =>
+      (await readGuestBody(electronApp, pageUrl))?.includes('内置浏览器测试页')
+    )
+
+    await clickGuestElement(electronApp, pageUrl, '#redirect-link')
+    await waitFor(async () => (await readGuestBody(electronApp, popupUrl)) === 'POPUP_OK')
+    await waitFor(async () => {
+      const state = await win.evaluate(() => window.api.browser.state())
+      const tab = state.tabs.find((item) => item.id === state.activeTabId)
+      return tab?.url === popupUrl && !tab.loading && !tab.error
+    })
+
+    expect(unexpectedErrors(consoleErrors)).toEqual([])
+  })
+  it('cancels a slow page when a newer URL is submitted in the address bar', async () => {
+    const { electronApp, win, consoleErrors } = ctx
+    const slowUrl = pageUrl + 'slow'
+    await openBrowserPage(win)
+    await win.getByTestId('browser-view').waitFor()
+    await waitFor(
+      async () => (await win.evaluate(() => window.api.browser.state())).tabs.length === 1
+    )
+
+    await win.getByTestId('browser-address').fill(slowUrl)
+    await win.getByTestId('browser-go').click()
+    await waitFor(() => slowRequested)
+
+    const started = Date.now()
+    await win.getByTestId('browser-address').fill(pageUrl)
+    await win.getByTestId('browser-go').click()
+    await waitFor(async () =>
+      (await readGuestBody(electronApp, pageUrl))?.includes('内置浏览器测试页')
+    )
+    expect(Date.now() - started).toBeLessThan(3000)
+    expect(unexpectedErrors(consoleErrors)).toEqual([])
+  })
 })
 
 describe('内置浏览器原生开发者工具', () => {
   it('opens with F12 or the toolbar and closes from DevTools or browser navigation', async () => {
     const { electronApp, win, consoleErrors } = ctx
-    await win.getByTestId('nav-browser').click()
+    await openBrowserPage(win)
     await win.getByTestId('browser-view').waitFor()
     await win.getByTestId('browser-address').fill(pageUrl)
     await win.getByTestId('browser-go').click()
@@ -299,7 +372,7 @@ describe('内置浏览器元素检查器与设备工具栏', () => {
   it('selects an element, edits styles live, emulates a viewport and appends context to chat', async () => {
     const { electronApp, win, consoleErrors } = ctx
     await win.getByTestId('chat-input').fill('已有草稿')
-    await win.getByTestId('nav-browser').click()
+    await openBrowserPage(win)
     await win.getByTestId('browser-view').waitFor()
     await win.getByTestId('browser-address').fill(pageUrl)
     await win.getByTestId('browser-go').click()
@@ -443,7 +516,7 @@ describe('内置浏览器 P2 安全最小闭环', () => {
     mock.state.browserUrl = pageUrl + '?agent=1'
     mock.state.browserDelayMs = 1500
 
-    await win.getByTestId('nav-browser').click()
+    await openBrowserPage(win)
     await win.getByTestId('browser-view').waitFor()
     await waitFor(
       async () => (await win.evaluate(() => window.api.browser.state())).tabs.length === 1
@@ -461,7 +534,7 @@ describe('内置浏览器 P2 安全最小闭环', () => {
       const state = await win.evaluate(() => window.api.browser.state())
       return state.tabs.some((tab) => tab.kind === 'agent')
     })
-    await win.getByTestId('nav-browser').click()
+    await openBrowserPage(win)
     await win.getByTestId('browser-agent-banner').waitFor()
     await waitFor(async () => pageState.result === 'MiniAgent')
     expect(pageState.userCookie).toBe('miniagent_user=secret')
@@ -500,7 +573,7 @@ describe('内置浏览器 P2 安全最小闭环', () => {
       const state = await win.evaluate(() => window.api.browser.state())
       return state.tabs.some((tab) => tab.kind === 'agent')
     })
-    await win.getByTestId('nav-browser').click()
+    await openBrowserPage(win)
     await win.getByTestId('browser-agent-banner').waitFor()
     await win.getByTestId('browser-takeover').click()
     await win.getByTestId('nav-chat').click()
@@ -526,7 +599,7 @@ describe('内置浏览器 P2 安全最小闭环', () => {
 describe('内置浏览器 P5 登录态与文件能力', () => {
   it('persists user login across restart, clears it and stores downloads in a dedicated directory', async () => {
     let { electronApp, win, mock, userData, consoleErrors } = ctx
-    await win.getByTestId('nav-browser').click()
+    await openBrowserPage(win)
     await win.getByTestId('browser-view').waitFor()
     await waitFor(
       async () => (await win.evaluate(() => window.api.browser.state())).tabs.length === 1
@@ -546,7 +619,7 @@ describe('内置浏览器 P5 登录态与文件能力', () => {
     ;({ electronApp, win, mock, consoleErrors } = ctx)
     await win.evaluate(() => window.api.settings.set('browserAllowPrivateNetwork', true))
 
-    await win.getByTestId('nav-browser').click()
+    await openBrowserPage(win)
     await win.getByTestId('browser-view').waitFor()
     await waitFor(
       async () => (await win.evaluate(() => window.api.browser.state())).tabs.length === 1
@@ -583,7 +656,7 @@ describe('内置浏览器 P6 韧性与可观测性', () => {
   it('blocks private navigation by default and the feature switch closes every tab', async () => {
     const { electronApp, win, consoleErrors } = ctx
     await win.evaluate(() => window.api.settings.set('browserAllowPrivateNetwork', false))
-    await win.getByTestId('nav-browser').click()
+    await openBrowserPage(win)
     await win.getByTestId('browser-view').waitFor()
     await waitFor(
       async () => (await win.evaluate(() => window.api.browser.state())).tabs.length === 1
@@ -634,7 +707,7 @@ describe('内置浏览器 P6 韧性与可观测性', () => {
 describe.skipIf(process.env.MINIAGENT_E2E_PUBLIC_BROWSER !== '1')('真实公网网站验收', () => {
   it('支持裸域名并打开常见公网网站', async () => {
     const { electronApp, win } = ctx
-    await win.getByTestId('nav-browser').click()
+    await openBrowserPage(win)
     await win.getByTestId('browser-view').waitFor()
     await waitFor(
       async () => (await win.evaluate(() => window.api.browser.state())).tabs.length === 1
@@ -642,6 +715,7 @@ describe.skipIf(process.env.MINIAGENT_E2E_PUBLIC_BROWSER !== '1')('真实公网�
 
     for (const [input, origin] of [
       ['example.com', 'https://example.com/'],
+      ['baidu.com', 'https://www.baidu.com/'],
       ['https://www.baidu.com/', 'https://www.baidu.com/']
     ]) {
       await win.getByTestId('browser-address').fill(input)
@@ -668,8 +742,8 @@ describe.skipIf(process.env.MINIAGENT_E2E_PUBLIC_BROWSER !== '1')('真实公网�
 })
 
 describe('聊天右侧内置浏览器侧栏', () => {
-  it('expands to the right, shrinks chat and coexists with the standalone browser view', async () => {
-    const { win, consoleErrors } = ctx
+  it('expands to the right by widening the window, keeps chat width and coexists with the standalone browser view', async () => {
+    const { electronApp, win, consoleErrors } = ctx
     await win.bringToFront()
     await win.getByTestId('nav-chat').click()
     await win.getByTestId('new-conv').click()
@@ -681,54 +755,27 @@ describe('聊天右侧内置浏览器侧栏', () => {
     await win.getByTestId('chat-browser-panel-toggle').click()
     await win.getByTestId('chat-browser-panel').waitFor()
     await win.getByTestId('browser-view').waitFor()
+    await win.getByTestId('browser-address').fill(pageUrl)
+    await win.getByTestId('browser-go').click()
+    await waitFor(async () =>
+      (await readGuestBody(electronApp, pageUrl))?.includes('内置浏览器测试页')
+    )
     await waitFor(async () => {
       const state = await win.evaluate(() => window.api.browser.state())
       return !!state.attachedTabId
     })
 
     const after = await win.getByTestId('chat-main').boundingBox()
-    const panelBefore = await win.getByTestId('chat-browser-panel').boundingBox()
-    expect(after.width).toBeLessThan(before.width)
+    // 展开时主窗口同步拓宽，会话区宽度保持不变
+    expect(Math.abs(after.width - before.width)).toBeLessThanOrEqual(2)
 
-    const divider = await win.getByTestId('chat-browser-divider').boundingBox()
-    expect(divider).toBeTruthy()
-    await win.mouse.move(divider.x + divider.width / 2, divider.y + divider.height / 2)
-    await win.mouse.down()
-    await win.mouse.move(divider.x - 70, divider.y + divider.height / 2, { steps: 8 })
-    await win.mouse.up()
-    await waitFor(
-      async () =>
-        (await win.getByTestId('chat-browser-panel').boundingBox()).width > panelBefore.width + 40
+    await win.getByTestId('browser-new-tab').click()
+    await win.getByTestId('browser-quick-standalone').click()
+    await win.getByTestId('browser-address').fill(pageUrl)
+    await win.getByTestId('browser-go').click()
+    await waitFor(async () =>
+      (await readGuestBody(electronApp, pageUrl))?.includes('内置浏览器测试页')
     )
-    await win.waitForTimeout(150)
-    const widened = await win.getByTestId('chat-main').boundingBox()
-    const widenedPanel = await win.getByTestId('chat-browser-panel').boundingBox()
-    expect(widened.width).toBeLessThan(after.width - 40)
-
-    const movedDivider = await win.getByTestId('chat-browser-divider').boundingBox()
-    await win.mouse.move(
-      movedDivider.x + movedDivider.width / 2,
-      movedDivider.y + movedDivider.height / 2
-    )
-    await win.mouse.down()
-    await win.mouse.move(movedDivider.x + 50, movedDivider.y + movedDivider.height / 2, {
-      steps: 6
-    })
-    await win.mouse.up()
-    await waitFor(async () => {
-      const panel = await win.getByTestId('chat-browser-panel').boundingBox()
-      return !!panel && panel.width < widenedPanel.width - 20
-    })
-    const narrowedPanel = await win.getByTestId('chat-browser-panel').boundingBox()
-
-    await win.getByTestId('chat-browser-divider').focus()
-    await win.keyboard.press('ArrowRight')
-    await waitFor(
-      async () =>
-        (await win.getByTestId('chat-browser-panel').boundingBox()).width > narrowedPanel.width + 8
-    )
-
-    await win.getByTestId('nav-browser').click()
     await waitFor(async () => {
       const state = await win.evaluate(() => window.api.browser.state())
       return !!state.attachedTabId

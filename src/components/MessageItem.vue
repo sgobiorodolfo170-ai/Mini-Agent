@@ -22,7 +22,6 @@ const streaming = computed(() => props.msg.status === 'streaming')
 const statusLabel = computed(
   () =>
     ({
-      streaming: '生成中…',
       pending: '排队中',
       transferred: '已移交',
       interrupted: '执行中断',
@@ -34,6 +33,8 @@ const statusLabel = computed(
 const kbRefs = computed(() => (props.msg.meta && props.msg.meta.kbRefs) || [])
 const warnings = computed(() => (props.msg.meta && props.msg.meta.warnings) || [])
 const atts = computed(() => props.msg.attachments || [])
+const imageAtts = computed(() => atts.value.filter((a) => a && a.type === 'image' && a.dataUrl))
+const textAtts = computed(() => atts.value.filter((a) => a && a.type === 'text' && a.content))
 
 async function copy() {
   try {
@@ -87,12 +88,27 @@ function onEditKeydown(e) {
     <div class="max-w-[85%] min-w-0 group" :class="isUser ? '' : 'max-w-full w-full'">
       <!-- attachments -->
       <div
-        v-if="atts.length"
+        v-if="textAtts.length"
+        class="flex w-full flex-col gap-1 mb-1"
+        :class="isUser ? 'items-end' : ''"
+      >
+        <div
+          v-for="(a, i) in textAtts"
+          :key="'text-' + i"
+          class="max-h-28 max-w-[85%] overflow-y-auto whitespace-pre-wrap rounded-lg border border-line-subtle bg-subtle/40 px-3 py-2 text-xs text-ink-secondary"
+          data-testid="message-text-attachment"
+        >
+          <span class="mb-0.5 block text-[11px] font-medium text-ink-muted">选中文字</span>
+          {{ a.content }}
+        </div>
+      </div>
+      <div
+        v-if="imageAtts.length"
         class="flex flex-wrap gap-2 mb-1"
         :class="isUser ? 'justify-end' : ''"
       >
         <img
-          v-for="(a, i) in atts.filter((x) => x.type === 'image')"
+          v-for="(a, i) in imageAtts"
           :key="i"
           :src="a.dataUrl"
           class="max-h-40 rounded-lg border border-line-control"
@@ -160,8 +176,16 @@ function onEditKeydown(e) {
           <button class="hover:text-ink-primary" @click="editing = false">取消</button>
         </template>
         <template v-else>
+          <!-- 回复生成中：状态环跟随消息展示在回复文本下方（替代「生成中…」文案） -->
           <span
-            v-if="statusLabel"
+            v-if="streaming"
+            class="shrink-0 self-center w-3.5 h-3.5 rounded-full border-2 border-line-subtle border-t-brand animate-spin"
+            role="img"
+            aria-label="生成中"
+            data-testid="message-generating"
+          />
+          <span
+            v-else-if="statusLabel"
             :class="msg.status === 'error' ? 'text-bad-ink' : 'text-hint-ink'"
           >
             {{ statusLabel }}
