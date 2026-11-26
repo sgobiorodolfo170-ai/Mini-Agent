@@ -3,9 +3,9 @@
 Windows 桌面个人 AI 助理（自用）：主窗口多会话对话 · 多 Key 管理 · 托盘/快捷唤起 · 划词 · 截屏问 AI · 本地知识库（RAG，支持本地离线嵌入） · 内置多标签浏览器与 Agent 接管 · Agent 工具调用、自动编排计划确认、任务依赖图、Worktree 隔离与断点恢复。
 
 - **技术栈**：Electron + Vue 3 + Vite + Pinia + Tailwind；主进程 Node.js，存储 SQLite（node:sqlite 内置模块），知识库向量检索 faiss-node（本地嵌入走 onnxruntime-node + BGE 中文模型，可一键下载；远程嵌入走 OpenAI 兼容 /embeddings），Key 用 safeStorage（DPAPI）加密。
-- **当前阶段**：首个 Dev 预发布 v0.1.0；当前工作区已实现 Agent 集群自动编排、计划确认、权限继承、共享目录写租约和完整关系面板。工作区质量：811 单测 / 80 文件、77 个非调试 mock E2E、覆盖率 74.26% / 71.72% / 77.70%。
+- **当前阶段**：Dev 预发布 v0.1.1：Agent 集群自动编排、计划确认、权限继承、共享目录写租约和完整关系面板已落地。质量基线：811 单测 / 80 文件、77 个非调试 mock E2E、覆盖率 74.26% / 71.72% / 77.70%。
 - **版号规则**：`v0.1.0` 是首个 Dev 发布基线；后续 Dev 小版本从 `0.1.1`、`0.1.2` 继续递增。此前的 `1.x` 仅作为内部迭代历史，不再作为当前发布版号。
-- **安装包**：GitHub Releases [`v0.1.0`](https://github.com/sgobiorodolfo170-ai/Mini-Agent/releases/tag/v0.1.0)（Dev 预发布，未签名）。电脑操作需要 .NET 10 Windows Desktop Runtime（本机已具备）。
+- **安装包**：GitHub Releases [`v0.1.1`](https://github.com/sgobiorodolfo170-ai/Mini-Agent/releases/tag/v0.1.1)（Dev 预发布，未签名）。电脑操作需要 .NET 10 Windows Desktop Runtime（本机已具备）。
 
 ## 文档索引
 
