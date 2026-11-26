@@ -2,6 +2,8 @@ node_modules
 out
 dist-app
 dist-app-new
+dist-app-cluster
+dist-icon-check
 build
 assets
 coverage

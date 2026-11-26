@@ -37,15 +37,18 @@ const { defineTools } = require('./tools')
 const { escalateRisk, redactToolArgs } = require('./guard')
 const { runAgentLoop } = require('./loop')
 const { readMemoryFile } = require('./memory')
-const { parseMcpServers } = require('./mcp-client')
+const { parseMcpServersDetailed } = require('./mcp-client')
+const runtimeLog = require('../runtime-log')
 const { getHub } = require('../events/hub')
 const { parseHooks, applyHooks } = require('../events/hooks')
-const { normalizeMandate, defaultSubMandate, authorizeToolCall } = require('./mandate')
+const { normalizeMandate, deriveSubMandate, authorizeToolCall } = require('./mandate')
+const { LIMITS, assertClusterEnabled } = require('./cluster-policy')
 const { createSessionBridge } = require('./session-bridge')
 const acceptance = require('./acceptance')
 const graph = require('./graph')
 const workspace = require('./workspace')
 const { createApprovalService } = require('../remote/approval-service')
+const planService = require('./plan-service')
 const { createRunControl } = require('../remote/run-control-service')
 const { isShuttingDown } = require('../lifecycle')
 const { getBrowser } = require('../browser')
@@ -167,6 +170,44 @@ function resolveAgentParams(settings, conv, provider, model) {
   return effectiveParams(globalPolicy, provider, model, legacyPolicy)
 }
 
+// 同一诊断 60 秒内只记一次；指纹仅含稳定元数据，绝不包含配置正文或 env。
+const mcpDiagnosticLogState = new Map()
+function reportMcpDiagnostics(diagnostics) {
+  if (!Array.isArray(diagnostics) || !diagnostics.length) return
+  const now = Date.now()
+  const fresh = diagnostics.filter((d) => {
+    const key = JSON.stringify([
+      d.code || '',
+      d.name || '',
+      Number.isInteger(d.index) ? d.index : null
+    ])
+    const last = mcpDiagnosticLogState.get(key)
+    if (Number.isFinite(last) && now - last < 60000) return false
+    mcpDiagnosticLogState.set(key, now)
+    return true
+  })
+  if (mcpDiagnosticLogState.size > 128) {
+    for (const key of mcpDiagnosticLogState.keys()) {
+      if (mcpDiagnosticLogState.size <= 128) break
+      mcpDiagnosticLogState.delete(key)
+    }
+  }
+  if (!fresh.length) return
+  try {
+    runtimeLog.getRuntimeLog().log('warn', 'agent.mcp', 'MCP 配置包含无效项，相关服务器不可用', {
+      diagnostics: fresh.slice(0, 20).map((d) => ({
+        code: d.code,
+        ...(d.name ? { name: String(d.name).slice(0, 120) } : {}),
+        reason: d.reason,
+        ...(Number.isInteger(d.index) ? { index: d.index } : {})
+      })),
+      total: diagnostics.length
+    })
+  } catch {
+    // 运行日志不可用不得影响 Agent 启动。
+  }
+}
+
 function summarize(toolName, args) {
   args = redactToolArgs(toolName, args)
   try {
@@ -183,7 +224,13 @@ function summarize(toolName, args) {
     if (toolName === 'update_todo') return `更新任务清单: ${args.action}`
     if (toolName === 'save_memory') return `保存记忆「${args.name}」`
     if (toolName === 'search_workspace_index') return `检索工作区索引「${args.query}」`
-    if (toolName === 'spawn_agent') return `派生子 Agent: ${String(args.goal || '').slice(0, 120)}`
+    if (toolName === 'spawn_agent')
+      return `派生子 Agent: ${String(args.goal || args.goals?.join('；') || '').slice(0, 120)}`
+    if (toolName === 'run_plan') return `创建 ${args.tasks?.length || 0} 节点任务计划`
+    if (toolName === 'run_plan_confirm')
+      return `确认任务计划 ${String(args.planId || '').slice(0, 12)}`
+    if (toolName === 'run_plan_reject')
+      return `拒绝任务计划 ${String(args.planId || '').slice(0, 12)}`
     if (toolName === 'session_create')
       return `创建子会话「${String(args.title || '').slice(0, 60)}」`
     if (toolName === 'session_send')
@@ -262,6 +309,9 @@ async function withKeyRetry(db, provider, fn) {
       return r
     } catch (e) {
       if (e && e.name === 'AbortError') throw e
+      // A bounded stream timeout is terminal for this call; rotating keys only
+      // repeats the same wait and delays the visible error state.
+      if (e && e.kind === 'timeout') throw e
       const kind = e instanceof GatewayError ? e.kind : 'network_error'
       lastErr = String((e && e.message) || e).slice(0, 300)
       repos.updateKeyStatus(
@@ -277,7 +327,7 @@ async function withKeyRetry(db, provider, fn) {
 
 // 沿 parent_run_id 链计算派生和移交的深度。
 // 集中在此处配置，禁止各模块硬编码不同值。
-const MAX_DELEGATION_DEPTH = 3
+const MAX_DELEGATION_DEPTH = LIMITS.delegationDepth
 
 function depthOfRun(db, runId) {
   let depth = 0
@@ -301,15 +351,22 @@ function assertCanDelegate(db, parentRunId, controlMode, count, { plan = false }
   if (!parent || parent.status !== 'running' || !state || state.stopped) {
     throw new Error('父任务当前不可派发')
   }
+  assertClusterEnabled(state.cluster)
   if (state.mandate && !state.mandate.canDelegate) throw new Error('父任务授权未包含派发权限')
   if (depthOfRun(db, parentRunId) >= MAX_DELEGATION_DEPTH) throw new Error('已达到任务派发深度上限')
-  if (plan) return { parent, state }
+  if (plan) {
+    const activeGraph = db
+      .prepare("SELECT 1 FROM run_graphs WHERE parent_run_id=? AND status='running' LIMIT 1")
+      .get(parentRunId)
+    if (activeGraph) throw new Error('父任务已有活动任务图')
+    return { parent, state }
+  }
   const children = repos
     .listChildRuns(db, parentRunId)
     .filter((child) => child.controlMode === 'delegated')
     .map((child) => followTransfer(db, child))
     .filter((child) => !repos.isRunTerminal(child.status))
-  const limit = controlMode === 'transferred' ? 0 : state.cluster ? 2 : 1
+  const limit = controlMode === 'transferred' ? 0 : LIMITS.directChildren
   if (children.length + (controlMode === 'transferred' ? 0 : count) > limit) {
     throw new Error('活动子任务超过并发上限')
   }
@@ -329,7 +386,15 @@ function publishRegistration(db, row) {
 
 function registerRuns(
   requests,
-  { parentRunId, controlMode, idempotencyKey, plan = false, retryOfRunId = null } = {}
+  {
+    parentRunId,
+    controlMode,
+    idempotencyKey,
+    plan = false,
+    retryOfRunId = null,
+    inTransaction = false,
+    deferEffects = false
+  } = {}
 ) {
   const db = dbm.get()
   if (isShuttingDown()) throw new Error('应用正在退出，无法开始新的智能任务')
@@ -345,7 +410,7 @@ function registerRuns(
     .digest('hex')
   const graphId = plan ? repos.uid() : null
   let transferParent
-  const rows = transaction(db, () => {
+  const register = () => {
     if (idempotencyKey) {
       const prev = db
         .prepare('SELECT * FROM run_dispatch_requests WHERE scope=? AND request_key=?')
@@ -424,23 +489,18 @@ function registerRuns(
       const { provider, model } = resolveModel(db, conversationId)
       if (!provider || !model) throw new Error('未配置模型服务或模型')
       const mandate = owner
-        ? defaultSubMandate(owner.state.mandate)
+        ? deriveSubMandate(owner.state.mandate, owner.state, request)
         : normalizeMandate(request.mandate)
-      if (owner && mandate) {
-        if (!owner.state.mandate) {
-          const dirs = owner.state.authorizedDirs || []
-          mandate.authorizedDirs = { read: [...dirs], write: [...dirs] }
-        } else if (owner.state.workspacePath) {
-          const read = [...new Set([...mandate.authorizedDirs.read, owner.state.workspacePath])]
-          const write = [...new Set([...mandate.authorizedDirs.write, owner.state.workspacePath])]
-          mandate.authorizedDirs = { read, write }
-        }
+      if (owner && mandate && owner.state.workspacePath) {
+        const read = [...new Set([...mandate.authorizedDirs.read, owner.state.workspacePath])]
+        const write = [...new Set([...mandate.authorizedDirs.write, owner.state.workspacePath])]
+        mandate.authorizedDirs = { read, write }
       }
       let permission =
         request.permission === 'readonly' || request.permission === 'full'
           ? request.permission
           : 'autonomous'
-      if (owner) permission = owner.state.permission === 'readonly' ? 'readonly' : 'autonomous'
+      if (owner) permission = owner.state.permission
       if (mandate?.permissionMode === 'readonly') permission = 'readonly'
       if (mandate && mandate.permissionMode !== 'full' && permission === 'full')
         permission = 'autonomous'
@@ -491,6 +551,10 @@ function registerRuns(
           model,
           permission,
           cluster: !!(owner ? owner.state.cluster : request.cluster),
+          workspacePolicy:
+            owner && owner.state.permission !== 'readonly' && conv.projectId
+              ? 'worktree'
+              : 'shared',
           projectId: conv.projectId,
           kbIds: [
             ...new Set(
@@ -569,11 +633,14 @@ function registerRuns(
         JSON.stringify(registered.map((row) => row.runId))
       )
     return registered
-  })
+  }
+  const rows = inTransaction ? register() : transaction(db, register)
   if (transferParent) transferParent.transferred = true
-  for (const row of rows) if (!row.reused) publishRegistration(db, row)
   if (plan) rows.graphId = (rows[0] && rows[0].graphId) || graphId
-  runQueue.schedule(db)
+  if (!deferEffects) {
+    for (const row of rows) if (!row.reused) publishRegistration(db, row)
+    runQueue.schedule(db)
+  }
   return rows
 }
 
@@ -587,6 +654,9 @@ async function startAgentRun({
   if (parentRunId && !['delegated', 'transferred'].includes(controlMode))
     throw new Error('非法任务关系')
   if (!parentRunId && controlMode) throw new Error('任务派生必须指定父任务')
+  if (request.cluster && !['autonomous', 'full'].includes(request.permission)) {
+    throw new Error('Agent 集群仅支持自主模式或完整权限')
+  }
   return registerRuns([request], {
     parentRunId: parentRunId || null,
     controlMode: controlMode || null,
@@ -595,22 +665,65 @@ async function startAgentRun({
   })[0]
 }
 
-function registerPlan(tasks, { parentRunId, idempotencyKey } = {}) {
-  const normalized = graph.validatePlan(tasks)
-  const requests = normalized.map((task) => ({
-    goal: task.goal,
-    key: task.key,
-    deps: task.deps,
-    conversationId: task.conversationId,
-    title: task.title
-  }))
-  const rows = registerRuns(requests, {
+function createDraftPlan(tasks, { parentRunId, idempotencyKey } = {}) {
+  const db = dbm.get()
+  const parent = repos.getRun(db, parentRunId)
+  if (!parent) throw remoteError('NOT_FOUND', '父任务不存在', 404)
+  const plan = planService.createDraft(db, {
     parentRunId,
-    controlMode: 'delegated',
-    idempotencyKey,
-    plan: true
+    conversationId: parent.conversationId,
+    tasks,
+    requestKey: idempotencyKey || null,
+    assertParent: () => assertCanDelegate(db, parentRunId, 'delegated', 0, { plan: true })
   })
-  return { graphId: rows.graphId || (rows[0] && rows[0].graphId) || null, runs: rows }
+  broadcast('agent:event', {
+    type: 'plan',
+    action: 'created',
+    parentRunId,
+    conversationId: plan.conversationId,
+    ...plan
+  })
+  getHub().emit('cluster.plan.created', plan)
+  return plan
+}
+
+function confirmDraftPlan({ planId, etag }) {
+  const db = dbm.get()
+  const draft = planService.getPlan(db, planId)
+  if (!draft) throw remoteError('NOT_FOUND', '计划不存在', 404)
+  const plan = planService.confirmPlan(db, {
+    planId,
+    etag,
+    assertParent: () => assertCanDelegate(db, draft.parentRunId, 'delegated', 0, { plan: true }),
+    commit: (tasks) =>
+      registerRuns(tasks, {
+        parentRunId: draft.parentRunId,
+        controlMode: 'delegated',
+        plan: true,
+        inTransaction: true,
+        deferEffects: true
+      })
+  })
+  for (const row of plan.result || []) publishRegistration(db, row)
+  runQueue.schedule(db)
+  broadcast('agent:event', { type: 'plan', action: 'confirmed', ...plan })
+  getHub().emit('cluster.plan.confirmed', plan)
+  return plan
+}
+
+function rejectDraftPlan({ planId, etag }) {
+  const plan = planService.rejectPlan(dbm.get(), { planId, etag })
+  broadcast('agent:event', { type: 'plan', action: 'rejected', ...plan })
+  getHub().emit('cluster.plan.rejected', plan)
+  return plan
+}
+
+function getDraftPlan(planId) {
+  return planService.getPlan(dbm.get(), planId)
+}
+
+function listDraftPlans(parentRunId) {
+  return planService.listPlans(dbm.get(), parentRunId)
 }
 
 function resolveGraphForParent(parentRunId) {
@@ -656,6 +769,9 @@ function createDynamicGraphNode(db, { graphId, parentRunId, key, goal }) {
   const ownerState = active.get(parentRunId)
   const parent = repos.getRun(db, parentRunId)
   if (!ownerState || ownerState.stopped || !parent) throw new Error('父任务运行状态不可用')
+  assertClusterEnabled(ownerState.cluster)
+  if (ownerState.mandate && !ownerState.mandate.canDelegate)
+    throw new Error('父任务授权未包含派发权限')
   const parentConversation = repos.getConversation(db, parent.conversationId)
   if (!parentConversation) throw new Error('父任务会话不存在')
   const conversation = repos.createConversation(db, {
@@ -670,22 +786,17 @@ function createDynamicGraphNode(db, { graphId, parentRunId, key, goal }) {
   })
   const { provider, model } = resolveModel(db, conversation.id)
   if (!provider || !model) throw new Error('未配置模型服务或模型')
-  const mandate = defaultSubMandate(ownerState.mandate)
-  if (mandate) {
-    if (!ownerState.mandate) {
-      const dirs = ownerState.authorizedDirs || []
-      mandate.authorizedDirs = { read: [...dirs], write: [...dirs] }
-    } else if (ownerState.workspacePath) {
-      mandate.authorizedDirs = {
-        read: [...new Set([...mandate.authorizedDirs.read, ownerState.workspacePath])],
-        write: [...new Set([...mandate.authorizedDirs.write, ownerState.workspacePath])]
-      }
+  const mandate = deriveSubMandate(ownerState.mandate, ownerState, {})
+  if (mandate && ownerState.workspacePath) {
+    mandate.authorizedDirs = {
+      read: [...new Set([...mandate.authorizedDirs.read, ownerState.workspacePath])],
+      write: [...new Set([...mandate.authorizedDirs.write, ownerState.workspacePath])]
     }
   }
   const permission =
     mandate?.permissionMode === 'readonly' || ownerState.permission === 'readonly'
       ? 'readonly'
-      : 'autonomous'
+      : ownerState.permission
   const settings = repos.getAllSettings(db)
   const maxSteps = Math.min(
     Number(settings.agentMaxSteps) || 15,
@@ -830,7 +941,13 @@ async function launchQueuedRunInner(db, runId) {
   let workspaceInfo = safeJson(run.workspaceJson)
   if (!workspaceInfo) {
     const project = conv.projectId ? repos.getProject(db, conv.projectId) : null
-    if (project && project.workspaceMode === 'worktree') {
+    const useWorktree =
+      project &&
+      (project.workspaceMode === 'worktree' ||
+        (!!run.parentRunId &&
+          spec.workspacePolicy === 'worktree' &&
+          spec.permission !== 'readonly'))
+    if (useWorktree) {
       try {
         const electron = require('electron')
         workspaceInfo = await workspace.prepare({
@@ -934,7 +1051,12 @@ async function launchQueuedRunInner(db, runId) {
     traceId: run.traceId,
     permission: spec.permission,
     cluster: spec.cluster,
+    workspacePolicy: spec.workspacePolicy || 'shared',
     maxSteps: run.maxSteps,
+    stepsUsed: checkpoint ? Number(checkpoint.stepsUsed) || 0 : 0,
+    phase: 'preparing',
+    step: checkpoint ? Number(checkpoint.step) || 0 : 0,
+    heartbeatAt: Date.now(),
     workspacePath: workspaceInfo && workspaceInfo.mode === 'worktree' ? workspaceInfo.path : null,
     authorizedDirs:
       workspaceInfo && workspaceInfo.mode === 'worktree'
@@ -1236,6 +1358,8 @@ async function doAgentRun({
     ...(settings.agentAuthorizedDirs || []),
     ...(worktreePath ? [worktreePath] : [])
   ]
+  const mcpConfig = parseMcpServersDetailed(settings.agentMcpServers)
+  reportMcpDiagnostics(mcpConfig.diagnostics)
   const ctx = {
     authorizedDirs,
     workingDir: worktreePath || resolveWorkingDir(db, conversationId, settings),
@@ -1246,7 +1370,8 @@ async function doAgentRun({
     browserFactory: (opts) => new electron.BrowserWindow(opts),
     browser: getBrowser() ? getBrowser().forRun(runId) : null,
     computer: computerFacade,
-    mcpServers: parseMcpServers(settings.agentMcpServers),
+    mcpServers: mcpConfig.servers,
+    mcpDiagnostics: mcpConfig.diagnostics,
     tavilyKey: settings.tavilyApiKey || '',
     webSearchProvider: settings.webSearchProvider || 'auto',
     searchWorkspaceIndex: conv?.projectId
@@ -1256,7 +1381,9 @@ async function doAgentRun({
     sessionRunId: runId,
     sessionConversationId: conversationId,
     sessionPermission: state.permission,
-    sessionCluster: state.cluster
+    sessionCluster: state.cluster,
+    cluster: state.cluster,
+    mandate: state.mandate
   }
   // 会话管理：子会话继承本运行的权限等级，不擅自提权。
   // 参数透传与目标会话归属校验集中在 session-bridge，便于单测覆盖。
@@ -1295,7 +1422,9 @@ async function doAgentRun({
       idempotencyKey: callId
     })
   ctx.runPlan = (opts, callId) =>
-    registerPlan(opts.tasks, { parentRunId: runId, idempotencyKey: callId })
+    createDraftPlan(opts.tasks, { parentRunId: runId, idempotencyKey: callId })
+  ctx.runPlanConfirm = (opts) => confirmDraftPlan(opts)
+  ctx.runPlanReject = (opts) => rejectDraftPlan(opts)
   ctx.runDispatch = (opts, callId) => dispatch('delegated', opts, callId)
   ctx.runTransfer = (opts, callId) => dispatch('transferred', opts, callId)
   ctx.runStatus = ({ runId: id }) => getRunStatus(db, ownChild(id).id)
@@ -1387,7 +1516,7 @@ async function doAgentRun({
       ? `\n\n知识库暂不可用：${knowledgeResult.warnings.join('；')}。可继续使用文件工具完成目标。`
       : ''
   const clusterNote = state.cluster
-    ? '\n\n当前已开启 Agent 集群：遇到可拆分的独立子任务时，请调用 spawn_agent 并行派出多个子 Agent 分别处理，最后由你汇总结果。'
+    ? '\n\n当前已开启 Agent 集群：遇到可拆分的独立子任务时，先调用 run_plan 创建计划草稿，向用户展示目标、依赖、权限和工作区策略，得到明确确认后再调用 run_plan_confirm。单个临时子任务可使用 spawn_agent 或 run_dispatch；完整移交使用 run_transfer。'
     : ''
   const permissionNote =
     state.permission === 'readonly'
@@ -1423,6 +1552,7 @@ async function doAgentRun({
   let finalContent = ''
   let stepsUsed = 0
   let status = 'done'
+  let failureReason = null
 
   // 旧流隔离：Run 仍是本进程内当前活动的那一个，且未被停止。
   // 被 stopRun / 移交 / 替换后，任何迟到回调都不得写入或广播。
@@ -1430,6 +1560,37 @@ async function doAgentRun({
     if (state.stopped || state.transferred) return false
     const cur = active.get(runId)
     return !!cur && cur === state
+  }
+
+  let lastHeartbeatKey = ''
+  let lastHeartbeatAt = 0
+  const heartbeat = (phase, step, extra = {}, force = true) => {
+    if (!isCurrentRun()) return
+    const nextStep = Math.max(0, Number(step) || 0)
+    state.phase = phase
+    state.step = nextStep
+    state.heartbeatAt = Date.now()
+    // Count an attempted model step immediately, not only after it returns.
+    if (nextStep > state.stepsUsed) {
+      // Heartbeats are observational: do not bump the CAS version used by
+      // pause/resume/stop requests while the model call is still in flight.
+      db.prepare('UPDATE agent_runs SET steps_used=? WHERE id=?').run(nextStep, runId)
+      state.stepsUsed = nextStep
+    }
+    const key = `${phase}:${nextStep}:${extra.tool || ''}`
+    const now = state.heartbeatAt
+    if (!force && key === lastHeartbeatKey && now - lastHeartbeatAt < 1000) return
+    lastHeartbeatKey = key
+    lastHeartbeatAt = now
+    const payload = {
+      phase,
+      step: nextStep,
+      stepsUsed: state.stepsUsed,
+      heartbeatAt: now,
+      ...extra
+    }
+    broadcast('agent:event', { type: 'heartbeat', runId, conversationId, ...payload })
+    getHub().emit('run.heartbeat', { runId, conversationId, ...payload })
   }
 
   // 迟到事件审计：只记一次每条 Run 的第一条，避免刷屏
@@ -1452,7 +1613,7 @@ async function doAgentRun({
 
   state.releaseSlot = () => runQueue.release(db, runId)
   state.acquireSlot = () => runQueue.acquire(db, runId, state.ac.signal)
-  const modelCallWith = (apiKey) => async (msgs) => {
+  const modelCallWith = (apiKey) => async (msgs, context) => {
     if (!(await getControlRuntime(db).runs.checkpoint(runId, state)))
       return { content: '', toolCalls: [], stopped: true }
     const payload = { model, messages: msgs, stream: true, tools: toolSchemas(tools) }
@@ -1467,6 +1628,7 @@ async function doAgentRun({
       { baseUrl: provider.base_url, apiKey, payload },
       {
         signal: state.ac.signal,
+        timeouts: settings.agentStreamTimeouts,
         onDelta: (d) => {
           // 旧流隔离（方案四 §5.3）：被取消/移交/替换的 Run 不得继续广播增量。
           // 迟到的 token 一律丢弃并记审计，不依赖 Renderer 过滤。
@@ -1480,6 +1642,7 @@ async function doAgentRun({
             msgId: assistantMsgId,
             delta: d
           })
+          heartbeat('model_streaming', context?.step || state.step, {}, false)
         }
       }
     )
@@ -1488,6 +1651,10 @@ async function doAgentRun({
   const decide = async ({ name, args, riskLevel }) => {
     const risk = escalateRisk(name, args, riskLevel)
     const safeArgs = redactToolArgs(name, args)
+    if (name === 'run_plan_confirm') {
+      const plan = planService.getPlan(db, args.planId)
+      if (plan) safeArgs.plan = plan.tasks
+    }
     // 每条返回路径都要写回 lastDecision，否则日志里的「确认方式」会沿用上一步的旧值
     const settle = (decision) => {
       lastDecision = { allowed: !!decision.allowed, confirmedBy: decision.confirmedBy }
@@ -1535,7 +1702,8 @@ async function doAgentRun({
     if (!(await getControlRuntime(db).runs.checkpoint(runId, state)))
       return settle({ allowed: false, confirmedBy: 'stopped' })
     // 命令与破坏性操作即使用户选择完整权限，也必须在每次调用前确认。
-    const alwaysConfirm = name === 'run_command' || risk === 'destructive'
+    const alwaysConfirm =
+      name === 'run_command' || name === 'run_plan_confirm' || risk === 'destructive'
     if (!alwaysConfirm && state.permission === 'full')
       return settle({ allowed: true, confirmedBy: 'permission:full' })
     if (!alwaysConfirm && risk === 'side_effect' && state.remember.has(name))
@@ -1642,6 +1810,12 @@ async function doAgentRun({
 
   ctx.spawnAgent = async ({ goal, goals }, callId) => {
     const list = goals?.length ? goals : [goal]
+    if (list.length > 1) {
+      return createDraftPlan(
+        list.map((item, index) => ({ key: `subtask-${index + 1}`, goal: item })),
+        { parentRunId: runId, idempotencyKey: callId }
+      )
+    }
     const rows = registerRuns(
       list.map((item) => ({ goal: item })),
       {
@@ -1674,16 +1848,22 @@ async function doAgentRun({
       execute,
       redactArgs: redactToolArgs,
       onEvent,
-      onCheckpoint: (snapshot) => saveCheckpoint(db, runId, snapshot)
+      onCheckpoint: (snapshot) => {
+        saveCheckpoint(db, runId, snapshot)
+        heartbeat(snapshot.phase, snapshot.step)
+      },
+      onHeartbeat: (snapshot) => heartbeat(snapshot.phase, snapshot.step, snapshot)
     })
     finalContent = lastAssistantContent(result.messages)
     stepsUsed = result.steps
     status = result.status === 'done' ? 'done' : result.status
   } catch (e) {
+    stepsUsed = Math.max(stepsUsed, state.stepsUsed || 0)
     if (e && e.name === 'AbortError') {
       status = 'stopped'
     } else {
       status = 'error'
+      failureReason = e && e.kind === 'timeout' ? 'model_timeout' : 'runner_error'
       finalContent =
         (finalContent ? finalContent + '\n\n' : '') +
         `> ⚠ Agent 出错：${String((e && e.message) || e)}`
@@ -1749,7 +1929,7 @@ async function doAgentRun({
       ? 'workspace_verification_failed'
       : artifactSealFailed
         ? 'artifact_seal_failed'
-        : state.stopReason,
+        : failureReason || state.stopReason,
     content: finalContent,
     stepsUsed,
     acceptanceStatus: acceptancePolicy && status === 'done' ? 'pending' : null
@@ -1901,6 +2081,7 @@ async function retryInterruptedRun(
     goal: `${original.goal}${recoveryNote}`,
     permission: spec.permission,
     cluster: spec.cluster,
+    workspacePolicy: spec.workspacePolicy || 'shared',
     acceptancePolicy: safeJson(original.acceptancePolicy),
     idempotencyKey,
     retryOfRunId: original.id
@@ -1940,14 +2121,36 @@ function resumeRun(runId, actor = 'desktop') {
   return getControlRuntime(dbm.get()).runs.request(runId, 'resume', actor)
 }
 
+function getQueueSnapshot() {
+  return runQueue.snapshot(dbm.get())
+}
+
 module.exports = {
   startAgentRun,
+  getQueueSnapshot,
+  createDraftPlan,
+  confirmDraftPlan,
+  rejectDraftPlan,
+  getDraftPlan,
+  listDraftPlans,
   getGraphForParent,
   getGraphLayoutForParent,
   saveGraphLayoutForParent,
   mutateRunGraph,
   resumeQueuedRuns,
-  getRunStatus: (id) => getRunStatus(dbm.get(), id),
+  getRunStatus: (id) => {
+    const run = getRunStatus(dbm.get(), id)
+    const state = active.get(id)
+    return state && !repos.isRunTerminal(run.status)
+      ? {
+          ...run,
+          phase: state.phase,
+          step: state.step,
+          stepsUsed: Math.max(run.stepsUsed || 0, state.stepsUsed || 0),
+          heartbeatAt: state.heartbeatAt
+        }
+      : run
+  },
   getRunResult: (id, maxChars) => getRunResult(dbm.get(), id, maxChars),
   respondConfirm,
   decideAcceptance,

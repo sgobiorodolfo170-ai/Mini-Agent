@@ -8,22 +8,52 @@ export const useAgentStore = defineStore('agent', {
     calls: [],
     confirms: [],
     graph: null,
+    plans: [],
+    queue: null,
     recovery: null
   }),
   getters: {
     activeRun(state) {
       return state.runs.find((r) => r.id === state.activeRunId) || null
+    },
+    runTree(state) {
+      const byParent = new Map()
+      for (const run of state.runs) {
+        const key = run.parent_run_id || run.parentRunId || run.trace_id || run.traceId || run.id
+        const list = byParent.get(key) || []
+        list.push(run)
+        byParent.set(key, list)
+      }
+      return byParent
     }
   },
   actions: {
     async loadRuns() {
       this.runs = await window.api.agent.runs()
+      if (window.api.agent.queue) this.queue = await window.api.agent.queue()
     },
     async select(id) {
       this.activeRunId = id
       this.calls = await window.api.agent.calls(id)
       await this.loadGraph(id)
+      await this.loadPlans(id)
       await this.loadRecovery(id)
+    },
+    async loadPlans(id) {
+      this.plans = window.api.agent.plans ? await window.api.agent.plans(id) : []
+      return this.plans
+    },
+    async confirmPlan(planId, etag) {
+      const plan = await window.api.agent.confirmPlan({ planId, etag })
+      await this.loadRuns()
+      await this.loadPlans(plan.parentRunId)
+      await this.loadGraph(plan.parentRunId)
+      return plan
+    },
+    async rejectPlan(planId, etag) {
+      const plan = await window.api.agent.rejectPlan({ planId, etag })
+      await this.loadPlans(plan.parentRunId)
+      return plan
     },
     async loadRecovery(id) {
       this.recovery = window.api.agent.recovery && id ? await window.api.agent.recovery(id) : null
@@ -88,8 +118,11 @@ export const useAgentStore = defineStore('agent', {
       })
     },
     handleEvent(ev) {
-      if (['queued', 'started', 'state', 'done', 'acceptance', 'workspace'].includes(ev.type))
+      if (
+        ['queued', 'started', 'state', 'done', 'acceptance', 'workspace', 'plan'].includes(ev.type)
+      )
         this.loadRuns()
+      if (ev.type === 'plan' && this.activeRunId) this.loadPlans(this.activeRunId)
       if (['state', 'done', 'acceptance', 'graph'].includes(ev.type) && this.activeRunId)
         this.loadGraph(this.activeRunId)
       if (ev.type === 'done' && this.activeRunId) this.loadRecovery(this.activeRunId)

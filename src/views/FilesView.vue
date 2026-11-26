@@ -135,11 +135,7 @@ onBeforeUnmount(() => {
         <div v-if="!roots.length" class="p-3 text-xs text-ink-muted">
           还没有项目工作目录，请先在「会话」页添加项目。
         </div>
-        <button
-          v-if="canGoUp"
-          class="list-row !min-h-[32px] text-xs"
-          @click="upDir"
-        >
+        <button v-if="canGoUp" class="list-row !min-h-[32px] text-xs" @click="upDir">
           <UiIcon name="chevronLeft" :size="14" class="shrink-0 text-ink-muted" />
           返回上级
         </button>

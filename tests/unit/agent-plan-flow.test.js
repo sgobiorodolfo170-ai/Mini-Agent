@@ -58,7 +58,26 @@ function tool(name, args, index = 0) {
   }
 }
 
+async function approvePlans() {
+  const approvals = agent.getApprovalService()
+  const original = approvals.decide.bind(approvals)
+  approvals.decide = (input) => {
+    const pending = original(input)
+    setImmediate(() => {
+      const row = dbm
+        .get()
+        .prepare(
+          "SELECT approval_id FROM agent_approvals WHERE run_id=? AND tool='run_plan_confirm' AND status='pending' ORDER BY created_at DESC LIMIT 1"
+        )
+        .get(input.runId)
+      if (row) approvals.respond({ approvalId: row.approval_id, decision: 'approved' })
+    })
+    return pending
+  }
+}
+
 it('runs a dependency graph in order and waits for the whole graph', async () => {
+  await approvePlans()
   const childGoals = []
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, opts) => {
     const { messages } = JSON.parse(opts.body)
@@ -85,6 +104,11 @@ it('runs a dependency graph in order and waits for the whole graph', async () =>
     }
     const output = JSON.parse(last.content)
     if (last.tool_call_id === 'call-run_plan') {
+      return response({
+        tool_calls: [tool('run_plan_confirm', { planId: output.planId, etag: output.etag })]
+      })
+    }
+    if (last.tool_call_id === 'call-run_plan_confirm') {
       return response({ tool_calls: [tool('run_wait', { graphId: output.graphId })] })
     }
     return response({ content: output.runs.map((r) => r.content).join(' / ') })
@@ -93,7 +117,8 @@ it('runs a dependency graph in order and waits for the whole graph', async () =>
   const parent = await agent.startAgentRun({
     conversationId,
     goal: '按顺序完成两个任务',
-    permission: 'full'
+    permission: 'full',
+    cluster: true
   })
   await expect
     .poll(() => agent.getRunResult(parent.runId), { timeout: 20000 })
@@ -110,6 +135,7 @@ it('runs a dependency graph in order and waits for the whole graph', async () =>
 })
 
 it('blocks downstream nodes when a dependency fails', async () => {
+  await approvePlans()
   const childGoals = []
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, opts) => {
     const { messages } = JSON.parse(opts.body)
@@ -136,6 +162,11 @@ it('blocks downstream nodes when a dependency fails', async () => {
     }
     const output = JSON.parse(last.content)
     if (last.tool_call_id === 'call-run_plan') {
+      return response({
+        tool_calls: [tool('run_plan_confirm', { planId: output.planId, etag: output.etag })]
+      })
+    }
+    if (last.tool_call_id === 'call-run_plan_confirm') {
       return response({ tool_calls: [tool('run_wait', { graphId: output.graphId })] })
     }
     return response({ content: '已处理失败依赖' })
@@ -144,7 +175,8 @@ it('blocks downstream nodes when a dependency fails', async () => {
   const parent = await agent.startAgentRun({
     conversationId,
     goal: '验证失败级联',
-    permission: 'full'
+    permission: 'full',
+    cluster: true
   })
   await expect
     .poll(() => agent.getRunResult(parent.runId), { timeout: 20000 })

@@ -5,9 +5,13 @@ import UiDialog from '../components/UiDialog.vue'
 import UiIcon from '../components/UiIcon.vue'
 import { useSettingsStore } from '../stores/settings'
 import { useUiStore } from '../stores/ui'
+import { useChatStore } from '../stores/chat'
+import { useProjectsStore } from '../stores/projects'
 
 const settings = useSettingsStore()
 const ui = useUiStore()
+const chat = useChatStore()
+const projects = useProjectsStore()
 
 const sections = [
   { key: 'model', label: '模型服务' },
@@ -33,6 +37,9 @@ const maxSteps = ref(15)
 const webSearchProvider = ref('auto')
 const tavilyApiKey = ref('')
 const mcpServersJson = ref('')
+const mcpDiagnostics = ref([])
+const mcpValidationError = ref('')
+let mcpSaveSequence = 0
 const hooksJson = ref('[]')
 const hookStages = ref(['session.send', 'run.start', 'run.end', 'tool.before', 'tool.after'])
 const hookActions = ref(['notify', 'log', 'block'])
@@ -42,17 +49,43 @@ const browserEnabled = ref(true)
 const browserAllowPrivateNetwork = ref(false)
 const computerEnabled = ref(false)
 
-function syncFromStore() {
+async function validateMcpConfiguration(raw) {
+  if (!window.api.settings || !window.api.settings.validateMcp) {
+    throw new Error('MCP 配置校验接口不可用')
+  }
+  const result = await window.api.settings.validateMcp(raw)
+  if (!result || !Array.isArray(result.diagnostics) || typeof result.valid !== 'boolean') {
+    throw new Error('MCP 配置校验结果无效')
+  }
+  return result
+}
+
+function showMcpDiagnostics(result) {
+  mcpDiagnostics.value = result.diagnostics
+  mcpValidationError.value = ''
+}
+
+async function syncFromStore() {
   hotkeys.value = { ...settings.hotkeys }
-  agentDirs.value = [...(settings.settings.agentAuthorizedDirs || [])]
+  agentDirs.value = uniqueAgentDirs(settings.settings.agentAuthorizedDirs)
   maxSteps.value = Number(settings.settings.agentMaxSteps) || 15
   webSearchProvider.value = settings.settings.webSearchProvider || 'auto'
   tavilyApiKey.value = settings.settings.tavilyApiKey || ''
-  mcpServersJson.value = settings.settings.agentMcpServers || ''
+  const raw = settings.settings.agentMcpServers
+  const text = raw == null ? '' : String(raw)
+  mcpServersJson.value = text
   browserEnabled.value = settings.settings.browserEnabled !== false
   browserAllowPrivateNetwork.value = settings.settings.browserAllowPrivateNetwork === true
   computerEnabled.value = settings.settings.computerUseEnabled === true
   syncHooks()
+  try {
+    const result = await validateMcpConfiguration(raw)
+    if (mcpServersJson.value === text) showMcpDiagnostics(result)
+  } catch (e) {
+    if (mcpServersJson.value === text) {
+      mcpValidationError.value = '已保存的 MCP 配置无法校验：' + String((e && e.message) || e)
+    }
+  }
 }
 
 // 钩子配置以 JSON 数组存于 settings.agentHooks；界面只做格式化展示与校验
@@ -362,15 +395,107 @@ async function saveHotkeys() {
 }
 
 // ---------- 智能任务安全 ----------
-async function addDir() {
-  const dir = await window.api.dialog.pickDir()
-  if (!dir) return
-  if (!agentDirs.value.includes(dir)) agentDirs.value.push(dir)
-  settings.set('agentAuthorizedDirs', [...agentDirs.value])
+const savingAgentDirs = ref(false)
+
+// 仅用于界面去重与状态提示；真实边界由主进程 guard 校验。
+function dirKey(value) {
+  const text = String(value || '')
+    .trim()
+    .replace(/\\/g, '/')
+  const prefix = text.startsWith('//')
+    ? '//'
+    : text.startsWith('/')
+      ? '/'
+      : /^[a-z]:/i.test(text)
+        ? text.slice(0, 2)
+        : ''
+  const parts = []
+  for (const part of text.slice(prefix.length).split('/')) {
+    if (!part || part === '.') continue
+    if (part === '..') {
+      if (parts.length && parts[parts.length - 1] !== '..') parts.pop()
+      else if (!prefix) parts.push(part)
+    } else parts.push(part)
+  }
+  return (prefix + parts.join('/')).toLowerCase()
 }
-function removeDir(d) {
-  agentDirs.value = agentDirs.value.filter((x) => x !== d)
-  settings.set('agentAuthorizedDirs', [...agentDirs.value])
+function uniqueAgentDirs(dirs) {
+  const seen = new Set()
+  return (Array.isArray(dirs) ? dirs : []).filter((d) => {
+    const key = dirKey(d)
+    if (!key || seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+// 与主进程 resolveWorkingDir 的项目优先级保持一致；都不配置时使用系统用户主目录。
+const currentWorkingDir = computed(() => {
+  const projectId = chat.activeConv && chat.activeConv.projectId
+  const project = projectId ? projects.byId(projectId) : null
+  return (project && project.path) || settings.settings.agentWorkingDir || ''
+})
+const workingDirLabel = computed(
+  () => currentWorkingDir.value || '系统用户主目录（未绑定项目，未配置 legacy 工作目录）'
+)
+const workingDirAuthorized = computed(() => {
+  const target = dirKey(currentWorkingDir.value)
+  return (
+    !!target &&
+    agentDirs.value.some((d) => {
+      const root = dirKey(d)
+      return target === root || target.startsWith(root + '/')
+    })
+  )
+})
+
+async function persistAgentDirs(next) {
+  if (savingAgentDirs.value) return false
+  const previous = [...agentDirs.value]
+  const previousSetting = settings.settings.agentAuthorizedDirs
+  const deduped = uniqueAgentDirs(next)
+  savingAgentDirs.value = true
+  agentDirs.value = deduped
+  try {
+    await settings.set('agentAuthorizedDirs', deduped)
+    return true
+  } catch (e) {
+    agentDirs.value = previous
+    settings.settings.agentAuthorizedDirs = previousSetting
+    ui.toast('授权目录保存失败：' + String((e && e.message) || e), 'error')
+    return false
+  } finally {
+    savingAgentDirs.value = false
+  }
+}
+async function addDir() {
+  if (savingAgentDirs.value) return
+  try {
+    const dir = await window.api.dialog.pickDir()
+    if (!dir) return
+    if (uniqueAgentDirs([...agentDirs.value, dir]).length === agentDirs.value.length) {
+      ui.toast('该目录已在有效授权列表中', 'info')
+      return
+    }
+    await persistAgentDirs([...agentDirs.value, dir])
+  } catch (e) {
+    ui.toast('选择目录失败：' + String((e && e.message) || e), 'error')
+  }
+}
+async function authorizeWorkingDir() {
+  if (!currentWorkingDir.value) {
+    ui.toast('请先为当前会话绑定项目并配置工作目录', 'warn')
+    return
+  }
+  if (workingDirAuthorized.value) {
+    ui.toast('当前工作目录已在有效授权范围内', 'info')
+    return
+  }
+  await persistAgentDirs([...agentDirs.value, currentWorkingDir.value])
+}
+async function removeDir(d) {
+  const removed = await persistAgentDirs(agentDirs.value.filter((x) => dirKey(x) !== dirKey(d)))
+  if (removed) ui.toast('已移除授权目录', 'success')
 }
 // 编辑即保存：普通字段直接落库
 function saveAgent() {
@@ -378,17 +503,42 @@ function saveAgent() {
   settings.set('webSearchProvider', webSearchProvider.value || 'auto')
   settings.set('tavilyApiKey', tavilyApiKey.value.trim() || null)
 }
-// MCP JSON 需先校验再落库，避免把非法 JSON 写入设置
-function saveMcpServers() {
+function mcpDiagnosticText(d) {
+  const codes = {
+    invalid_json: '非法 JSON',
+    invalid_root: '根配置无效',
+    invalid_name: '服务器名称无效',
+    invalid_entry: '服务器配置无效',
+    invalid_command: 'command 无效',
+    invalid_args: 'args 无效'
+  }
+  const target = d.name ? `服务器「${d.name}」：` : ''
+  const arg = Number.isInteger(d.index) ? `args[${d.index}] ` : ''
+  return `${codes[d.code] || d.code || '配置无效'}${target}${arg}${d.reason || ''}`
+}
+
+// 保存前统一走主进程详细校验；无效草稿保留在输入框中，但绝不落库。
+async function saveMcpServers() {
+  const sequence = ++mcpSaveSequence
+  const draft = mcpServersJson.value
+  const raw = draft.trim() || null
   try {
-    if (mcpServersJson.value.trim()) JSON.parse(mcpServersJson.value)
-    settings.set('agentMcpServers', mcpServersJson.value.trim() || null)
+    const result = await validateMcpConfiguration(raw)
+    if (sequence !== mcpSaveSequence || mcpServersJson.value !== draft) return
+    showMcpDiagnostics(result)
+    if (!result.valid) {
+      ui.toast('MCP 配置未保存，请修正下列诊断', 'error')
+      return
+    }
+    await settings.set('agentMcpServers', raw)
+    if (sequence === mcpSaveSequence) {
+      ui.toast(raw ? 'MCP 配置已保存' : 'MCP 配置已清空', 'success')
+    }
   } catch (e) {
-    ui.toast(
-      '保存失败：' +
-        (String(e.message || e).includes('JSON') ? 'MCP 配置不是合法 JSON' : e.message || e),
-      'error'
-    )
+    if (sequence === mcpSaveSequence && mcpServersJson.value === draft) {
+      mcpValidationError.value = 'MCP 配置校验或保存失败：' + String((e && e.message) || e)
+    }
+    ui.toast('MCP 配置未保存：' + String((e && e.message) || e), 'error')
   }
 }
 
@@ -580,6 +730,48 @@ const logStats = ref({ size: 0, bytes: 0, path: '', dir: '' })
 const logExpanded = ref({})
 let logTimer = null
 
+// persistence 由主进程提供脱敏健康元数据；healthy/disabled 不展示打扰性横幅。
+const logRecoveryNotice = ref(null)
+watch(
+  () => logStats.value && logStats.value.persistence,
+  (p, previous) => {
+    const recoveredAt = p && p.status === 'healthy' ? p.recoveredAt : null
+    if (recoveredAt && recoveredAt !== (previous && previous.recoveredAt)) {
+      logRecoveryNotice.value = recoveredAt
+    } else if (!p || p.status !== 'healthy' || recoveredAt === (previous && previous.recoveredAt)) {
+      logRecoveryNotice.value = null
+    }
+  }
+)
+const logPersistence = computed(() => {
+  const p = logStats.value && logStats.value.persistence
+  if (!p) return null
+  const recovered = p.status === 'recovered' || !!logRecoveryNotice.value
+  if (!recovered && !['degraded', 'error'].includes(p.status)) return null
+  const error = p.lastError
+    ? [
+        p.lastError.reason,
+        p.lastError.code ? `（${p.lastError.code}）` : '',
+        p.lastError.operation ? `操作：${p.lastError.operation}` : '',
+        p.lastError.at ? formatLogTime(p.lastError.at) : ''
+      ]
+        .filter(Boolean)
+        .join(' ')
+    : ''
+  return {
+    status: recovered ? 'recovered' : p.status,
+    title: recovered
+      ? '日志持久化已恢复'
+      : p.status === 'error'
+        ? '日志持久化错误'
+        : '日志持久化降级',
+    message: recovered
+      ? '历史日志文件已恢复写入，内存日志仍可正常查看。'
+      : '日志仍保留在内存中，但历史文件写入异常，请检查日志目录权限或磁盘空间。',
+    recentError: error ? `最近错误：${error}` : ''
+  }
+})
+
 const logLevelOptions = [
   { value: 'all', label: '全部' },
   { value: 'debug', label: '调试' },
@@ -728,7 +920,13 @@ async function clearLogs() {
   })
   if (!ok) return
   try {
-    await window.api.logs.clear()
+    const cleared = await window.api.logs.clear()
+    if (cleared !== true) {
+      // 失败时重新读取主进程，保留磁盘旧日志与真实健康状态，不能伪装成已清空。
+      await loadLogs()
+      ui.toast('清空失败：磁盘日志仍保留，请检查权限或磁盘空间', 'error')
+      return
+    }
     logExpanded.value = {}
     await loadLogs()
     ui.toast('运行日志已清空', 'success')
@@ -1213,30 +1411,75 @@ async function openLogFolder() {
           <section v-show="section === 'agent'" class="space-y-4">
             <h2 class="text-base font-semibold">智能任务安全</h2>
             <div class="space-y-3 max-w-2xl">
-              <div>
-                <span class="field-label">授权目录（智能任务文件工具的读写范围）</span>
-                <div class="flex flex-wrap gap-1.5 mt-1.5">
-                  <span
-                    v-for="d in agentDirs"
-                    :key="d"
-                    class="inline-flex items-center gap-1 px-2 h-8 rounded-lg bg-subtle text-xs"
-                  >
-                    <span class="truncate max-w-[300px]" :title="d">{{ d }}</span>
-                    <button
-                      class="icon-btn-sm !w-5 !h-5"
-                      :aria-label="'移除目录 ' + d"
-                      @click="removeDir(d)"
-                    >
-                      <UiIcon name="close" :size="12" />
-                    </button>
-                  </span>
-                  <button
-                    class="btn-compact border border-dashed border-line-control"
-                    @click="addDir"
-                  >
-                    + 添加目录
-                  </button>
+              <div class="card p-4 space-y-3" data-testid="agent-directory-security">
+                <div>
+                  <span class="field-label">当前工作目录（仅用于 run_command，不自动授权）</span>
+                  <p class="mt-1 text-sm font-mono break-all" data-testid="agent-working-dir">
+                    {{ workingDirLabel }}
+                  </p>
+                  <p class="field-help mt-1">
+                    默认没有任何文件授权。工作目录不会因为绑定项目或打开设置而自动加入授权范围。
+                  </p>
                 </div>
+                <div class="flex items-center gap-3 flex-wrap">
+                  <button
+                    class="btn-secondary"
+                    :disabled="savingAgentDirs || workingDirAuthorized"
+                    data-testid="agent-authorize-working-dir"
+                    @click="authorizeWorkingDir"
+                  >
+                    授权当前工作目录
+                  </button>
+                  <span
+                    class="text-xs"
+                    :class="workingDirAuthorized ? 'text-ok-ink' : 'text-warn-ink'"
+                    data-testid="agent-working-dir-status"
+                  >
+                    {{ workingDirAuthorized ? '已在有效授权范围内' : '未授权文件读写' }}
+                  </span>
+                </div>
+                <div class="border-t border-line-subtle pt-3">
+                  <span class="field-label">有效授权目录（文件工具读写范围）</span>
+                  <div class="flex flex-wrap gap-1.5 mt-1.5" data-testid="agent-authorized-dirs">
+                    <span
+                      v-for="d in agentDirs"
+                      :key="d"
+                      class="inline-flex items-center gap-1 px-2 h-8 rounded-lg bg-subtle text-xs"
+                      data-testid="agent-authorized-dir"
+                    >
+                      <span class="truncate max-w-[300px]" :title="d">{{ d }}</span>
+                      <button
+                        class="icon-btn-sm !w-5 !h-5"
+                        :disabled="savingAgentDirs"
+                        :aria-label="'移除目录 ' + d"
+                        @click="removeDir(d)"
+                      >
+                        <UiIcon name="close" :size="12" />
+                      </button>
+                    </span>
+                    <button
+                      class="btn-compact border border-dashed border-line-control"
+                      :disabled="savingAgentDirs"
+                      data-testid="agent-add-dir"
+                      @click="addDir"
+                    >
+                      + 添加目录
+                    </button>
+                    <span v-if="!agentDirs.length" class="text-xs text-warn-ink py-1">
+                      未授权任何目录
+                    </span>
+                  </div>
+                  <p class="field-help mt-1">
+                    授权包含子目录；保存失败会回滚。独立 Git
+                    工作区由任务系统单独加入，不属于当前工作目录的自动授权。
+                  </p>
+                </div>
+              </div>
+              <div
+                class="max-w-2xl rounded-lg border border-warn/40 bg-warn-soft p-3 text-xs text-warn-ink"
+              >
+                <strong>命令特权提示：</strong>run_command 不受上述目录 guard 限制，不属于文件沙箱；
+                它以当前 Windows 用户权限在工作目录执行，仍需逐次确认，可访问授权目录之外的文件。
               </div>
               <div class="max-w-md">
                 <label class="block">
@@ -1298,10 +1541,32 @@ async function openLogFolder() {
                 <textarea
                   v-model="mcpServersJson"
                   rows="3"
+                  data-testid="mcp-servers-json"
+                  :aria-invalid="!!mcpDiagnostics.length || !!mcpValidationError"
                   placeholder='例如: {"docs": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:/docs"]}}'
                   class="field-input font-mono text-xs"
                   @change="saveMcpServers"
                 ></textarea>
+                <span class="field-help mt-1 block">
+                  留空保存为 null（不配置 MCP）；非法 JSON、command 或 args 会阻止保存。
+                </span>
+                <div
+                  v-if="mcpDiagnostics.length"
+                  data-testid="mcp-diagnostics"
+                  class="mt-2 rounded-lg border border-bad/40 bg-bad-soft p-2 text-xs text-bad-ink"
+                  role="alert"
+                >
+                  <p v-for="(d, i) in mcpDiagnostics" :key="i" :data-code="d.code">
+                    {{ mcpDiagnosticText(d) }}
+                  </p>
+                </div>
+                <span
+                  v-if="mcpValidationError"
+                  data-testid="mcp-validation-error"
+                  class="field-help mt-1 block text-bad-ink"
+                  role="alert"
+                  >{{ mcpValidationError }}</span
+                >
               </label>
               <label class="block max-w-2xl">
                 <span class="field-label">生命周期钩子（JSON 数组，可选）</span>
@@ -1556,6 +1821,25 @@ async function openLogFolder() {
                   清空
                 </button>
               </div>
+            </div>
+
+            <div
+              v-if="logPersistence"
+              data-testid="log-persistence-health"
+              :data-status="logPersistence.status"
+              class="rounded-lg border p-3 text-xs"
+              :class="
+                logPersistence.status === 'recovered'
+                  ? 'border-hint/40 bg-hint text-hint-ink'
+                  : 'border-warn/40 bg-warn-soft text-warn-ink'
+              "
+              role="status"
+            >
+              <p class="font-medium">{{ logPersistence.title }}</p>
+              <p class="mt-1">{{ logPersistence.message }}</p>
+              <p v-if="logPersistence.recentError" class="mt-1" data-testid="log-persistence-error">
+                {{ logPersistence.recentError }}
+              </p>
             </div>
 
             <div class="card overflow-hidden">

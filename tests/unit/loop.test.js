@@ -100,6 +100,33 @@ describe('runAgentLoop', () => {
     expect(result.status).toBe('stopped')
   })
 
+  it('exposes phase and step before a model call can hang', async () => {
+    const heartbeats = []
+    const checkpoints = []
+    const result = await runAgentLoop({
+      messages: [],
+      toolMap,
+      modelCall: async (_msgs, context) => {
+        expect(heartbeats.at(-1)).toMatchObject({
+          phase: 'model_call',
+          step: 1,
+          stepsUsed: 1
+        })
+        expect(context).toMatchObject({ phase: 'model_call', step: 1, stepsUsed: 1 })
+        return { content: '完成', toolCalls: [] }
+      },
+      onHeartbeat: (snapshot) => heartbeats.push(snapshot),
+      onCheckpoint: (snapshot) => checkpoints.push(snapshot)
+    })
+    expect(result.status).toBe('done')
+    expect(checkpoints[0]).toMatchObject({ phase: 'before_model', step: 1, stepsUsed: 1 })
+    expect(heartbeats.map((entry) => entry.phase)).toEqual([
+      'before_model',
+      'model_call',
+      'model_done'
+    ])
+  })
+
   it('captures tool execution failures', async () => {
     const script = [
       { content: '', toolCalls: [toolCall('c1', 'echo', {})] },

@@ -144,10 +144,16 @@ describe('工具授权校验（§4.4）', () => {
   })
 
   it('高风险工具未显式授权时拒绝', () => {
-    const m = baseMandate({ allowedTools: null })
+    const m = baseMandate({ allowedTools: ['read_file'] })
     const r = authorizeToolCall({ toolName: 'run_command', args: { command: 'dir' }, mandate: m })
     expect(r.allowed).toBe(false)
-    expect(r.reason).toBe('high_risk_requires_explicit')
+    expect(r.reason).toBe('tool_not_allowed')
+  })
+
+  it('继承父权限的空允许列表表示不额外限制工具，仍由应用审批兜底', () => {
+    const m = baseMandate({ allowedTools: null })
+    const r = authorizeToolCall({ toolName: 'run_command', args: { command: 'dir' }, mandate: m })
+    expect(r.allowed).toBe(true)
   })
 
   it('readonly 模式下写类工具被拒绝，只读工具放行', () => {

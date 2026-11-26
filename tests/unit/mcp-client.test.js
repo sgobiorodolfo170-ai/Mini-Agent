@@ -8,6 +8,7 @@ import {
   createMcpClient,
   withMcpServer,
   parseMcpServers,
+  parseMcpServersDetailed,
   PROTOCOL_VERSION
 } from '../../electron/main/agent/mcp-client'
 
@@ -177,5 +178,117 @@ describe('parseMcpServers', () => {
 
   it('accepts already-parsed objects', () => {
     expect(parseMcpServers({ a: { command: 'x' } })).toEqual({ a: { command: 'x' } })
+  })
+
+  it('keeps the legacy truthy-command filtering behavior', () => {
+    const cfg = { command: 42, args: 'not-an-array' }
+    expect(parseMcpServers({ legacy: cfg })).toEqual({ legacy: cfg })
+  })
+})
+
+describe('parseMcpServersDetailed', () => {
+  it('treats null and blank input as unconfigured without diagnostics', () => {
+    for (const raw of [null, undefined, '', '  \n ']) {
+      expect(parseMcpServersDetailed(raw)).toEqual({
+        configured: false,
+        servers: {},
+        diagnostics: []
+      })
+    }
+  })
+
+  it('reports invalid JSON and invalid roots without echoing configuration content', () => {
+    const invalidJson = parseMcpServersDetailed('{"token":"sk-abcdefghijklmnop"')
+    expect(invalidJson).toEqual({
+      configured: true,
+      servers: {},
+      diagnostics: [{ code: 'invalid_json', reason: 'MCP 配置不是合法 JSON' }]
+    })
+    expect(JSON.stringify(invalidJson)).not.toContain('sk-')
+
+    for (const raw of ['[]', '42', 'false']) {
+      expect(parseMcpServersDetailed(raw).diagnostics).toEqual([
+        { code: 'invalid_root', reason: 'MCP 配置必须是服务器对象映射' }
+      ])
+    }
+  })
+
+  it('returns valid servers and itemized diagnostics for invalid entries', () => {
+    const result = parseMcpServersDetailed({
+      docs: { command: 'node', args: ['server.js'], env: { MODE: 'test' } },
+      noArgs: { command: 'node' },
+      missing: {},
+      scalar: 'node',
+      nullEntry: null,
+      arrayEntry: [],
+      emptyCommand: { command: '' },
+      blankCommand: { command: '   ' },
+      paddedCommand: { command: ' node' },
+      numericCommand: { command: 42 },
+      nulCommand: { command: 'node\0bad' },
+      stringArgs: { command: 'node', args: 'server.js' },
+      nullArgs: { command: 'node', args: null },
+      mixedArgs: { command: 'node', args: ['server.js', 1] },
+      nulArg: { command: 'node', args: ['server\0.js'] },
+      '': { command: 'node' }
+    })
+
+    expect(Object.keys(result.servers)).toEqual(['docs', 'noArgs'])
+    expect(result.servers.docs).toEqual({
+      command: 'node',
+      args: ['server.js'],
+      env: { MODE: 'test' }
+    })
+    expect(result.servers.noArgs.args).toEqual([])
+    expect(result.diagnostics).toEqual(
+      expect.arrayContaining([
+        { name: 'missing', code: 'invalid_command', reason: '缺少 command 启动命令' },
+        { name: 'scalar', code: 'invalid_entry', reason: '服务器配置必须是对象' },
+        { name: 'nullEntry', code: 'invalid_entry', reason: '服务器配置必须是对象' },
+        { name: 'arrayEntry', code: 'invalid_entry', reason: '服务器配置必须是对象' },
+        expect.objectContaining({ name: 'emptyCommand', code: 'invalid_command' }),
+        expect.objectContaining({ name: 'blankCommand', code: 'invalid_command' }),
+        expect.objectContaining({ name: 'paddedCommand', code: 'invalid_command' }),
+        expect.objectContaining({ name: 'numericCommand', code: 'invalid_command' }),
+        expect.objectContaining({ name: 'nulCommand', code: 'invalid_command' }),
+        { name: 'stringArgs', code: 'invalid_args', reason: 'args 必须是字符串数组' },
+        { name: 'nullArgs', code: 'invalid_args', reason: 'args 必须是字符串数组' },
+        {
+          name: 'mixedArgs',
+          code: 'invalid_args',
+          reason: 'args 的每一项必须是不含 NUL 字符的字符串',
+          index: 1
+        },
+        expect.objectContaining({ name: 'nulArg', code: 'invalid_args', index: 0 }),
+        { code: 'invalid_name', reason: '服务器名称不能为空或包含 NUL 字符' }
+      ])
+    )
+    expect(result.diagnostics).toHaveLength(14)
+  })
+
+  it('copies args and safely preserves special server names', () => {
+    const args = ['server.js']
+    const result = parseMcpServersDetailed({ docs: { command: 'node', args } })
+    args.push('changed.js')
+    expect(result.servers.docs.args).toEqual(['server.js'])
+
+    const special = parseMcpServersDetailed('{"__proto__":{"command":"node"}}')
+    expect(Object.keys(special.servers)).toEqual(['__proto__'])
+    expect(special.servers.__proto__.command).toBe('node')
+    expect({}.command).toBeUndefined()
+  })
+
+  it('rejects invalid launch configuration before calling spawnFn', async () => {
+    let spawned = false
+    const spawnFn = () => {
+      spawned = true
+      throw new Error('must not spawn')
+    }
+    const blank = createMcpClient({ command: '   ', spawnFn })
+    await expect(blank.initialize()).rejects.toThrow('command 必须是非空字符串')
+
+    const badArgs = createMcpClient({ command: 'node', args: 'server.js', spawnFn })
+    await expect(badArgs.initialize()).rejects.toThrow('args 必须是字符串数组')
+    expect(spawned).toBe(false)
   })
 })

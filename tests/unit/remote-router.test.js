@@ -82,6 +82,39 @@ describe('RemoteCommandRouter', () => {
     ).rejects.toThrow(/操作权限/)
   })
 
+  it('viewer 不能确认或拒绝集群计划，operator 可以确认自己的会话计划', async () => {
+    const runId = repos.createRun(db, { conversationId: conv.id, goal: 'root', status: 'running' })
+    const planId = `plan-${Math.random().toString(36).slice(2)}`
+    db.prepare(
+      `INSERT INTO cluster_plans(id,parent_run_id,conversation_id,status,spec_json,etag,created_at)
+       VALUES(?,?,?,'draft','[]','etag',?)`
+    ).run(planId, runId, conv.id, Date.now())
+    await expect(
+      router.execute(
+        { deviceId: device.device_id, role: 'viewer' },
+        cmd('agent.plan.confirm', { planId, etag: 'etag' }),
+        'tls'
+      )
+    ).rejects.toThrow(/操作权限/)
+    await expect(
+      router.execute(
+        { deviceId: device.device_id, role: 'operator' },
+        cmd('agent.plan.reject', { planId, etag: 'etag' }),
+        'tls'
+      )
+    ).resolves.toMatchObject({ status: 'accepted', plan: { status: 'rejected' } })
+  })
+
+  it('operator 不能以 readonly 权限开启远程集群', async () => {
+    await expect(
+      router.execute(
+        { deviceId: device.device_id, role: 'operator' },
+        cmd('agent.run.start', { goal: 'test', permission: 'readonly', cluster: true }),
+        'tls'
+      )
+    ).rejects.toThrow(/只读模式不可开启集群/)
+  })
+
   it('明文模式拒绝 Agent 启动', async () => {
     const authCtx = { deviceId: device.device_id, role: 'operator' }
     await expect(

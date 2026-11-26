@@ -775,7 +775,10 @@ function updateSelectionMenu() {
   selectionMenu.value = {
     visible: true,
     text: text.slice(0, 8000),
-    x: Math.max(12, Math.min(rect.left + rect.width / 2 - width / 2, window.innerWidth - width - 12)),
+    x: Math.max(
+      12,
+      Math.min(rect.left + rect.width / 2 - width / 2, window.innerWidth - width - 12)
+    ),
     y: Math.max(12, Math.min(rect.bottom + 8, window.innerHeight - 52))
   }
 }
@@ -1439,7 +1442,10 @@ function startBrowserResize(e) {
                   >
                     <span class="shrink-0 font-medium text-ink-secondary">选中文字</span>
                     <span class="min-w-0 flex-1 truncate text-ink-muted">{{ a.preview }}</span>
-                    <button class="shrink-0 text-link hover:underline" @click="removeTextAttachment(a.id)">
+                    <button
+                      class="shrink-0 text-link hover:underline"
+                      @click="removeTextAttachment(a.id)"
+                    >
                       移除
                     </button>
                   </div>

@@ -22,7 +22,8 @@ function buildMain() {
     settings: {
       get: (k) => inv('settings:get', k),
       set: (k, v) => inv('settings:set', k, v),
-      all: () => inv('settings:all')
+      all: () => inv('settings:all'),
+      validateMcp: (raw) => inv('settings:validateMcp', raw)
     },
     providers: {
       list: () => inv('providers:list'),
@@ -92,11 +93,16 @@ function buildMain() {
       respond: (o) => inv('agent:respond', o),
       acceptanceDecide: (o) => inv('agent:acceptance:decide', o),
       runs: () => inv('agent:runs'),
+      queue: () => inv('agent:queue'),
       calls: (runId) => inv('agent:calls', runId),
       graph: (runId) => inv('agent:graph', runId),
       graphLayout: (runId) => inv('agent:graph:layout:get', runId),
       saveGraphLayout: (o) => inv('agent:graph:layout:save', o),
-      mutateGraph: (o) => inv('agent:graph:mutate', o)
+      mutateGraph: (o) => inv('agent:graph:mutate', o),
+      plans: (runId) => inv('agent:plan:list', runId),
+      plan: (planId) => inv('agent:plan:get', planId),
+      confirmPlan: (o) => inv('agent:plan:confirm', o),
+      rejectPlan: (o) => inv('agent:plan:reject', o)
     },
     browser: {
       state: () => inv('browser:state'),

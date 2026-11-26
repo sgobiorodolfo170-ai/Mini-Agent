@@ -48,9 +48,35 @@ describe('任务图可视化与重规划', () => {
       return window.api.agent.run({
         conversationId: conversation.id,
         permission: 'full',
+        cluster: true,
         goal: '动态节点验收'
       })
     })
+    await expect
+      .poll(
+        () =>
+          win.evaluate(
+            (runId) =>
+              window.api.agent.runs().then((runs) => runs.find((run) => run.id === runId)?.status),
+            started.runId
+          ),
+        {
+          timeout: 15000
+        }
+      )
+      .toBe('running')
+    await expect
+      .poll(() => win.evaluate((runId) => window.api.agent.plans(runId), started.runId), {
+        timeout: 15000
+      })
+      .toMatchObject([{ status: 'draft' }])
+    const plans = await win.evaluate((runId) => window.api.agent.plans(runId), started.runId)
+    await win.evaluate(
+      (plan) => window.api.agent.confirmPlan({ planId: plan.planId, etag: plan.etag }),
+      plans[0]
+    )
+    await win.getByText('Agent 请求确认').waitFor({ timeout: 15000 })
+    await win.getByText('允许执行', { exact: true }).click()
     await expect
       .poll(() => win.evaluate((runId) => window.api.agent.graph(runId), started.runId), {
         timeout: 15000
@@ -101,7 +127,7 @@ describe('任务图可视化与重规划', () => {
     const { win, mock, consoleErrors } = ctx
     await setupProviderAndKey(win, mock.url, 'sk-good')
     mock.state.planRun = true
-    mock.state.planNodeDelayMs = 20000
+    mock.state.planNodeDelayMs = 12000
     await win.getByTestId('nav-chat').click()
     await win.getByTestId('new-conv').click()
     const started = await win.evaluate(async () => {
@@ -109,10 +135,36 @@ describe('任务图可视化与重规划', () => {
       return window.api.agent.run({
         conversationId: conversation.id,
         permission: 'full',
+        cluster: true,
         goal: '任务图验收'
       })
     })
 
+    await expect
+      .poll(
+        () =>
+          win.evaluate(
+            (runId) =>
+              window.api.agent.runs().then((runs) => runs.find((run) => run.id === runId)?.status),
+            started.runId
+          ),
+        {
+          timeout: 15000
+        }
+      )
+      .toBe('running')
+    await expect
+      .poll(() => win.evaluate((runId) => window.api.agent.plans(runId), started.runId), {
+        timeout: 15000
+      })
+      .toMatchObject([{ status: 'draft' }])
+    const plans = await win.evaluate((runId) => window.api.agent.plans(runId), started.runId)
+    await win.evaluate(
+      (plan) => window.api.agent.confirmPlan({ planId: plan.planId, etag: plan.etag }),
+      plans[0]
+    )
+    await win.getByText('Agent 请求确认').waitFor({ timeout: 15000 })
+    await win.getByText('允许执行', { exact: true }).click()
     await expect
       .poll(() => win.evaluate((runId) => window.api.agent.graph(runId), started.runId), {
         timeout: 15000

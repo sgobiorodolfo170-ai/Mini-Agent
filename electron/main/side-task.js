@@ -25,7 +25,8 @@ function transcriptOf(db, conversationId, maxChars) {
     .filter((m) => m && m.content && m.status !== 'error')
   const lines = rows.map((m) => `${m.role === 'user' ? '用户' : '助手'}：${String(m.content)}`)
   let text = lines.join('\n\n')
-  if (maxChars > 0 && text.length > maxChars) text = '（较早内容已省略）\n\n' + text.slice(-maxChars)
+  if (maxChars > 0 && text.length > maxChars)
+    text = '（较早内容已省略）\n\n' + text.slice(-maxChars)
   return text
 }
 
@@ -50,9 +51,7 @@ async function send({ id, conversationId, content, history, useContext } = {}) {
 
   const maxChars = Number(params.maxChars) || 12000
   const transcript =
-    useContext !== false && conversationId
-      ? transcriptOf(db, conversationId, maxChars)
-      : ''
+    useContext !== false && conversationId ? transcriptOf(db, conversationId, maxChars) : ''
   const system = [
     '你是主会话旁的临时助手，用来解读、释疑、探索或推演分支方案。',
     '临时会话的消息不会计入主会话上下文，也不会改动主会话。',

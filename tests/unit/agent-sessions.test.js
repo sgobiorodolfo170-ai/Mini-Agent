@@ -1,9 +1,17 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { createRequire } from 'node:module'
+import { tmpdir } from 'node:os'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import dbm from '../../electron/store/db'
 import repos from '../../electron/store/repos'
+import storage from '../../electron/store/run-storage'
 import { getHub, resetHub } from '../../electron/main/events/hub'
 import * as sessions from '../../electron/main/agent/sessions'
+import * as agent from '../../electron/main/agent'
+
+const require = createRequire(import.meta.url)
+const electronPath = require.resolve('electron')
+require('electron')
 
 // 会话管理通过 _setDeps 暴露依赖接缝，测试直接注入替身，
 // 不依赖打包器对 CJS require 的 mock 行为。
@@ -364,5 +372,112 @@ describe('session 状态与结果', () => {
     })
     expect(r.timedOut).toBe(true)
     expect(r.status).toBe('waiting_child')
+  })
+})
+
+describe('Agent 首流挂起', () => {
+  let originalElectron
+  let conversationId
+
+  beforeEach(() => {
+    originalElectron = require.cache[electronPath].exports
+    require.cache[electronPath].exports = { app: { getPath: () => tmpdir() } }
+    const db = dbm.get()
+    const providerId = repos.saveProvider(db, {
+      name: 'Mock',
+      baseUrl: 'https://mock/v1',
+      models: [{ id: 'm1' }]
+    })
+    repos.addKey(db, {
+      providerId,
+      label: 'key',
+      secretEnc: 'plain:' + Buffer.from('key').toString('base64')
+    })
+    conversationId = repos.createConversation(db, {
+      title: '挂起会话',
+      providerId,
+      model: 'm1'
+    }).id
+    // Avoid starting the independent title request in these stream tests.
+    repos.insertMessage(db, { conversationId, role: 'user', content: '历史消息' })
+  })
+
+  afterEach(async () => {
+    await agent.stopAllRuns()
+    dbm.close()
+    require.cache[electronPath].exports = originalElectron
+    vi.restoreAllMocks()
+  })
+
+  function hangFirstStream() {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => ({
+      ok: true,
+      status: 200,
+      body: (async function* () {
+        yield* []
+        await new Promise(() => {})
+      })()
+    }))
+  }
+
+  it('exposes heartbeat then reaches error on stream timeout', async () => {
+    hangFirstStream()
+    repos.setSetting(dbm.get(), 'agentStreamTimeouts', {
+      connectTimeoutMs: 0,
+      firstByteTimeoutMs: 40,
+      idleTimeoutMs: 0,
+      totalTimeoutMs: 0
+    })
+    const heartbeat = new Promise((resolve) => {
+      const off = getHub().on('run.heartbeat', (event) => {
+        if (event.payload.phase !== 'model_call') return
+        off()
+        resolve(event.payload)
+      })
+    })
+    const { runId, assistantMsgId } = await agent.startAgentRun({
+      conversationId,
+      goal: '首流挂起',
+      permission: 'full'
+    })
+    await expect(heartbeat).resolves.toMatchObject({
+      runId,
+      phase: 'model_call',
+      step: 1,
+      stepsUsed: 1
+    })
+    expect(storage.loadCheckpoint(dbm.get(), runId)).toMatchObject({
+      phase: 'before_model',
+      step: 1,
+      stepsUsed: 1
+    })
+    await expect
+      .poll(() => agent.getRunStatus(runId), { timeout: 2000 })
+      .toMatchObject({ status: 'error', finishedReason: 'model_timeout', stepsUsed: 1 })
+    expect(repos.getMessage(dbm.get(), assistantMsgId).status).toBe('error')
+    expect(storage.loadCheckpoint(dbm.get(), runId)).toBeNull()
+  })
+
+  it('external cancel of the same hung stream reaches stopped, not error', async () => {
+    hangFirstStream()
+    repos.setSetting(dbm.get(), 'agentStreamTimeouts', {
+      connectTimeoutMs: 0,
+      firstByteTimeoutMs: 5000,
+      idleTimeoutMs: 0,
+      totalTimeoutMs: 0
+    })
+    const { runId, assistantMsgId } = await agent.startAgentRun({
+      conversationId,
+      goal: '取消挂起流',
+      permission: 'full'
+    })
+    await expect
+      .poll(() => agent.getRunStatus(runId), { timeout: 2000 })
+      .toMatchObject({ status: 'running', phase: 'model_call', step: 1, stepsUsed: 1 })
+    expect(agent.stopRun(runId, 'user')).toBe(true)
+    await expect
+      .poll(() => agent.getRunStatus(runId), { timeout: 2000 })
+      .toMatchObject({ status: 'stopped', finishedReason: 'user', stepsUsed: 1 })
+    expect(repos.getMessage(dbm.get(), assistantMsgId).status).toBe('stopped')
   })
 })

@@ -1257,10 +1257,9 @@ function install() {
           const content = mockFiles.get(key)
           return { content, size: content.length, mtime: Date.now() }
         }
-        const content =
-          key.endsWith('package.json')
-            ? JSON.stringify({ name: 'miniagent', version: '1.5.0', private: true }, null, 2)
-            : `// 浏览器预览环境的模拟文件\n// ${key}\n\nexport const preview = true\n`
+        const content = key.endsWith('package.json')
+          ? JSON.stringify({ name: 'miniagent', version: '1.5.0', private: true }, null, 2)
+          : `// 浏览器预览环境的模拟文件\n// ${key}\n\nexport const preview = true\n`
         return { content, size: content.length, mtime: Date.now() }
       },
       write: async (arg, contentArg) => {
@@ -1360,7 +1359,11 @@ function install() {
           id: uid('tab'),
           kind: 'user',
           owner: 'user',
-          title: internal ? INTERNAL_TITLES[internal] || '内部页面' : raw === 'about:blank' ? '新标签页' : raw,
+          title: internal
+            ? INTERNAL_TITLES[internal] || '内部页面'
+            : raw === 'about:blank'
+              ? '新标签页'
+              : raw,
           url: raw,
           internal: internal || null,
           loading: false,

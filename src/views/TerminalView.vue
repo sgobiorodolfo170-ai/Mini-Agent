@@ -109,8 +109,13 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <section class="flex-1 min-w-0 flex flex-col m-3 chat-surface overflow-hidden" data-testid="terminal-view">
-    <header class="h-12 shrink-0 flex items-center gap-2 px-4 border-b border-line-subtle bg-surface">
+  <section
+    class="flex-1 min-w-0 flex flex-col m-3 chat-surface overflow-hidden"
+    data-testid="terminal-view"
+  >
+    <header
+      class="h-12 shrink-0 flex items-center gap-2 px-4 border-b border-line-subtle bg-surface"
+    >
       <UiIcon name="terminal" :size="17" class="text-brand-ink" />
       <span class="text-sm font-semibold shrink-0">终端</span>
       <select

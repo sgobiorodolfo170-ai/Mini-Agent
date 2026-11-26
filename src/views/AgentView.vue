@@ -112,6 +112,28 @@ const editingGoal = ref('')
 const editingDeps = ref([])
 const graphBusy = ref(false)
 const graphCanvasOpen = ref(true)
+const planBusy = ref(false)
+const draftPlans = computed(() => agent.plans.filter((plan) => plan.status === 'draft'))
+const childRuns = computed(() =>
+  agent.runs.filter((run) => (run.parent_run_id || run.parentRunId) === agent.activeRunId)
+)
+async function decidePlan(plan, confirm) {
+  if (planBusy.value) return
+  planBusy.value = true
+  try {
+    if (confirm) {
+      await agent.confirmPlan(plan.planId, plan.etag)
+      ui.toast('计划已确认，子任务开始排队', 'success')
+    } else {
+      await agent.rejectPlan(plan.planId, plan.etag)
+      ui.toast('计划已拒绝，未启动子任务', 'success')
+    }
+  } catch (e) {
+    ui.toast(String((e && e.message) || e), 'error')
+  } finally {
+    planBusy.value = false
+  }
+}
 function openGraphEditor(node) {
   if (!node.editable || !agent.graph || agent.graph.status !== 'running') return
   editingNodeId.value = node.runId
@@ -225,6 +247,10 @@ async function copyResult(c) {
         class="px-3 py-3 text-base font-semibold text-ink-primary border-b border-line-subtle bg-panel"
       >
         执行记录
+        <div v-if="agent.queue" class="px-3 pb-2 text-[11px] text-ink-muted">
+          执行槽 {{ agent.queue.activeSlots }}/{{ agent.queue.slotLimit }} · 排队
+          {{ agent.queue.queued }}
+        </div>
       </div>
       <div class="scroll-region flex-1 p-2 space-y-1 bg-panel">
         <div
@@ -273,6 +299,9 @@ async function copyResult(c) {
                 data-testid="run-control-mode"
               >
                 {{ controlModeLabel(agent.activeRun) }}
+              </span>
+              <span v-if="agent.activeRun.phase" class="badge bg-hint text-hint-ink">
+                {{ agent.activeRun.phase }} · {{ agent.activeRun.step || 0 }} 步
               </span>
               <span
                 v-if="agent.activeRun.graph_id"
@@ -329,6 +358,75 @@ async function copyResult(c) {
             停止执行
           </button>
         </header>
+
+        <div
+          v-if="childRuns.length"
+          class="shrink-0 px-5 py-3 bg-surface border-b border-line-subtle"
+          data-testid="run-children"
+        >
+          <div class="text-xs font-medium text-ink-secondary mb-2">
+            直属子任务（{{ childRuns.length }}）
+          </div>
+          <div class="flex gap-2 overflow-x-auto pb-1">
+            <button
+              v-for="child in childRuns"
+              :key="child.id"
+              class="shrink-0 rounded-lg border border-line-subtle px-3 py-2 text-left hover:bg-brand-soft"
+              @click="agent.select(child.id)"
+            >
+              <div class="text-xs font-medium max-w-48 truncate">{{ child.goal }}</div>
+              <div class="mt-1"><StatusBadge :status="child.status" /></div>
+            </button>
+          </div>
+        </div>
+
+        <div
+          v-for="plan in draftPlans"
+          :key="plan.planId"
+          class="shrink-0 px-5 py-3 bg-warn-soft border-b border-line-subtle"
+          data-testid="cluster-plan-preview"
+        >
+          <div class="flex items-center gap-2 mb-2">
+            <span class="text-sm font-medium text-ink-primary">Agent 集群计划待确认</span>
+            <span class="text-xs text-ink-muted"
+              >{{ plan.tasks.length }} 个节点 · 确认前不会执行</span
+            >
+          </div>
+          <ol class="space-y-1.5 max-h-48 overflow-auto">
+            <li
+              v-for="task in plan.tasks"
+              :key="task.key"
+              class="rounded-lg bg-panel px-3 py-2 text-xs"
+            >
+              <div class="font-medium text-ink-primary">{{ task.key }}</div>
+              <div class="text-ink-secondary break-words">{{ task.goal }}</div>
+              <div v-if="task.deps?.length" class="text-ink-muted mt-1">
+                依赖：{{ task.deps.join('、') }}
+              </div>
+            </li>
+          </ol>
+          <div class="flex items-center gap-2 mt-3">
+            <button
+              class="btn h-8 px-3 rounded-lg text-xs bg-brand text-white"
+              :disabled="planBusy"
+              data-testid="cluster-plan-confirm"
+              @click="decidePlan(plan, true)"
+            >
+              确认并执行
+            </button>
+            <button
+              class="btn-secondary h-8 px-3 rounded-lg text-xs"
+              :disabled="planBusy"
+              data-testid="cluster-plan-reject"
+              @click="decidePlan(plan, false)"
+            >
+              拒绝
+            </button>
+            <span class="text-xs text-ink-muted"
+              >子任务继承当前任务权限；命令与破坏性操作仍逐次审批。</span
+            >
+          </div>
+        </div>
 
         <div
           v-if="agent.activeRun.status === 'interrupted'"

@@ -63,9 +63,7 @@ async function send() {
   // 只发送选中文字、不写问题时给一个默认提问
   const content = text || (attachments.length ? '请解读选中的内容' : '')
   if (!content) return
-  const attachmentText = attachments
-    .map((a) => `[选中文字]\n${a.content}`)
-    .join('\n\n')
+  const attachmentText = attachments.map((a) => `[选中文字]\n${a.content}`).join('\n\n')
   const requestContent = attachmentText ? `${content}\n\n${attachmentText}` : content
   const id = 'side-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7)
   const history = messages.value
@@ -129,8 +127,13 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <section class="flex-1 min-w-0 flex flex-col m-3 chat-surface overflow-hidden" data-testid="side-task-view">
-    <header class="shrink-0 h-14 flex items-center gap-2 px-4 bg-surface border-b border-line-subtle">
+  <section
+    class="flex-1 min-w-0 flex flex-col m-3 chat-surface overflow-hidden"
+    data-testid="side-task-view"
+  >
+    <header
+      class="shrink-0 h-14 flex items-center gap-2 px-4 bg-surface border-b border-line-subtle"
+    >
       <UiIcon name="panelRight" :size="18" class="text-brand-ink shrink-0" />
       <div class="min-w-0 flex-1">
         <h1 class="text-sm font-semibold truncate">临时会话</h1>
@@ -159,10 +162,7 @@ onBeforeUnmount(() => {
 
     <div ref="scrollEl" class="flex-1 min-h-0 overflow-y-auto px-4 md:px-6 py-4 bg-surface">
       <div class="max-w-[840px] mx-auto w-full space-y-4">
-        <div
-          v-if="!messages.length"
-          class="rounded-2xl border border-line-subtle bg-subtle/40 p-4"
-        >
+        <div v-if="!messages.length" class="rounded-2xl border border-line-subtle bg-subtle/40 p-4">
           <h2 class="text-sm font-semibold text-ink-primary">临时子会话</h2>
           <p class="mt-1 text-xs text-ink-muted leading-relaxed">
             可以围绕主会话做解读、释疑、探索或分支推演；这里的对话不会写入主会话，也不会占用主会话上下文。

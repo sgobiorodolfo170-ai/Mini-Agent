@@ -65,15 +65,29 @@ describe('电脑操作', () => {
           { timeout: 15000 }
         )
         .toBe(true)
-      execFileSync(
-        'powershell.exe',
-        [
-          '-NoProfile',
-          '-Command',
-          `Add-Type -Namespace MiniAgentUia -Name Native -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);'; $p=Get-Process -Id ${processId}; [MiniAgentUia.Native]::SetForegroundWindow($p.MainWindowHandle) > $null`
-        ],
-        { encoding: 'utf8' }
-      )
+      // SetForegroundWindow alone can be rejected by Windows foreground locks.
+      // AppActivate targets the PID; attaching input threads is the fallback.
+      await expect
+        .poll(
+          async () => {
+            const activatedProcessId = Number(
+              execFileSync(
+                'powershell.exe',
+                [
+                  '-NoProfile',
+                  '-Command',
+                  `$ErrorActionPreference='Stop'; $p=Get-Process -Id ${processId}; $window=$p.MainWindowHandle; if ($window -eq 0) { throw 'Notepad window not found' }; $shell=New-Object -ComObject WScript.Shell; $shell.AppActivate(${processId}) > $null; Add-Type -Namespace MiniAgentUia -Name Native -MemberDefinition '[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId); [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach); [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow); [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);'; $foregroundProcessId=0; $foreground=[MiniAgentUia.Native]::GetForegroundWindow(); if ($foreground -eq 0 -or [MiniAgentUia.Native]::GetWindowThreadProcessId($foreground, [ref]$foregroundProcessId) -eq 0) { $foregroundProcessId=0 }; if ($foregroundProcessId -ne ${processId}) { $targetProcessId=0; $targetThreadId=[MiniAgentUia.Native]::GetWindowThreadProcessId($window, [ref]$targetProcessId); $foregroundThreadId=0; if ($foreground -ne 0) { $foregroundThreadId=[MiniAgentUia.Native]::GetWindowThreadProcessId($foreground, [ref]$foregroundProcessId) }; if ($targetThreadId -ne 0 -and $foregroundThreadId -ne 0 -and $targetThreadId -ne $foregroundThreadId -and [MiniAgentUia.Native]::AttachThreadInput($foregroundThreadId, $targetThreadId, $true)) { try { [MiniAgentUia.Native]::ShowWindow($window, 9) > $null; [MiniAgentUia.Native]::SetForegroundWindow($window) > $null } finally { [MiniAgentUia.Native]::AttachThreadInput($foregroundThreadId, $targetThreadId, $false) > $null } } }; Start-Sleep -Milliseconds 100; $foreground=[MiniAgentUia.Native]::GetForegroundWindow(); $foregroundProcessId=0; if ($foreground -eq 0 -or [MiniAgentUia.Native]::GetWindowThreadProcessId($foreground, [ref]$foregroundProcessId) -eq 0) { $foregroundProcessId=0 }; $foregroundProcessId`
+                ],
+                { encoding: 'utf8' }
+              )
+            )
+            if (activatedProcessId !== processId) return activatedProcessId
+            const foreground = await request({ command: 'foreground' })
+            return foreground.ok ? foreground.processId : 0
+          },
+          { timeout: 15000, interval: 250 }
+        )
+        .toBe(processId)
       const snapshot = await request({ command: 'snapshot', processId, maxNodes: 500 })
       expect(snapshot.ok).toBe(true)
       const editor = snapshot.elements.find(

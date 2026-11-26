@@ -14,9 +14,17 @@ const path = require('path')
 const LEVELS = ['debug', 'info', 'warn', 'error']
 const DEFAULT_MAX_ENTRIES = 800
 const DEFAULT_MAX_BYTES = 2 * 1024 * 1024
+const DEFAULT_DIAGNOSTIC_INTERVAL_MS = 60000
 const MAX_SCOPE = 80
 const MAX_MESSAGE = 4000
 const MAX_DATA = 12000
+const PERSISTENCE_REASONS = {
+  mkdir: '无法创建运行日志目录',
+  read: '无法读取运行日志历史',
+  append: '无法追加运行日志',
+  rotate: '无法轮转运行日志',
+  write: '无法清空运行日志文件'
+}
 
 function redact(text) {
   return String(text == null ? '' : text)
@@ -93,6 +101,7 @@ function createRuntimeLog({
   dir = null,
   maxEntries = DEFAULT_MAX_ENTRIES,
   maxBytes = DEFAULT_MAX_BYTES,
+  diagnosticIntervalMs = DEFAULT_DIAGNOSTIC_INTERVAL_MS,
   now = Date.now,
   fsImpl = fs
 } = {}) {
@@ -102,10 +111,86 @@ function createRuntimeLog({
   let seq = 0
   let dirReady = false
   let captureRestore = null
+  let persistenceFailed = false
+  let failureCount = 0
+  let consecutiveFailures = 0
+  let diagnosticsEmitted = 0
+  let diagnosticsSuppressed = 0
+  let lastDiagnosticAt = null
+  let lastError = null
+  let lastSuccessAt = null
+  let recoveredAt = null
+  // 轮转失败后，普通 append 仍会落盘，但不能证明轮转已恢复。
+  // 只有轮转及随后 append 均成功，或显式清空成功，才解除这一待恢复状态。
+  let rotationPending = false
 
   function nextId(at) {
     seq += 1
     return `${at}-${seq.toString(36)}`
+  }
+
+  function retain(entry) {
+    entries.push(entry)
+    while (entries.length > maxEntries) entries.shift()
+  }
+
+  function getPersistenceHealth() {
+    return {
+      enabled: Boolean(file),
+      status: !file ? 'disabled' : persistenceFailed ? 'degraded' : 'healthy',
+      lastError: lastError ? { ...lastError } : null,
+      lastSuccessAt,
+      recoveredAt,
+      failureCount,
+      consecutiveFailures,
+      diagnosticsEmitted,
+      diagnosticsSuppressed
+    }
+  }
+
+  function noteSuccess({ rotationRecovered = false } = {}) {
+    const at = now()
+    if (rotationRecovered) rotationPending = false
+    const recovered = persistenceFailed && !rotationPending
+    lastSuccessAt = at
+    if (!rotationPending) {
+      persistenceFailed = false
+      consecutiveFailures = 0
+      if (recovered) recoveredAt = at
+    }
+  }
+
+  function noteFailure(operation, error) {
+    const at = now()
+    const code =
+      error && typeof error.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(error.code)
+        ? error.code
+        : 'UNKNOWN'
+    const reason =
+      code === 'INVALID_JSONL'
+        ? '运行日志历史包含损坏行'
+        : PERSISTENCE_REASONS[operation] || '运行日志持久化失败'
+    persistenceFailed = true
+    failureCount += 1
+    consecutiveFailures += 1
+    lastError = { operation, code, reason, at }
+
+    // 首次失败必报，后续失败按时间限流；诊断只含操作与错误码，不带文件内容或异常原文。
+    if (lastDiagnosticAt == null || at - lastDiagnosticAt >= diagnosticIntervalMs) {
+      lastDiagnosticAt = at
+      diagnosticsEmitted += 1
+      retain(
+        normalizeEntry({
+          at,
+          level: 'error',
+          scope: 'runtime-log.persistence',
+          message: `运行日志持久化异常：${reason}`,
+          data: JSON.stringify({ operation, code })
+        })
+      )
+    } else {
+      diagnosticsSuppressed += 1
+    }
   }
 
   function normalizeEntry(raw) {
@@ -125,8 +210,10 @@ function createRuntimeLog({
     try {
       fsImpl.mkdirSync(dir, { recursive: true })
       dirReady = true
-    } catch {
+      noteSuccess()
+    } catch (error) {
       dirReady = false
+      noteFailure('mkdir', error)
     }
     return dirReady
   }
@@ -138,43 +225,58 @@ function createRuntimeLog({
       const raw = fsImpl.readFileSync(file, 'utf8')
       bytes = Buffer.byteLength(raw, 'utf8')
       const lines = raw.split(/\r?\n/)
+      let damagedLines = 0
       for (const line of lines.slice(-maxEntries)) {
         if (!line.trim()) continue
         try {
           entries.push(normalizeEntry(JSON.parse(line)))
         } catch {
-          // 跳过损坏行，保证单行损坏不影响其余历史
+          // 跳过损坏行，保证单行损坏不影响其余历史；诊断不携带行内容。
+          damagedLines += 1
         }
       }
-    } catch {
-      // 读取失败时以内存日志继续运行
+      if (damagedLines) noteFailure('read', { code: 'INVALID_JSONL' })
+      else noteSuccess()
+    } catch (error) {
+      // 读取失败时以内存日志继续运行。
+      noteFailure('read', error)
     }
   }
 
   function rotate() {
-    if (!file || !ensureDir()) return
+    if (!file || !ensureDir()) return false
     try {
       const backup = file + '.1'
       if (fsImpl.existsSync(backup)) fsImpl.unlinkSync(backup)
       if (fsImpl.existsSync(file)) fsImpl.renameSync(file, backup)
       bytes = 0
-    } catch {
-      // 轮转失败时继续追加，文件变大也不会影响功能
+      return true
+    } catch (error) {
+      // 轮转失败时继续追加，文件变大也不会影响功能。
+      rotationPending = true
+      noteFailure('rotate', error)
+      return false
     }
   }
 
   function append(entry) {
-    entries.push(entry)
-    while (entries.length > maxEntries) entries.shift()
+    retain(entry)
     if (!file || !ensureDir()) return
     try {
       const line = JSON.stringify(entry) + '\n'
       const size = Buffer.byteLength(line, 'utf8')
-      if (bytes + size > maxBytes) rotate()
+      let rotated = false
+      if (bytes + size > maxBytes) {
+        rotated = rotate()
+        // 一次完整轮转还必须包含对新活动文件的 append 成功。
+        if (rotated) rotationPending = true
+      }
       fsImpl.appendFileSync(file, line, 'utf8')
       bytes += size
-    } catch {
-      // 持久化失败不阻塞业务
+      noteSuccess({ rotationRecovered: rotated })
+    } catch (error) {
+      // 持久化失败不阻塞业务，内存条目已保留。
+      noteFailure('append', error)
     }
   }
 
@@ -227,18 +329,26 @@ function createRuntimeLog({
       bytes,
       path: file || '',
       dir: dir || '',
-      maxEntries
+      maxEntries,
+      persistence: getPersistenceHealth()
     }
   }
 
   function clear() {
-    entries.length = 0
-    if (!file || !ensureDir()) return true
+    if (!file) {
+      entries.length = 0
+      return true
+    }
+    if (!ensureDir()) return false
     try {
       fsImpl.writeFileSync(file, '', 'utf8')
+      entries.length = 0
       bytes = 0
+      // 显式清空成功也会建立全新的活动文件，等价于持久化恢复边界。
+      noteSuccess({ rotationRecovered: true })
       return true
-    } catch {
+    } catch (error) {
+      noteFailure('write', error)
       return false
     }
   }
@@ -279,6 +389,7 @@ function createRuntimeLog({
     event,
     list,
     stats,
+    getPersistenceHealth,
     clear,
     installConsoleCapture,
     dispose,

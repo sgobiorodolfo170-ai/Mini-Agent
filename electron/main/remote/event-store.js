@@ -221,6 +221,20 @@ class RemoteEventStore {
           status: p.status || p.type
         }
       })
+    } else if (channel === 'agent:event' && p.type === 'plan') {
+      this.record({
+        type: 'cluster.plan.changed',
+        conversationId: cid,
+        runId: p.parentRunId,
+        payload: {
+          planId: p.planId,
+          status: p.status,
+          action: p.action,
+          graphId: p.graphId,
+          etag: p.etag,
+          tasks: p.tasks
+        }
+      })
     } else if (
       channel === 'agent:event' &&
       [

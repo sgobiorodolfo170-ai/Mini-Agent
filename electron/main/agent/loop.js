@@ -19,6 +19,7 @@ async function runAgentLoop({
   redactArgs = (_name, args) => args,
   onEvent,
   onCheckpoint,
+  onHeartbeat,
   isStopped,
   isTransferred
 }) {
@@ -26,6 +27,9 @@ async function runAgentLoop({
   let steps = initialSteps
   let status = 'done'
   let endedWithToolCalls = false
+  const heartbeat = (phase, extra = {}) => {
+    if (onHeartbeat) onHeartbeat({ phase, step: steps, stepsUsed: steps, ...extra })
+  }
 
   loop: while (steps < maxSteps) {
     if (isStopped && isStopped()) {
@@ -33,6 +37,7 @@ async function runAgentLoop({
       break
     }
     steps++
+    heartbeat('before_model')
     if (onCheckpoint) {
       await onCheckpoint({
         phase: 'before_model',
@@ -42,11 +47,13 @@ async function runAgentLoop({
         stepsUsed: steps
       })
     }
-    const resp = await modelCall(msgs)
+    heartbeat('model_call')
+    const resp = await modelCall(msgs, { phase: 'model_call', step: steps, stepsUsed: steps })
     if (resp?.stopped || isStopped?.()) {
       status = 'stopped'
       break
     }
+    heartbeat('model_done')
     const toolCalls = (resp && resp.toolCalls) || []
     if (resp && resp.content) {
       msgs.push({
@@ -84,6 +91,7 @@ async function runAgentLoop({
       const args = safeParseJson((tc.function && tc.function.arguments) || '{}') || {}
       const tool = toolMap[name]
       const riskLevel = tool ? tool.risk : 'readonly'
+      heartbeat('tool_decide', { tool: name })
       let allowed = true
       let decision = null
       if (decide) {
@@ -101,6 +109,7 @@ async function runAgentLoop({
         ok = false
         resultText = (decision && decision.denyMessage) || '用户拒绝执行该操作'
       } else {
+        heartbeat('tool_execute', { tool: name })
         try {
           const r = await execute(tool, args, tc.id)
           resultText = typeof r === 'string' ? r : JSON.stringify(r)
@@ -112,6 +121,7 @@ async function runAgentLoop({
       if (resultText && resultText.length > 20000)
         resultText = resultText.slice(0, 20000) + '…(截断)'
       if (onEvent) onEvent('tool-done', { name, ok, result: resultText })
+      heartbeat('tool_done', { tool: name, ok })
       msgs.push({ role: 'tool', tool_call_id: tc.id || name, content: resultText })
       if (onCheckpoint) {
         await onCheckpoint({

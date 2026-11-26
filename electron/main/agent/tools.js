@@ -1,13 +1,13 @@
 const fs = require('fs')
-const fsp = fs.promises
 const path = require('path')
 const { execFile } = require('child_process')
-const { assertAllowed } = require('./guard')
+const { assertAllowed, readFileAllowed, writeFileAllowed, updateFileAllowed } = require('./guard')
 const { webSearch } = require('./web-search')
 const { createBrowserSession } = require('./browser-session')
 const { withMcpServer } = require('./mcp-client')
 const { upsertMemoryFile } = require('./memory')
 const { processRegistry } = require('../lifecycle')
+const { filterTools } = require('./cluster-policy')
 
 function htmlToText(html) {
   return String(html)
@@ -54,7 +54,7 @@ function runPowerShell(command, cwd, timeoutMs = 60000) {
 // ctx: { authorizedDirs, workingDir, clipboard, shell, todo, spawnAgent, memoryPath,
 //        browserFactory, mcpServers, tavilyKey, webSearchProvider }
 function defineTools(ctx) {
-  return [
+  const tools = [
     {
       name: 'list_dir',
       risk: 'readonly',
@@ -65,8 +65,8 @@ function defineTools(ctx) {
         required: ['path']
       },
       handler: async ({ path: p }) => {
-        assertAllowed(ctx.authorizedDirs, p)
-        const es = await fsp.readdir(p, { withFileTypes: true })
+        const realPath = assertAllowed(ctx.authorizedDirs, p)
+        const es = fs.readdirSync(realPath, { withFileTypes: true })
         return (
           es
             .slice(0, 200)
@@ -85,9 +85,8 @@ function defineTools(ctx) {
         required: ['path']
       },
       handler: async ({ path: p }) => {
-        assertAllowed(ctx.authorizedDirs, p)
-        const buf = await fsp.readFile(p)
-        if (buf.length > 2 * 1024 * 1024) return '文件过大(>2MB)，拒绝读取'
+        const buf = readFileAllowed(ctx.authorizedDirs, p, 2 * 1024 * 1024)
+        if (!buf) return '文件过大(>2MB)，拒绝读取'
         return buf.toString('utf8').slice(0, 20000)
       }
     },
@@ -104,23 +103,23 @@ function defineTools(ctx) {
         required: ['dir', 'pattern']
       },
       handler: async ({ dir, pattern }) => {
-        assertAllowed(ctx.authorizedDirs, dir)
         const out = []
-        async function walk(d, depth) {
+        function walk(d, depth) {
           if (out.length >= 100 || depth > 6) return
+          const realDir = assertAllowed(ctx.authorizedDirs, d)
           let es
           try {
-            es = await fsp.readdir(d, { withFileTypes: true })
+            es = fs.readdirSync(realDir, { withFileTypes: true })
           } catch {
             return
           }
           for (const e of es) {
             const fp = path.join(d, e.name)
-            if (e.isDirectory()) await walk(fp, depth + 1)
+            if (e.isDirectory()) walk(fp, depth + 1)
             else if (e.name.toLowerCase().includes(String(pattern).toLowerCase())) out.push(fp)
           }
         }
-        await walk(dir, 0)
+        walk(dir, 0)
         return out.join('\n') || '(无匹配)'
       }
     },
@@ -137,9 +136,7 @@ function defineTools(ctx) {
         required: ['path', 'content']
       },
       handler: async ({ path: p, content }) => {
-        assertAllowed(ctx.authorizedDirs, p)
-        await fsp.mkdir(path.dirname(p), { recursive: true })
-        await fsp.writeFile(p, String(content == null ? '' : content), 'utf8')
+        writeFileAllowed(ctx.authorizedDirs, p, String(content == null ? '' : content))
         return `已写入 ${String(content == null ? '' : content).length} 字符到 ${p}`
       }
     },
@@ -192,20 +189,21 @@ function defineTools(ctx) {
         required: ['path', 'oldText', 'newText']
       },
       handler: async ({ path: p, oldText, newText, replaceAll }) => {
-        assertAllowed(ctx.authorizedDirs, p)
         if (!oldText) throw new Error('oldText 不能为空')
-        const s = await fsp.readFile(p, 'utf8')
-        const count = s.split(oldText).length - 1
-        if (!count) throw new Error('未找到要替换的文本（oldText 与文件内容不一致）')
-        if (!replaceAll && count > 1)
-          throw new Error(
-            `oldText 在文件中出现 ${count} 次：请扩大上下文唯一定位，或设置 replaceAll=true`
-          )
-        const out = replaceAll
-          ? s.split(oldText).join(String(newText))
-          : s.replace(oldText, String(newText))
-        await fsp.writeFile(p, out, 'utf8')
-        return `已替换 ${replaceAll ? count : 1} 处: ${p}`
+        let replaced = 0
+        updateFileAllowed(ctx.authorizedDirs, p, (s) => {
+          const count = s.split(oldText).length - 1
+          if (!count) throw new Error('未找到要替换的文本（oldText 与文件内容不一致）')
+          if (!replaceAll && count > 1)
+            throw new Error(
+              `oldText 在文件中出现 ${count} 次：请扩大上下文唯一定位，或设置 replaceAll=true`
+            )
+          replaced = replaceAll ? count : 1
+          return replaceAll
+            ? s.split(oldText).join(String(newText))
+            : s.replace(oldText, String(newText))
+        })
+        return `已替换 ${replaced} 处: ${p}`
       }
     },
     {
@@ -236,11 +234,12 @@ function defineTools(ctx) {
         }
         const needle = String(pattern).toLowerCase()
         const hits = []
-        async function walk(d, depth) {
+        function walk(d, depth) {
           if (hits.length >= 50 || depth > 6) return
+          const realDir = assertAllowed(ctx.authorizedDirs, d)
           let es
           try {
-            es = await fsp.readdir(d, { withFileTypes: true })
+            es = fs.readdirSync(realDir, { withFileTypes: true })
           } catch {
             return
           }
@@ -248,13 +247,13 @@ function defineTools(ctx) {
             if (hits.length >= 50) return
             const fp = path.join(d, e.name)
             if (e.isDirectory()) {
-              await walk(fp, depth + 1)
+              walk(fp, depth + 1)
               continue
             }
             try {
-              const st = await fsp.stat(fp)
-              if (st.size > 1024 * 1024) continue
-              const buf = await fsp.readFile(fp)
+              // 校验、打开、身份复核和读取都在同一同步调用内，句柄不跟随后续换链。
+              const buf = readFileAllowed(ctx.authorizedDirs, fp, 1024 * 1024)
+              if (!buf) continue
               if (buf.includes(0)) continue // 二进制文件跳过
               const lines = buf.toString('utf8').split('\n')
               for (let i = 0; i < lines.length && hits.length < 50; i++) {
@@ -267,7 +266,7 @@ function defineTools(ctx) {
             }
           }
         }
-        await walk(dir, 0)
+        walk(dir, 0)
         return hits.join('\n') || '(无匹配)'
       }
     },
@@ -417,8 +416,8 @@ function defineTools(ctx) {
       ],
       [
         'run_plan',
-        'side_effect',
-        '按依赖图派发多个子任务；节点只在依赖成功后启动。用于有先后顺序的流水线。',
+        'readonly',
+        '将任务拆解为依赖图草稿，不执行任何子任务。返回 planId 与 etag，用户确认后再调用 run_plan_confirm。',
         {
           tasks: {
             type: 'array',
@@ -437,6 +436,28 @@ function defineTools(ctx) {
         },
         ['tasks'],
         ctx.runPlan
+      ],
+      [
+        'run_plan_confirm',
+        'side_effect',
+        '确认当前任务创建的计划草稿并原子启动子任务；执行前必须由用户审批。',
+        {
+          planId: { type: 'string' },
+          etag: { type: 'string' }
+        },
+        ['planId', 'etag'],
+        ctx.runPlanConfirm
+      ],
+      [
+        'run_plan_reject',
+        'side_effect',
+        '拒绝当前任务创建的计划草稿，不启动任何子任务。',
+        {
+          planId: { type: 'string' },
+          etag: { type: 'string' }
+        },
+        ['planId', 'etag'],
+        ctx.runPlanReject
       ],
       [
         'run_transfer',
@@ -647,7 +668,7 @@ function defineTools(ctx) {
       name: 'spawn_agent',
       risk: 'side_effect',
       description:
-        '派生子 Agent 独立完成子任务并只返回最终结论（子任务拥有独立会话和运行记录）。开启 Agent 集群时可用 goals 一次派发多个并行子任务',
+        '派生子 Agent 独立完成子任务并只返回最终结论。多个目标会创建计划草稿，必须经 run_plan_confirm 确认后执行',
       parameters: {
         type: 'object',
         properties: {
@@ -655,7 +676,7 @@ function defineTools(ctx) {
           goals: {
             type: 'array',
             items: { type: 'string' },
-            description: '多个互不依赖的子任务，集群模式下并行执行'
+            description: '多个互不依赖的子任务，创建计划草稿后需用户确认'
           }
         }
       },
@@ -675,7 +696,10 @@ function defineTools(ctx) {
       risk: 'side_effect',
       description: '读取剪贴板文本（最多 5000 字符）',
       parameters: { type: 'object', properties: {} },
-      handler: async () => (ctx.clipboard.readText() || '').slice(0, 5000) || '(剪贴板为空)'
+      handler: async () => {
+        const text = String((await ctx.clipboard.readText()) ?? '')
+        return text.slice(0, 5000) || '(剪贴板为空)'
+      }
     },
     {
       name: 'clipboard_write',
@@ -687,7 +711,7 @@ function defineTools(ctx) {
         required: ['text']
       },
       handler: async ({ text }) => {
-        ctx.clipboard.writeText(String(text == null ? '' : text))
+        await ctx.clipboard.writeText(String(text == null ? '' : text))
         return '已写入剪贴板'
       }
     },
@@ -1002,6 +1026,7 @@ function defineTools(ctx) {
       }
     }
   ]
+  return filterTools(tools, { cluster: !!ctx.cluster, mandate: ctx.mandate || null })
 }
 
 // browser_* 工具共享同一个离屏会话（按 ctx 惰性创建，close 后重建）。
@@ -1013,11 +1038,25 @@ function browserSession(ctx) {
 }
 
 function requireMcp(ctx, server) {
-  const cfg = (ctx.mcpServers || {})[String(server || '')]
+  const name = String(server || '')
+  const servers = ctx.mcpServers || {}
+  const cfg = Object.prototype.hasOwnProperty.call(servers, name) ? servers[name] : null
+  const diagnostics = Array.isArray(ctx.mcpDiagnostics) ? ctx.mcpDiagnostics : []
   if (!cfg) {
-    const names = Object.keys(ctx.mcpServers || {})
+    const relevant = diagnostics.filter((d) => !d.name || d.name === name)
+    const details = (relevant.length ? relevant : diagnostics).slice(0, 3).map((d) => {
+      const target = d.name ? `服务器「${d.name}」：` : ''
+      const arg = Number.isInteger(d.index) ? `args[${d.index}] ` : ''
+      return `${target}${arg}${d.reason || d.code || '配置无效'}`
+    })
+    if (details.length) {
+      throw new Error(
+        `MCP 配置无效，无法使用服务器「${name}」：${details.join('；')}。请在设置中修正后重试。`
+      )
+    }
+    const names = Object.keys(servers)
     throw new Error(
-      `未配置 MCP 服务器「${server}」${names.length ? `（可用: ${names.join(', ')}）` : '（需在设置 agentMcpServers 中配置）'}`
+      `未配置 MCP 服务器「${name}」${names.length ? `（可用: ${names.join(', ')}）` : '（需在设置 agentMcpServers 中配置）'}`
     )
   }
   return cfg

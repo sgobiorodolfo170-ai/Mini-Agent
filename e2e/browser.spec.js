@@ -1,6 +1,8 @@
+/* global Buffer, URL, process, setTimeout, window */
 import fs from 'node:fs'
 import http from 'node:http'
 import path from 'node:path'
+import zlib from 'node:zlib'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { closeApp, launchApp, setupProviderAndKey, unexpectedErrors } from './helpers'
 
@@ -10,6 +12,85 @@ let pageUrl
 let popupUrl
 let pageState
 let slowRequested = false
+
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+
+function assertPngScreenshot(screenshot) {
+  expect(screenshot.width).toBeGreaterThan(0)
+  expect(screenshot.height).toBeGreaterThan(0)
+  const png = fs.readFileSync(screenshot.path)
+  expect(png.byteLength).toBeGreaterThan(24)
+  expect(png.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)).toBe(true)
+  expect(png.readUInt32BE(16)).toBe(screenshot.width)
+  expect(png.readUInt32BE(20)).toBe(screenshot.height)
+  expect(png.readUInt32BE(png.length - 12)).toBe(0)
+  expect(png.toString('ascii', png.length - 8, png.length - 4)).toBe('IEND')
+  return png.byteLength
+}
+
+async function readNativeViewState(electronApp, url) {
+  return electronApp.evaluate(({ BrowserWindow, webContents }, target) => {
+    const guest = webContents.getAllWebContents().find((contents) => contents.getURL() === target)
+    if (!guest) return null
+    const view = BrowserWindow.getAllWindows()
+      .flatMap((window) => window.contentView?.children || [])
+      .find((candidate) => candidate.webContents === guest)
+    if (!view) return null
+    return { visible: view.getVisible(), bounds: view.getBounds() }
+  }, url)
+}
+
+async function trackNativeViewTransitions(electronApp, url) {
+  return electronApp.evaluate(({ BrowserWindow, webContents }, target) => {
+    const guest = webContents.getAllWebContents().find((contents) => contents.getURL() === target)
+    const win = BrowserWindow.getAllWindows().find((window) =>
+      (window.contentView?.children || []).some((candidate) => candidate.webContents === guest)
+    )
+    const view = win?.contentView.children.find((candidate) => candidate.webContents === guest)
+    if (!win || !view) throw new Error('native view not found')
+    const tracking = {
+      view,
+      setBounds: view.setBounds,
+      setVisible: view.setVisible,
+      transitions: []
+    }
+    view.setBounds = function trackedBounds(bounds) {
+      tracking.transitions.push({ visible: this.getVisible(), bounds: { ...bounds } })
+      return tracking.setBounds.call(this, bounds)
+    }
+    view.setVisible = function trackedVisible(visible) {
+      tracking.transitions.push({
+        visible: this.getVisible(),
+        requestedVisible: visible,
+        bounds: { ...this.getBounds() }
+      })
+      return tracking.setVisible.call(this, visible)
+    }
+    globalThis.__miniagentScreenshotTracking = tracking
+    return win.getContentSize()
+  }, url)
+}
+
+async function finishNativeViewTracking(electronApp) {
+  return electronApp.evaluate(() => {
+    const tracking = globalThis.__miniagentScreenshotTracking
+    if (!tracking) throw new Error('native view tracking not found')
+    tracking.view.setBounds = tracking.setBounds
+    tracking.view.setVisible = tracking.setVisible
+    delete globalThis.__miniagentScreenshotTracking
+    return tracking.transitions
+  })
+}
+
+async function readCenterPixel(electronApp, png) {
+  return electronApp.evaluate(({ nativeImage }, base64) => {
+    const image = nativeImage.createFromBuffer(Buffer.from(base64, 'base64'))
+    const { width, height } = image.getSize()
+    const bitmap = image.toBitmap()
+    const offset = (Math.floor(height / 2) * width + Math.floor(width / 2)) * 4
+    return { width, height, bgra: [...bitmap.subarray(offset, offset + 4)] }
+  }, png.toString('base64'))
+}
 
 async function listen(server) {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
@@ -145,6 +226,25 @@ async function sendBrowserGoal(win) {
   await win.keyboard.press('Enter')
 }
 
+async function screenshotOutcome(win, tabId) {
+  return win.evaluate(async (id) => {
+    try {
+      return { ok: true, screenshot: await window.api.browser.screenshot(id) }
+    } catch (error) {
+      return { ok: false, name: error.name, code: error.code, message: error.message }
+    }
+  }, tabId)
+}
+
+async function openHiddenScreenshotTab(electronApp, win) {
+  const url = pageUrl + 'screenshot-solid'
+  const tab = await win.evaluate(async (target) => window.api.browser.open({ url: target }), url)
+  await waitFor(async () =>
+    (await readGuestBody(electronApp, url))?.includes('OFFSCREEN_SCREENSHOT_OK')
+  )
+  return { tab, url }
+}
+
 beforeEach(async () => {
   pageState = { result: null, userCookie: null, agentCookie: null }
   slowRequested = false
@@ -156,6 +256,13 @@ beforeEach(async () => {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
         res.end('<!doctype html><title>Slow</title><body>SLOW_PAGE</body>')
       }, 4000)
+      return
+    }
+    if (req.url === '/screenshot-solid') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      res.end(`<!doctype html><html><head><title>Screenshot Solid</title><style>
+        html, body { margin: 0; width: 100%; height: 100%; background: #0c8852; }
+      </style></head><body>OFFSCREEN_SCREENSHOT_OK</body></html>`)
       return
     }
     if (req.url === '/' || req.url.startsWith('/?')) {
@@ -248,8 +355,11 @@ describe('内置浏览器 P1 技术 spike', () => {
       const current = await window.api.browser.state()
       return window.api.browser.screenshot(current.activeTabId)
     })
-    expect(fs.existsSync(screenshot.path)).toBe(true)
-    fs.rmSync(screenshot.path, { force: true })
+    try {
+      expect(assertPngScreenshot(screenshot)).toBeGreaterThan(24)
+    } finally {
+      fs.rmSync(screenshot.path, { force: true })
+    }
 
     await win.setViewportSize({ width: 1100, height: 720 })
     await waitFor(async () => {
@@ -283,6 +393,218 @@ describe('内置浏览器 P1 技术 spike', () => {
 
     expect(unexpectedErrors(consoleErrors)).toEqual([])
   })
+  it('captures an unmounted tab with one visible pixel and restores hidden state', async () => {
+    const { electronApp, win, consoleErrors } = ctx
+    const screenshotUrl = pageUrl + 'screenshot-solid'
+    const tab = await win.evaluate(async (url) => window.api.browser.open({ url }), screenshotUrl)
+    expect(tab.bounds).toEqual({ x: 0, y: 0, width: 0, height: 0 })
+    expect((await win.evaluate(() => window.api.browser.state())).attachedTabId).toBe(null)
+    await waitFor(async () =>
+      (await readGuestBody(electronApp, screenshotUrl))?.includes('OFFSCREEN_SCREENSHOT_OK')
+    )
+    expect(await readNativeViewState(electronApp, screenshotUrl)).toEqual({
+      visible: false,
+      bounds: { x: 0, y: 0, width: 0, height: 0 }
+    })
+    await trackNativeViewTransitions(electronApp, screenshotUrl)
+
+    const screenshot = await win.evaluate(
+      async (tabId) => window.api.browser.screenshot(tabId),
+      tab.id
+    )
+    const transitions = await finishNativeViewTracking(electronApp)
+    try {
+      expect(assertPngScreenshot(screenshot)).toBeGreaterThan(24)
+      const png = fs.readFileSync(screenshot.path)
+      expect(await readCenterPixel(electronApp, png)).toEqual({
+        width: screenshot.width,
+        height: screenshot.height,
+        bgra: [82, 136, 12, 255]
+      })
+      const visibleTransitions = transitions.filter(
+        (entry) => entry.requestedVisible && entry.bounds.width > 0 && entry.bounds.height > 0
+      )
+      expect(visibleTransitions.length).toBeGreaterThan(0)
+      for (const entry of visibleTransitions) {
+        expect(entry.bounds.x).toBeLessThan(0)
+        expect(entry.bounds.y).toBeLessThan(0)
+        expect(entry.bounds.x + entry.bounds.width).toBe(1)
+        expect(entry.bounds.y + entry.bounds.height).toBe(1)
+      }
+    } finally {
+      fs.rmSync(screenshot.path, { force: true })
+    }
+
+    const state = await win.evaluate(() => window.api.browser.state())
+    expect(state.attachedTabId).toBe(null)
+    expect(state.tabs.find((item) => item.id === tab.id).bounds).toEqual({
+      x: 0,
+      y: 0,
+      width: 0,
+      height: 0
+    })
+    expect(await readNativeViewState(electronApp, screenshotUrl)).toEqual({
+      visible: false,
+      bounds: { x: 0, y: 0, width: 0, height: 0 }
+    })
+    expect(unexpectedErrors(consoleErrors)).toEqual([])
+  })
+  it('times out a hung capturePage call and recovers after the native call settles', async () => {
+    const { electronApp, win } = ctx
+    const { tab, url } = await openHiddenScreenshotTab(electronApp, win)
+    const bounds = { x: 10, y: 20, width: 800, height: 600 }
+    await win.evaluate(({ id, rect }) => window.api.browser.attach(id, rect), {
+      id: tab.id,
+      rect: bounds
+    })
+    await electronApp.evaluate(({ webContents }, target) => {
+      const guest = webContents.getAllWebContents().find((contents) => contents.getURL() === target)
+      const capturePage = guest.capturePage.bind(guest)
+      guest.capturePage = (options) =>
+        new Promise((resolve) => {
+          globalThis.__miniagentReleaseCapture = () => resolve(capturePage(options))
+        })
+      globalThis.__miniagentScreenshotPatch = { guest, capturePage }
+    }, url)
+
+    const failed = await screenshotOutcome(win, tab.id)
+    expect(failed).toMatchObject({ ok: false })
+    expect(failed.message).toContain('原生截图超时')
+    expect(await readNativeViewState(electronApp, url)).toEqual({ visible: true, bounds })
+
+    await electronApp.evaluate(() => {
+      const { guest, capturePage } = globalThis.__miniagentScreenshotPatch
+      guest.capturePage = capturePage
+      globalThis.__miniagentReleaseCapture()
+      delete globalThis.__miniagentReleaseCapture
+      delete globalThis.__miniagentScreenshotPatch
+    })
+    const recovered = await screenshotOutcome(win, tab.id)
+    expect(recovered.ok).toBe(true)
+    try {
+      expect(assertPngScreenshot(recovered.screenshot)).toBeGreaterThan(24)
+    } finally {
+      fs.rmSync(recovered.screenshot.path, { force: true })
+    }
+  }, 45000)
+
+  it('honors detachment while an attached native capture is in flight', async () => {
+    const { electronApp, win } = ctx
+    const { tab, url } = await openHiddenScreenshotTab(electronApp, win)
+    const bounds = { x: 10, y: 20, width: 800, height: 600 }
+    await win.evaluate(({ id, rect }) => window.api.browser.attach(id, rect), {
+      id: tab.id,
+      rect: bounds
+    })
+    await electronApp.evaluate(({ webContents }, target) => {
+      const guest = webContents.getAllWebContents().find((contents) => contents.getURL() === target)
+      const capturePage = guest.capturePage.bind(guest)
+      guest.capturePage = (options) =>
+        new Promise((resolve) => {
+          globalThis.__miniagentReleaseCapture = () => resolve(capturePage(options))
+        })
+    }, url)
+    const pending = screenshotOutcome(win, tab.id)
+    await waitFor(() =>
+      electronApp.evaluate(() => typeof globalThis.__miniagentReleaseCapture === 'function')
+    )
+    await win.evaluate(() => window.api.browser.detach())
+    await electronApp.evaluate(() => globalThis.__miniagentReleaseCapture())
+    const outcome = await pending
+    expect(outcome.ok).toBe(true)
+    try {
+      expect(assertPngScreenshot(outcome.screenshot)).toBeGreaterThan(24)
+    } finally {
+      fs.rmSync(outcome.screenshot.path, { force: true })
+    }
+    expect((await win.evaluate(() => window.api.browser.state())).attachedTabId).toBe(null)
+    expect(await readNativeViewState(electronApp, url)).toEqual({ visible: false, bounds })
+  })
+
+  it('rejects a truncated PNG that has a valid signature and IHDR', async () => {
+    const { electronApp, win } = ctx
+    const { tab, url } = await openHiddenScreenshotTab(electronApp, win)
+    await win.evaluate(
+      ({ id }) => window.api.browser.attach(id, { x: 0, y: 0, width: 800, height: 600 }),
+      { id: tab.id }
+    )
+    await electronApp.evaluate(({ webContents }, target) => {
+      const guest = webContents.getAllWebContents().find((contents) => contents.getURL() === target)
+      const capturePage = guest.capturePage.bind(guest)
+      guest.capturePage = async () => ({
+        getSize: () => ({ width: 1, height: 1 }),
+        toPNG: () => {
+          const png = Buffer.alloc(24)
+          Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(png)
+          png.writeUInt32BE(13, 8)
+          png.write('IHDR', 12)
+          png.writeUInt32BE(1, 16)
+          png.writeUInt32BE(1, 20)
+          return png
+        }
+      })
+      globalThis.__miniagentScreenshotPatch = { guest, capturePage }
+    }, url)
+
+    const failed = await screenshotOutcome(win, tab.id)
+    expect(failed).toMatchObject({ ok: false })
+    expect(failed.message).toContain('不是有效的 PNG')
+    await electronApp.evaluate(() => {
+      const { guest, capturePage } = globalThis.__miniagentScreenshotPatch
+      guest.capturePage = capturePage
+      delete globalThis.__miniagentScreenshotPatch
+    })
+  })
+
+  it('rejects a PNG whose chunks are valid but compressed pixel data is corrupt', async () => {
+    const { electronApp, win } = ctx
+    const { tab, url } = await openHiddenScreenshotTab(electronApp, win)
+    await win.evaluate(
+      ({ id }) => window.api.browser.attach(id, { x: 0, y: 0, width: 800, height: 600 }),
+      { id: tab.id }
+    )
+    const valid = await screenshotOutcome(win, tab.id)
+    expect(valid.ok).toBe(true)
+    const png = fs.readFileSync(valid.screenshot.path)
+    fs.rmSync(valid.screenshot.path, { force: true })
+    const damaged = Buffer.from(png)
+    const idatLength = damaged.readUInt32BE(33)
+    const dataOffset = 41
+    const crcOffset = dataOffset + idatLength
+    damaged[dataOffset] ^= 0xff
+    damaged.writeUInt32BE(zlib.crc32(damaged.subarray(37, crcOffset)), crcOffset)
+
+    await electronApp.evaluate(
+      ({ webContents }, { target, png, width, height }) => {
+        const guest = webContents
+          .getAllWebContents()
+          .find((contents) => contents.getURL() === target)
+        const capturePage = guest.capturePage.bind(guest)
+        const damaged = Buffer.from(png, 'base64')
+        guest.capturePage = async () => ({
+          getSize: () => ({ width, height }),
+          toPNG: () => damaged
+        })
+        globalThis.__miniagentScreenshotPatch = { guest, capturePage }
+      },
+      {
+        target: url,
+        png: damaged.toString('base64'),
+        width: valid.screenshot.width,
+        height: valid.screenshot.height
+      }
+    )
+
+    const failed = await screenshotOutcome(win, tab.id)
+    expect(failed).toMatchObject({ ok: false })
+    expect(failed.message).toContain('PNG 解码失败')
+    await electronApp.evaluate(() => {
+      const { guest, capturePage } = globalThis.__miniagentScreenshotPatch
+      guest.capturePage = capturePage
+      delete globalThis.__miniagentScreenshotPatch
+    })
+  })
+
   it('follows a clicked link through an HTTP redirect without a stale error', async () => {
     const { electronApp, win, consoleErrors } = ctx
     await openBrowserPage(win)

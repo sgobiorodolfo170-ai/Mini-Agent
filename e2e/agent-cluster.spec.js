@@ -33,8 +33,17 @@ describe('Agent 集群并发派发', () => {
     await win.getByTestId('chat-input').fill('并行处理这两件事')
     await win.keyboard.press('Enter')
 
-    // 子 Agent 的工具调用会请求确认；允许后继续
+    // 模型先创建计划草稿，确认工具触发审批；此时不应有子 Agent 模型请求
     await win.getByText('Agent 请求确认').waitFor({ timeout: 45000 })
+    const draft = await win.evaluate(async () => {
+      const runs = await window.api.agent.runs()
+      const parent = runs.find((run) => run.goal === '并行处理这两件事')
+      const plans = await window.api.agent.plans(parent.id)
+      return { plans, childCount: runs.filter((run) => run.parent_run_id === parent.id).length }
+    })
+    expect(draft.plans[0].status).toBe('draft')
+    expect(draft.childCount).toBe(0)
+    expect(mock.state.subPeak).toBe(0)
     await win.getByText('允许执行', { exact: true }).click()
 
     // 任务完成：结果落在「智能任务」页的执行记录里（会话主区不渲染 Agent 正文）
@@ -72,6 +81,7 @@ describe('Agent 集群并发派发', () => {
       return window.api.agent.run({
         conversationId: entries[0].id,
         permission: 'full',
+        cluster: true,
         goal: '请移交任务'
       })
     })

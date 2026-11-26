@@ -19,7 +19,11 @@ const {
 
 const USER_PARTITION = 'persist:miniagent-browser'
 const DEFAULT_LOAD_TIMEOUT_MS = 30000
+const DEFAULT_SCREENSHOT_CAPTURE_TIMEOUT_MS = 15000
+const DEFAULT_SCREENSHOT_QUEUE_TIMEOUT_MS = 30000
 const DEFAULT_MAX_TABS = 6
+const SCREENSHOT_DEFAULT_BOUNDS = { x: 0, y: 0, width: 800, height: 600 }
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36'
 
@@ -69,6 +73,91 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+function positiveTimeout(value, fallback) {
+  const timeout = Number(value)
+  return Number.isFinite(timeout) && timeout > 0 ? timeout : fallback
+}
+
+async function withTimeout(operation, timeoutMs, message) {
+  let timer
+  try {
+    return await Promise.race([
+      Promise.resolve().then(operation),
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new BrowserError(message, 'BROWSER_SCREENSHOT_TIMEOUT')),
+          timeoutMs
+        )
+      })
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+const PNG_CRC_TABLE = Array.from({ length: 256 }, (_, value) => {
+  let crc = value
+  for (let bit = 0; bit < 8; bit += 1) crc = crc & 1 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1
+  return crc >>> 0
+})
+
+function pngCrc32(buffer) {
+  let crc = 0xffffffff
+  for (const byte of buffer) crc = PNG_CRC_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8)
+  return (crc ^ 0xffffffff) >>> 0
+}
+
+function hasPositiveSize(bounds) {
+  return (
+    bounds &&
+    Number.isInteger(bounds.width) &&
+    Number.isInteger(bounds.height) &&
+    bounds.width > 0 &&
+    bounds.height > 0
+  )
+}
+
+function readPngHeader(png) {
+  if (
+    png.length < 33 ||
+    !png.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE) ||
+    png.readUInt32BE(8) !== 13 ||
+    png.toString('ascii', 12, 16) !== 'IHDR'
+  ) {
+    throw new BrowserError('浏览器截图无效：不是有效的 PNG 图像', 'BROWSER_SCREENSHOT_INVALID')
+  }
+  const size = { width: png.readUInt32BE(16), height: png.readUInt32BE(20) }
+  if (!hasPositiveSize(size)) {
+    throw new BrowserError('浏览器截图无效：图像宽高必须大于 0', 'BROWSER_SCREENSHOT_INVALID')
+  }
+  return size
+}
+
+function validatePngChunks(png) {
+  let offset = 8
+  let hasData = false
+  let ended = false
+  while (offset < png.length) {
+    if (offset + 12 > png.length) break
+    const length = png.readUInt32BE(offset)
+    const end = offset + 12 + length
+    if (end > png.length) break
+    const type = png.toString('ascii', offset + 4, offset + 8)
+    const expectedCrc = png.readUInt32BE(end - 4)
+    if (pngCrc32(png.subarray(offset + 4, end - 4)) !== expectedCrc) break
+    if (type === 'IDAT') hasData = true
+    offset = end
+    if (type === 'IEND') {
+      if (length !== 0) break
+      ended = true
+      break
+    }
+  }
+  if (!hasData || !ended || offset !== png.length) {
+    throw new BrowserError('浏览器截图无效：PNG 数据不完整', 'BROWSER_SCREENSHOT_INVALID')
+  }
+}
+
 function cleanPartitionRunId(runId) {
   return String(runId || 'unknown')
     .replace(/[^a-zA-Z0-9_-]/g, '_')
@@ -83,6 +172,14 @@ function createBrowserService(options = {}) {
   const now = options.now || Date.now
   const idFactory = options.idFactory || (() => `tab-${crypto.randomUUID()}`)
   const loadTimeoutMs = Number(options.loadTimeoutMs) || DEFAULT_LOAD_TIMEOUT_MS
+  const screenshotCaptureTimeoutMs = positiveTimeout(
+    options.screenshotCaptureTimeoutMs,
+    DEFAULT_SCREENSHOT_CAPTURE_TIMEOUT_MS
+  )
+  const screenshotQueueTimeoutMs = positiveTimeout(
+    options.screenshotQueueTimeoutMs,
+    DEFAULT_SCREENSHOT_QUEUE_TIMEOUT_MS
+  )
   const maxTabs =
     Number(options.maxTabs) || Number(getSetting('browserMaxTabs')) || DEFAULT_MAX_TABS
   const downloadDir =
@@ -95,6 +192,10 @@ function createBrowserService(options = {}) {
   const configuredSessions = new Map()
   let activeTabId = null
   let attachedTabId = null
+  let screenshotQueue = Promise.resolve()
+  let temporaryScreenshotView = null
+  const pendingNativeCaptures = new Map()
+  const debuggerLeases = new Map()
   let enabled = getSetting('browserEnabled') !== false
 
   function ensureAvailable() {
@@ -264,6 +365,22 @@ function createBrowserService(options = {}) {
     emitState(type, { tabId: tab.id })
   }
 
+  function setViewState(tab, visible, bounds) {
+    tab.viewState = { visible: !!visible, bounds: { ...bounds } }
+    tab.viewStateVersion += 1
+  }
+
+  function hideTemporaryScreenshotView() {
+    const view = temporaryScreenshotView
+    temporaryScreenshotView = null
+    if (!view || !view.webContents || view.webContents.isDestroyed()) return
+    try {
+      view.setVisible(false)
+    } catch {
+      // 截图流程会按最新 viewState 继续恢复或终止。
+    }
+  }
+
   function attachEvents(tab) {
     const wc = tab.webContents
     tab.cleanups.push(() => wc.removeAllListeners('before-mouse-event'))
@@ -421,6 +538,9 @@ function createBrowserService(options = {}) {
         createdAt: now(),
         view: null,
         webContents: null,
+        viewState: null,
+        viewStateVersion: 0,
+        screenshotToken: 0,
         cleanups: [],
         navigationToken: 0,
         inspector: { selecting: false, selected: null, selectionToken: 0 },
@@ -465,6 +585,9 @@ function createBrowserService(options = {}) {
       createdAt: now(),
       view,
       webContents: wc,
+      viewState: { visible: false, bounds: { x: 0, y: 0, width: 0, height: 0 } },
+      viewStateVersion: 0,
+      screenshotToken: 0,
       cleanups: [],
       navigationToken: 0,
       inspector: { selecting: false, selected: null, selectionToken: 0 },
@@ -601,6 +724,7 @@ function createBrowserService(options = {}) {
 
   function closeTab(tabId) {
     const tab = requireTab(tabId)
+    if (tab.view && tab.view === temporaryScreenshotView) hideTemporaryScreenshotView()
     if (tab.queuedNavigation) {
       const pending = tab.queuedNavigation
       tab.queuedNavigation = null
@@ -615,7 +739,10 @@ function createBrowserService(options = {}) {
     if (activeTabId === tab.id) activeTabId = [...tabs.keys()].at(-1) || null
     if (attachedTabId === tab.id) {
       attachedTabId = null
-      if (tab.view) tab.view.setVisible(false)
+      if (tab.view) {
+        tab.view.setVisible(false)
+        if (tab.viewState) setViewState(tab, false, tab.viewState.bounds)
+      }
     }
     try {
       if (tab.view) getMainWindow().contentView.removeChildView(tab.view)
@@ -648,12 +775,18 @@ function createBrowserService(options = {}) {
     if (attachedTabId) {
       const previous = tabs.get(attachedTabId)
       if (previous && previous.id !== tab.id) {
-        if (previous.view) previous.view.setVisible(false)
+        if (previous.view) {
+          previous.view.setVisible(false)
+          if (previous.viewState) setViewState(previous, false, previous.viewState.bounds)
+        }
         cancelSelection(previous)
         closeDevTools(previous)
       }
       attachedTabId = tab.id
-      if (tab.view) tab.view.setVisible(true)
+      if (tab.view) {
+        tab.view.setVisible(true)
+        if (tab.viewState) setViewState(tab, true, tab.viewState.bounds)
+      }
     }
     emitState('state')
     return getState()
@@ -661,6 +794,7 @@ function createBrowserService(options = {}) {
 
   function attachTab(tabId, bounds, options = {}) {
     const tab = requireTab(tabId)
+    hideTemporaryScreenshotView()
     // 内部页面由渲染层直接渲染，无需挂载原生视图
     if (tab.internal) {
       activeTabId = tab.id
@@ -672,7 +806,10 @@ function createBrowserService(options = {}) {
     if (attachedTabId && attachedTabId !== tab.id) {
       const previous = tabs.get(attachedTabId)
       if (previous) {
-        if (previous.view) previous.view.setVisible(false)
+        if (previous.view) {
+          previous.view.setVisible(false)
+          if (previous.viewState) setViewState(previous, false, previous.viewState.bounds)
+        }
         cancelSelection(previous)
         closeDevTools(previous)
       }
@@ -688,6 +825,7 @@ function createBrowserService(options = {}) {
     }
     tab.view.setBounds(rect)
     tab.view.setVisible(true)
+    setViewState(tab, true, rect)
     emitState('state')
     return getState()
   }
@@ -706,10 +844,18 @@ function createBrowserService(options = {}) {
   }
 
   function detach() {
+    hideTemporaryScreenshotView()
+    // detach 是全局视图代际边界：即使隐藏标签没有 attachedTabId，也要废弃其重试。
+    for (const tab of tabs.values()) {
+      if (!tab.destroyed) tab.viewStateVersion += 1
+    }
     if (attachedTabId) {
       const tab = tabs.get(attachedTabId)
       if (tab) {
-        if (tab.view) tab.view.setVisible(false)
+        if (tab.view) {
+          tab.view.setVisible(false)
+          if (tab.viewState) setViewState(tab, false, tab.viewState.bounds)
+        }
         cancelSelection(tab)
         closeDevTools(tab)
       }
@@ -1055,6 +1201,29 @@ function createBrowserService(options = {}) {
     return summarize(tab)
   }
 
+  function acquireDebugger(webContents) {
+    const debuggerApi = webContents.debugger
+    let lease = debuggerLeases.get(webContents)
+    if (!lease) {
+      lease = { users: 0, attachedHere: false }
+      if (!debuggerApi.isAttached()) {
+        debuggerApi.attach('1.3')
+        lease.attachedHere = true
+      }
+      debuggerLeases.set(webContents, lease)
+    }
+    lease.users += 1
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      lease.users -= 1
+      if (lease.users > 0) return
+      debuggerLeases.delete(webContents)
+      if (lease.attachedHere && debuggerApi.isAttached()) debuggerApi.detach()
+    }
+  }
+
   async function dispatchInput(input = {}) {
     const tab = tabs.get(attachedTabId)
     if (!tab || tab.kind !== 'user' || tab.destroyed || tab.crashed) {
@@ -1066,8 +1235,7 @@ function createBrowserService(options = {}) {
     if (!debuggerApi || typeof debuggerApi.sendCommand !== 'function') {
       throw new BrowserError('当前浏览器视图不支持 CDP 输入', 'BROWSER_VIEW_UNAVAILABLE')
     }
-    const attachedHere = !debuggerApi.isAttached()
-    if (attachedHere) debuggerApi.attach('1.3')
+    const releaseDebugger = acquireDebugger(tab.webContents)
     const sendCommand = async (method, params) => {
       let timer
       try {
@@ -1126,19 +1294,286 @@ function createBrowserService(options = {}) {
       }
       return { ok: true }
     } finally {
-      if (attachedHere && debuggerApi.isAttached()) debuggerApi.detach()
+      releaseDebugger()
     }
   }
 
-  async function screenshot(tabId) {
+  function removeScreenshotFile(file) {
+    if (!file) return
+    try {
+      fs.rmSync(file, { force: true })
+    } catch {
+      // 清理失败不覆盖原始截图错误
+    }
+  }
+
+  async function settleScreenshotFrame(webContents) {
+    let timer
+    try {
+      await Promise.race([
+        webContents.executeJavaScript(`new Promise((resolve) => {
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve(true)))
+        })`),
+        new Promise((resolve) => {
+          timer = setTimeout(resolve, 1000)
+        })
+      ])
+    } catch {
+      // 页面可能正在导航；随后 capturePage 会给出最终结果并由 PNG 校验兜底
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  function needsCaptureViewport(state) {
+    return !state || !state.visible || !hasPositiveSize(state.bounds)
+  }
+
+  function screenshotCaptureBounds(state, visible) {
+    const bounds = hasPositiveSize(state && state.bounds)
+      ? { ...state.bounds }
+      : { ...SCREENSHOT_DEFAULT_BOUNDS }
+    if (!visible) return bounds
+    // A hidden renderer needs at least one on-screen pixel to create its first
+    // compositor surface. Keep the remaining view outside the content area.
+    return { ...bounds, x: 1 - bounds.width, y: 1 - bounds.height }
+  }
+
+  function restoreScreenshotView(view, state) {
+    // 隐藏恢复必须先隐藏再改 bounds，避免原隐藏位置短暂可见。
+    if (!state.visible) view.setVisible(false)
+    view.setBounds({ ...state.bounds })
+    if (state.visible) view.setVisible(true)
+  }
+
+  function validateScreenshot(tab, webContents, size, png, expectedSize) {
+    if (tabs.get(tab.id) !== tab || tab.destroyed || webContents.isDestroyed()) {
+      throw new BrowserError('截图期间浏览器标签已关闭', 'BROWSER_TAB_NOT_FOUND')
+    }
+    if (!hasPositiveSize(size)) {
+      throw new BrowserError('浏览器截图无效：图像宽高必须大于 0', 'BROWSER_SCREENSHOT_INVALID')
+    }
+    if (!Buffer.isBuffer(png) || png.length === 0) {
+      throw new BrowserError('浏览器截图无效：PNG 缓冲为空', 'BROWSER_SCREENSHOT_INVALID')
+    }
+    const headerSize = readPngHeader(png)
+    validatePngChunks(png)
+
+    let decoded
+    try {
+      const nativeImageApi = electronApi.nativeImage
+      if (!nativeImageApi || typeof nativeImageApi.createFromBuffer !== 'function') {
+        throw new Error('nativeImage unavailable')
+      }
+      decoded = nativeImageApi.createFromBuffer(png)
+      if (decoded.isEmpty()) throw new Error('empty image')
+      // toBitmap 强制完整像素解码，不能只依赖 PNG 签名或 IHDR。
+      const bitmap = decoded.toBitmap()
+      const decodedSize = decoded.getSize()
+      if (
+        decodedSize.width !== headerSize.width ||
+        decodedSize.height !== headerSize.height ||
+        size.width !== headerSize.width ||
+        size.height !== headerSize.height ||
+        (expectedSize && (size.width !== expectedSize.width || size.height !== expectedSize.height))
+      ) {
+        throw new BrowserError('浏览器截图无效：图像尺寸不一致', 'BROWSER_SCREENSHOT_INVALID')
+      }
+      if (
+        !Buffer.isBuffer(bitmap) ||
+        bitmap.length !== decodedSize.width * decodedSize.height * 4
+      ) {
+        throw new Error('incomplete bitmap')
+      }
+    } catch (error) {
+      if (error instanceof BrowserError) throw error
+      throw new BrowserError(
+        `浏览器截图无效：PNG 解码失败 (${String(error.message || error)})`,
+        'BROWSER_SCREENSHOT_INVALID'
+      )
+    }
+    return { size: decoded.getSize(), png }
+  }
+
+  async function readNativeScreenshot(tab, webContents, captureBounds) {
+    const operation = Promise.resolve().then(() =>
+      webContents.capturePage({
+        x: 0,
+        y: 0,
+        width: captureBounds.width,
+        height: captureBounds.height
+      })
+    )
+    pendingNativeCaptures.set(webContents, operation)
+    operation
+      .finally(() => {
+        if (pendingNativeCaptures.get(webContents) === operation) {
+          pendingNativeCaptures.delete(webContents)
+        }
+      })
+      .catch(() => {})
+    const image = await withTimeout(
+      () => operation,
+      screenshotCaptureTimeoutMs,
+      '浏览器原生截图超时'
+    )
+    return validateScreenshot(tab, webContents, image.getSize(), image.toPNG(), captureBounds)
+  }
+
+  async function captureTabScreenshot(tab, capture) {
+    // 排队期间发生的 attach/detach 属于执行前的最新状态，不应使任务过期。
+    capture.viewStateVersion = tab.viewStateVersion
+    capture.token = ++tab.screenshotToken
+    const isLive = () =>
+      tabs.get(tab.id) === tab && !tab.destroyed && !tab.webContents.isDestroyed()
+    const isActive = () => isLive() && !capture.cancelled && tab.screenshotToken === capture.token
+    const isCurrentAttempt = () => isActive() && tab.viewStateVersion === capture.viewStateVersion
+    const assertCurrentAttempt = () => {
+      if (!isCurrentAttempt()) {
+        throw new BrowserError('截图尝试已过期', 'BROWSER_SCREENSHOT_ABORTED')
+      }
+    }
+    if (!isLive()) throw new BrowserError('浏览器标签已关闭', 'BROWSER_TAB_NOT_FOUND')
+    const view = tab.view
+    const webContents = tab.webContents
+    if (!view || !webContents) {
+      throw new BrowserError('内部页面不支持截图', 'BROWSER_VIEW_UNAVAILABLE')
+    }
+    const pendingCapture = pendingNativeCaptures.get(webContents)
+    if (pendingCapture) {
+      await withTimeout(
+        () => pendingCapture,
+        screenshotQueueTimeoutMs,
+        '浏览器截图队列等待前次原生捕获超时'
+      )
+      assertCurrentAttempt()
+    }
+
+    const originalState = tab.viewState
+    let shouldRestore = false
+    let tempFile = null
+    let file = null
+    let failure = null
+    let size
+    let png
+
+    const restore = () => {
+      // 仅当前截图代数可恢复；外部 attach/detach/close 后始终遵循最新状态。
+      if (!shouldRestore || !isLive() || tab.screenshotToken !== capture.token) {
+        return
+      }
+      try {
+        restoreScreenshotView(view, tab.viewState || originalState)
+      } finally {
+        if (temporaryScreenshotView === view) temporaryScreenshotView = null
+        shouldRestore = false
+      }
+    }
+    capture.restore = restore
+
+    try {
+      try {
+        assertCurrentAttempt()
+        let captureBounds = { ...originalState?.bounds }
+        if (needsCaptureViewport(originalState)) {
+          shouldRestore = true
+          // Hidden renderers need one on-screen pixel to create a valid surface.
+          captureBounds = screenshotCaptureBounds(originalState, true)
+          view.setBounds(captureBounds)
+          view.setVisible(true)
+          temporaryScreenshotView = view
+        }
+
+        await settleScreenshotFrame(webContents)
+        assertCurrentAttempt()
+        const latestState = tab.viewState || originalState
+        if (needsCaptureViewport(latestState)) {
+          captureBounds = screenshotCaptureBounds(latestState, true)
+          view.setBounds(captureBounds)
+          view.setVisible(true)
+          temporaryScreenshotView = view
+          await settleScreenshotFrame(webContents)
+          assertCurrentAttempt()
+        } else {
+          captureBounds = { ...latestState.bounds }
+        }
+
+        const captured = await readNativeScreenshot(tab, webContents, captureBounds)
+        size = captured.size
+        png = captured.png
+        if (!isActive()) throw new BrowserError('截图尝试已过期', 'BROWSER_SCREENSHOT_ABORTED')
+
+        fs.mkdirSync(artifactDir, { recursive: true })
+        file = path.join(artifactDir, `browser-${now()}-${tab.id}-${crypto.randomUUID()}.png`)
+        tempFile = `${file}.${process.pid}.tmp`
+        fs.writeFileSync(tempFile, png, { flag: 'wx' })
+      } catch (error) {
+        failure =
+          error instanceof BrowserError
+            ? error
+            : new BrowserError(
+                `浏览器截图失败：${String(error.message || error)}`,
+                'BROWSER_SCREENSHOT_FAILED'
+              )
+      }
+    } finally {
+      try {
+        restore()
+      } catch (error) {
+        failure = new BrowserError(
+          `浏览器截图后恢复视图失败：${String(error.message || error)}`,
+          'BROWSER_SCREENSHOT_FAILED'
+        )
+      } finally {
+        capture.restore = null
+      }
+    }
+    if (failure) {
+      removeScreenshotFile(tempFile)
+      throw failure
+    }
+
+    try {
+      fs.renameSync(tempFile, file)
+      tempFile = null
+    } catch (error) {
+      removeScreenshotFile(tempFile)
+      throw new BrowserError(
+        `浏览器截图保存失败：${String(error.message || error)}`,
+        'BROWSER_SCREENSHOT_FAILED'
+      )
+    }
+    return { path: file, width: size.width, height: size.height }
+  }
+
+  function screenshot(tabId) {
     const tab = requireTab(tabId)
     if (!tab.webContents) throw new BrowserError('内部页面不支持截图', 'BROWSER_VIEW_UNAVAILABLE')
-    const image = await tab.webContents.capturePage()
-    const size = image.getSize()
-    fs.mkdirSync(artifactDir, { recursive: true })
-    const file = path.join(artifactDir, `browser-${now()}-${tab.id}.png`)
-    fs.writeFileSync(file, image.toPNG())
-    return { path: file, width: size.width, height: size.height }
+    const capture = {
+      token: 0,
+      viewStateVersion: tab.viewStateVersion,
+      cancelled: false,
+      restore: null
+    }
+    let timer
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        capture.cancelled = true
+        try {
+          capture.restore?.()
+        } catch {
+          // 超时错误优先；底层捕获结束后仍会按最新状态执行 finally 恢复。
+        }
+        reject(new BrowserError('浏览器截图队列超时（含等待与捕获）', 'BROWSER_SCREENSHOT_TIMEOUT'))
+      }, screenshotQueueTimeoutMs)
+    })
+    const operation = screenshotQueue.then(() => captureTabScreenshot(tab, capture))
+    const pending = Promise.race([operation, timeout])
+    const result = pending.finally(() => clearTimeout(timer))
+    // Caller timeout must not let the next capture overlap a still-running
+    // native/CDP attempt. Keep the internal queue chained to the real operation.
+    screenshotQueue = operation.catch(() => {})
+    return result
   }
 
   async function clearData() {

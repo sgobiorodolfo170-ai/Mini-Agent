@@ -24,6 +24,10 @@ export function createMockServer() {
     clusterSpawn: false,
     transferRun: false,
     planRun: false,
+    recoveryPlan: false,
+    recoveryDelayMs: 0,
+    recoveryHold: false,
+    recoveryParentHold: false,
     computerRun: false,
     planNodeDelayMs: 0,
     agentDelayMs: 0,
@@ -117,7 +121,15 @@ export function createMockServer() {
         if (isSubAgent) {
           state.subInFlight++
           state.subPeak = Math.max(state.subPeak, state.subInFlight)
-          const delay = state.planRun && msgs[1]?.content === '节点A' ? state.planNodeDelayMs : 120
+          if (state.recoveryHold && msgs[1]?.content === '节点B') {
+            res.writeHead(200, { 'Content-Type': 'text/event-stream' })
+            res.write('data: {"choices":[{"delta":{"content":"部分"}}]}\n\n')
+            return
+          }
+          const delay =
+            state.planRun && (msgs[1]?.content === '节点A' || msgs[1]?.content === '节点B')
+              ? state.planNodeDelayMs
+              : 120
           setTimeout(() => {
             state.subInFlight--
             sse(res, [
@@ -159,9 +171,108 @@ export function createMockServer() {
           return
         }
         if (body.tools && state.planRun) {
+          if (state.recoveryPlan && !hasToolResult) {
+            sse(res, [
+              JSON.stringify({
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: [
+                        {
+                          index: 0,
+                          id: 'call-recovery-wait',
+                          type: 'function',
+                          function: {
+                            name: 'run_wait',
+                            arguments: JSON.stringify({
+                              graphId:
+                                msgs
+                                  .find((m) => m.role === 'system')
+                                  ?.content.match(/GRAPH_ID:([^ ]+)/)?.[1] || ''
+                            })
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }),
+              JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })
+            ])
+            return
+          }
+          if (state.recoveryPlan) {
+            if (state.recoveryParentHold) {
+              res.writeHead(200, { 'Content-Type': 'text/event-stream' })
+              res.write('data: {"choices":[{"delta":{"content":"部分"}}]}\n\n')
+              return
+            }
+            if (state.recoveryHold) {
+              setTimeout(() => {
+                sse(res, [
+                  JSON.stringify({
+                    choices: [{ index: 0, delta: { content: '任务图执行完成。' } }]
+                  }),
+                  JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })
+                ])
+              }, state.recoveryDelayMs || 30000)
+              return
+            }
+            sse(res, [
+              JSON.stringify({ choices: [{ index: 0, delta: { content: '任务图执行完成。' } }] }),
+              JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })
+            ])
+            return
+          }
           const last = msgs.at(-1)
           if (last?.role === 'tool' && last.tool_call_id === 'call-plan') {
-            const output = JSON.parse(last.content)
+            let output
+            try {
+              output = JSON.parse(last.content)
+            } catch {
+              sse(res, [
+                JSON.stringify({ choices: [{ index: 0, delta: { content: '任务图执行完成。' } }] }),
+                JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })
+              ])
+              return
+            }
+            sse(res, [
+              JSON.stringify({
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: [
+                        {
+                          index: 0,
+                          id: 'call-plan-confirm',
+                          type: 'function',
+                          function: {
+                            name: 'run_plan_confirm',
+                            arguments: JSON.stringify({ planId: output.planId, etag: output.etag })
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }),
+              JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })
+            ])
+            return
+          }
+          if (last?.role === 'tool' && last.tool_call_id === 'call-plan-confirm') {
+            let output
+            try {
+              output = JSON.parse(last.content)
+            } catch {
+              sse(res, [
+                JSON.stringify({ choices: [{ index: 0, delta: { content: '任务图执行完成。' } }] }),
+                JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })
+              ])
+              return
+            }
             sse(res, [
               JSON.stringify({
                 choices: [
@@ -334,7 +445,7 @@ export function createMockServer() {
           }
         }
         if (body.tools && state.clusterSpawn) {
-          // 已经收回子 Agent 结论 → 汇总收尾；否则派发一次批量 spawn
+          const last = msgs.at(-1)
           const sawSubResult = msgs.some(
             (m) => m.role === 'tool' && String(m.content || '').includes('子结论')
           )
@@ -345,13 +456,63 @@ export function createMockServer() {
             ])
             return
           }
-          if (hasToolResult) {
-            // 已有其他工具结果但还没拿到子结论：直接收尾，避免无限循环
-            sse(res, [
-              JSON.stringify({ choices: [{ index: 0, delta: { content: '集群任务完成。' } }] }),
-              JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })
-            ])
-            return
+          if (last?.role === 'tool') {
+            const output = JSON.parse(last.content)
+            if (last.tool_call_id === 'call-run-plan') {
+              sse(res, [
+                JSON.stringify({
+                  choices: [
+                    {
+                      index: 0,
+                      delta: {
+                        tool_calls: [
+                          {
+                            index: 0,
+                            id: 'call-run-plan-confirm',
+                            type: 'function',
+                            function: {
+                              name: 'run_plan_confirm',
+                              arguments: JSON.stringify({
+                                planId: output.planId,
+                                etag: output.etag
+                              })
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }),
+                JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })
+              ])
+              return
+            }
+            if (last.tool_call_id === 'call-run-plan-confirm') {
+              sse(res, [
+                JSON.stringify({
+                  choices: [
+                    {
+                      index: 0,
+                      delta: {
+                        tool_calls: [
+                          {
+                            index: 0,
+                            id: 'call-run-wait',
+                            type: 'function',
+                            function: {
+                              name: 'run_wait',
+                              arguments: JSON.stringify({ graphId: output.graphId })
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }),
+                JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })
+              ])
+              return
+            }
           }
           sse(res, [
             JSON.stringify({
@@ -362,11 +523,16 @@ export function createMockServer() {
                     tool_calls: [
                       {
                         index: 0,
-                        id: 'call-spawn',
+                        id: 'call-run-plan',
                         type: 'function',
                         function: {
-                          name: 'spawn_agent',
-                          arguments: JSON.stringify({ goals: ['子任务一', '子任务二'] })
+                          name: 'run_plan',
+                          arguments: JSON.stringify({
+                            tasks: [
+                              { key: 'a', goal: '子任务一' },
+                              { key: 'b', goal: '子任务二' }
+                            ]
+                          })
                         }
                       }
                     ]

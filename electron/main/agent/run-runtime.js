@@ -2,8 +2,9 @@ const repos = require('../../store/repos')
 const { recordRunState } = require('../../store/run-storage')
 const { getHub } = require('../events/hub')
 const graph = require('./graph')
+const { LIMITS } = require('./cluster-policy')
 
-const SLOT_LIMIT = 4
+const SLOT_LIMIT = LIMITS.globalSlots
 
 function transition(db, id, patch) {
   const result = repos.updateRunStatus(db, id, patch)
@@ -109,8 +110,44 @@ function createRunQueue({ launch, shuttingDown, limit = SLOT_LIMIT }) {
   const slots = new Set()
   const resumes = new Map()
   const activeGraphs = new Map()
+  const workspaceLeases = new Map()
   let scheduled = false
   let generation = 0
+
+  function workspaceKey(db, id) {
+    const run = repos.getRun(db, id)
+    if (!run) return null
+    const spec = safeSpec(run.runSpecJson)
+    if (spec.workspacePolicy === 'worktree') return null
+    const conv = repos.getConversation(db, run.conversationId)
+    return conv?.projectId
+      ? `project:${conv.projectId}`
+      : `conversation:${conv?.id || run.conversationId}`
+  }
+
+  function safeSpec(value) {
+    try {
+      return value ? JSON.parse(value) : {}
+    } catch {
+      return {}
+    }
+  }
+
+  function snapshot(db) {
+    const queued = db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM agent_runs WHERE status='queued' AND run_spec_json IS NOT NULL"
+      )
+      .get().n
+    return {
+      activeSlots: slots.size,
+      slotLimit: limit,
+      queued,
+      waitingResumes: resumes.size,
+      graphs: [...activeGraphs].map(([graphId, ids]) => ({ graphId, active: ids.size })),
+      workspaceLeases: [...workspaceLeases].map(([key, runId]) => ({ key, runId }))
+    }
+  }
 
   function trackGraph(db, id) {
     const run = repos.getRun(db, id)
@@ -157,6 +194,8 @@ function createRunQueue({ launch, shuttingDown, limit = SLOT_LIMIT }) {
       .all()
     for (const row of rows) {
       if (slots.has(row.id)) continue
+      const lease = workspaceKey(db, row.id)
+      if (lease && workspaceLeases.has(lease)) continue
       if (dependenciesReady(db, row.id) && graphHasCapacity(db, row.id)) return row.id
     }
     return null
@@ -186,11 +225,14 @@ function createRunQueue({ launch, shuttingDown, limit = SLOT_LIMIT }) {
           if (!queuedId) return
           slots.add(queuedId)
           trackGraph(db, queuedId)
+          const lease = workspaceKey(db, queuedId)
+          if (lease) workspaceLeases.set(lease, queuedId)
           try {
             launch(db, queuedId)
           } catch (error) {
             slots.delete(queuedId)
             untrackGraph(queuedId)
+            if (lease && workspaceLeases.get(lease) === queuedId) workspaceLeases.delete(lease)
             throw error
           }
         }
@@ -204,6 +246,8 @@ function createRunQueue({ launch, shuttingDown, limit = SLOT_LIMIT }) {
   function release(db, id) {
     const had = slots.delete(id)
     untrackGraph(id)
+    const lease = workspaceKey(db, id)
+    if (lease && workspaceLeases.get(lease) === id) workspaceLeases.delete(lease)
     if (had) schedule(db)
   }
 
@@ -234,10 +278,11 @@ function createRunQueue({ launch, shuttingDown, limit = SLOT_LIMIT }) {
     slots.clear()
     resumes.clear()
     activeGraphs.clear()
+    workspaceLeases.clear()
     scheduled = false
   }
 
-  return { schedule, release, acquire, isClaimed, reset }
+  return { schedule, release, acquire, isClaimed, reset, snapshot }
 }
 
 module.exports = {

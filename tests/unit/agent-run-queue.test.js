@@ -14,8 +14,13 @@ beforeEach(() => {
 })
 afterEach(() => dbm.close())
 
-function seed(status, parentRunId, controlMode, { graphId = null, nodeKey = null } = {}) {
-  const conv = repos.createConversation(db, {})
+function seed(
+  status,
+  parentRunId,
+  controlMode,
+  { graphId = null, nodeKey = null, projectId = null } = {}
+) {
+  const conv = repos.createConversation(db, { projectId })
   const id = repos.createRun(db, {
     conversationId: conv.id,
     goal: 'goal',
@@ -147,6 +152,29 @@ it('releases the only execution slot for a child and resumes the waiting parent'
   resumed = queue.acquire(db, parent, signal)
   queue.release(db, child)
   expect(await resumed).toBe(true)
+})
+
+it('serializes runs that share a workspace lease', async () => {
+  const projectId = repos.createProject(db, { name: 'Shared', path: process.cwd() }).id
+  const first = seed('queued', null, null, { projectId })
+  const second = seed('queued', null, null, { projectId })
+  const launches = []
+  const queue = runtime.createRunQueue({
+    limit: 4,
+    shuttingDown: () => false,
+    launch(store, id) {
+      runtime.transition(store, id, { status: 'running' })
+      launches.push(id)
+    }
+  })
+  db.prepare('UPDATE agent_runs SET submitted_at=0 WHERE id=?').run(first)
+  queue.schedule(db)
+  await tick()
+  expect(launches).toEqual([first])
+  expect(queue.snapshot(db).workspaceLeases).toHaveLength(1)
+  queue.release(db, first)
+  await tick()
+  expect(launches).toEqual([first, second])
 })
 
 it('only launches graph nodes whose dependencies are done', async () => {

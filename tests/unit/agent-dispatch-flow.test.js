@@ -60,7 +60,7 @@ function tool(name, args, index = 0) {
 }
 
 async function start(goal = 'root') {
-  return agent.startAgentRun({ conversationId, goal, permission: 'full' })
+  return agent.startAgentRun({ conversationId, goal, permission: 'full', cluster: true })
 }
 
 it('stops the real parent loop after a committed handoff', async () => {

@@ -15,7 +15,9 @@ function createMcpClient({ command, args = [], spawnFn = spawn, timeoutMs = 1500
   function start() {
     if (child) return child
     if (stopping) throw new Error('MCP 会话正在关闭')
-    if (!command) throw new Error('MCP 服务器未配置启动命令')
+    if (command == null || command === '') throw new Error('MCP 服务器未配置启动命令')
+    const invalid = validateMcpServerConfig({ command, args })
+    if (invalid) throw new Error(`MCP 配置无效: ${invalid.reason}`)
     child = spawnFn(command, args, { windowsHide: true })
     processRegistry.track(child)
     child.stdout.setEncoding('utf8')
@@ -159,6 +161,7 @@ async function withMcpServer(cfg, fn, opts = {}) {
 }
 
 // 设置里的 agentMcpServers 是 JSON 字符串：{"name": {"command": "...", "args": [...]}}
+// 保留旧解析器的过滤语义，主进程可逐步迁移到带诊断的 parseMcpServersDetailed。
 function parseMcpServers(raw) {
   if (!raw) return {}
   try {
@@ -174,4 +177,87 @@ function parseMcpServers(raw) {
   }
 }
 
-module.exports = { createMcpClient, withMcpServer, parseMcpServers, PROTOCOL_VERSION }
+function validateMcpServerConfig(cfg) {
+  if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) {
+    return { code: 'invalid_entry', reason: '服务器配置必须是对象' }
+  }
+  if (!Object.prototype.hasOwnProperty.call(cfg, 'command')) {
+    return { code: 'invalid_command', reason: '缺少 command 启动命令' }
+  }
+  const command = cfg.command
+  if (
+    typeof command !== 'string' ||
+    !command.trim() ||
+    command.trim() !== command ||
+    command.includes('\0')
+  ) {
+    return {
+      code: 'invalid_command',
+      reason: 'command 必须是非空字符串，且不能包含首尾空白或 NUL 字符'
+    }
+  }
+  const args = Object.prototype.hasOwnProperty.call(cfg, 'args') ? cfg.args : []
+  if (!Array.isArray(args)) {
+    return { code: 'invalid_args', reason: 'args 必须是字符串数组' }
+  }
+  for (let i = 0; i < args.length; i++) {
+    if (typeof args[i] !== 'string' || args[i].includes('\0')) {
+      return {
+        code: 'invalid_args',
+        reason: 'args 的每一项必须是不含 NUL 字符的字符串',
+        index: i
+      }
+    }
+  }
+  return null
+}
+
+// 纯解析，不启动服务器。null/空字符串表示未配置；其余输入逐项给出稳定诊断码。
+function parseMcpServersDetailed(raw) {
+  const result = { configured: false, servers: {}, diagnostics: [] }
+  if (raw == null || (typeof raw === 'string' && !raw.trim())) return result
+  result.configured = true
+
+  let value = raw
+  if (typeof raw === 'string') {
+    try {
+      value = JSON.parse(raw)
+    } catch {
+      result.diagnostics.push({ code: 'invalid_json', reason: 'MCP 配置不是合法 JSON' })
+      return result
+    }
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    result.diagnostics.push({ code: 'invalid_root', reason: 'MCP 配置必须是服务器对象映射' })
+    return result
+  }
+
+  for (const [name, cfg] of Object.entries(value)) {
+    if (!name.trim() || name.includes('\0')) {
+      result.diagnostics.push({ code: 'invalid_name', reason: '服务器名称不能为空或包含 NUL 字符' })
+      continue
+    }
+    const invalid = validateMcpServerConfig(cfg)
+    if (invalid) {
+      result.diagnostics.push({ name, ...invalid })
+      continue
+    }
+    const normalized = { ...cfg, args: cfg.args ? [...cfg.args] : [] }
+    // 不使用普通赋值，避免 __proto__ 等合法名称改变结果对象的原型。
+    Object.defineProperty(result.servers, name, {
+      value: normalized,
+      enumerable: true,
+      configurable: true,
+      writable: true
+    })
+  }
+  return result
+}
+
+module.exports = {
+  createMcpClient,
+  withMcpServer,
+  parseMcpServers,
+  parseMcpServersDetailed,
+  PROTOCOL_VERSION
+}

@@ -38,6 +38,16 @@ interface Message {
   status: string
   createdAt?: number
 }
+interface ClusterPlan {
+  planId: string
+  parentRunId: string
+  conversationId: string
+  status: string
+  etag: string
+  graphId?: string | null
+  tasks: Array<{ key: string; goal: string; deps?: string[] }>
+}
+
 interface Run {
   id: string
   status: string
@@ -505,6 +515,7 @@ function goPairing(message?: string): void {
   conversations.value = []
   messages.value = []
   runs.value = []
+  plans.value = []
   approvals.value = []
 }
 
@@ -855,6 +866,8 @@ const COMMAND_LABELS: Record<string, string> = {
   'agent.run.resume': '请求继续',
   'agent.run.retry': '恢复中断任务',
   'agent.run.stop': '请求停止',
+  'agent.plan.confirm': '确认集群计划',
+  'agent.plan.reject': '拒绝集群计划',
   'approval.respond': '提交审批决定'
 }
 function labelOf(type: string): string {
@@ -938,6 +951,11 @@ function handleFrame(raw: string): void {
     const status = text(field(payload, ['status'], 'done'), 24) || 'done'
     if (id) upsertMessage({ id, role: msgRole || 'assistant', content, status, conversationId })
     if (type.includes('failed') || type.includes('error')) markMessageStatus(id, 'error')
+    scheduleAck(seq)
+    return
+  }
+  if (type.startsWith('cluster.plan.')) {
+    applyPlanEvent(type, payload, conversationId)
     scheduleAck(seq)
     return
   }
@@ -1029,6 +1047,7 @@ function onPageShow(e: PageTransitionEvent | Event): void {
 const conversations = ref<Conversation[]>([])
 const messages = ref<Message[]>([])
 const runs = ref<Run[]>([])
+const plans = ref<ClusterPlan[]>([])
 const approvals = ref<Approval[]>([])
 const activeConversationId = ref('')
 const busy = reactive({
@@ -1296,6 +1315,45 @@ function applyRunEvent(
   if (type.includes('control')) void loadRuns()
 }
 
+function applyPlanEvent(
+  type: string,
+  payload: Record<string, unknown>,
+  conversationId: string
+): void {
+  const planId = text(field(payload, ['plan_id', 'planId', 'id']), 64)
+  if (!planId) return
+  const status = text(
+    field(payload, ['status'], type.endsWith('confirmed') ? 'confirmed' : 'draft'),
+    24
+  )
+  if (status !== 'draft') {
+    plans.value = plans.value.filter((plan) => plan.planId !== planId)
+    return
+  }
+  const tasks = Array.isArray(payload.tasks)
+    ? payload.tasks.map((task) => {
+        const item = task as Record<string, unknown>
+        return {
+          key: text(field(item, ['key']), 40),
+          goal: text(field(item, ['goal']), 2000),
+          deps: Array.isArray(item.deps) ? item.deps.map(String) : []
+        }
+      })
+    : []
+  const plan: ClusterPlan = {
+    planId,
+    parentRunId: text(field(payload, ['parent_run_id', 'parentRunId']), 64),
+    conversationId,
+    status,
+    etag: text(field(payload, ['etag']), 128),
+    graphId: text(field(payload, ['graph_id', 'graphId']), 64) || null,
+    tasks
+  }
+  const index = plans.value.findIndex((item) => item.planId === planId)
+  if (index >= 0) plans.value[index] = plan
+  else plans.value.unshift(plan)
+}
+
 function applyApprovalEvent(type: string, payload: Record<string, unknown>): void {
   const id = text(field(payload, ['approval_id', 'approvalId', 'id']), 64)
   if (type.startsWith('approval.created')) {
@@ -1338,12 +1396,18 @@ const respondedApprovals = new Set<string>()
 const draft = ref('')
 const goal = ref('')
 const permission = ref<'autonomous' | 'readonly'>('readonly')
+const cluster = ref(false)
 const messagesEl = ref<HTMLElement | null>(null)
 
 async function scrollMessages(): Promise<void> {
   await nextTick()
   const el = messagesEl.value
   if (el) el.scrollTop = el.scrollHeight
+}
+
+function setPermission(value: 'autonomous' | 'readonly'): void {
+  permission.value = value
+  if (value === 'readonly') cluster.value = false
 }
 
 async function sendChat(): Promise<void> {
@@ -1418,6 +1482,7 @@ async function startRun(): Promise<void> {
     pushToast('warn', '当前设备角色为只读，无法启动任务')
     return
   }
+  if (permission.value === 'readonly') cluster.value = false
   if (permission.value === 'autonomous') {
     const ok = await confirmAction({
       title: '以自主权限启动任务',
@@ -1430,7 +1495,12 @@ async function startRun(): Promise<void> {
   }
   const rid = sendCommand(
     'agent.run.start',
-    { goal: g, permission: permission.value, conversation_id: activeConversationId.value || null },
+    {
+      goal: g,
+      permission: permission.value,
+      cluster: cluster.value,
+      conversation_id: activeConversationId.value || null
+    },
     activeConversationId.value || null
   )
   if (!rid) {
@@ -1441,6 +1511,31 @@ async function startRun(): Promise<void> {
   pushToast('info', '任务启动请求已发送')
   goal.value = ''
   tab.value = 'runs'
+  void loadRuns()
+}
+
+async function decidePlan(plan: ClusterPlan, confirm: boolean): Promise<void> {
+  if (!capability.value.operator) {
+    pushToast('warn', '当前角色不能确认集群计划')
+    return
+  }
+  const ok = await confirmAction({
+    title: confirm ? '确认集群计划' : '拒绝集群计划',
+    message: confirm ? '确认后将原子创建子任务并开始排队执行。' : '拒绝后不会创建任何子任务。',
+    confirmText: confirm ? '确认执行' : '确认拒绝',
+    danger: confirm
+  })
+  if (!ok) return
+  const rid = sendCommand(
+    confirm ? 'agent.plan.confirm' : 'agent.plan.reject',
+    { plan_id: plan.planId, planId: plan.planId, etag: plan.etag },
+    plan.conversationId || null
+  )
+  if (!rid) {
+    pushToast('warn', '实时通道未连接')
+    return
+  }
+  plans.value = plans.value.filter((item) => item.planId !== plan.planId)
   void loadRuns()
 }
 
@@ -1877,18 +1972,27 @@ onBeforeUnmount(() => {
                 <button
                   type="button"
                   :class="{ active: permission === 'readonly' }"
-                  @click="permission = 'readonly'"
+                  @click="setPermission('readonly')"
                 >
                   只读
                 </button>
                 <button
                   type="button"
                   :class="{ active: permission === 'autonomous' }"
-                  @click="permission = 'autonomous'"
+                  @click="setPermission('autonomous')"
                 >
                   自主
                 </button>
               </div>
+              <label class="row row-end" style="gap: 8px">
+                <input
+                  v-model="cluster"
+                  type="checkbox"
+                  :disabled="permission === 'readonly' || !capability.operator"
+                  data-testid="remote-cluster-toggle"
+                />
+                <span>Agent 集群</span>
+              </label>
               <button
                 class="btn-primary"
                 type="button"
@@ -1904,10 +2008,34 @@ onBeforeUnmount(() => {
                   ? 'autonomous：Agent 可在授权目录内自主调用工具，含写操作，会二次确认。'
                   : 'readonly：Agent 只能读取与分析，不写入、不执行副作用。'
               }}
+              {{ cluster ? ' 集群已开启：模型先提交计划，确认后才执行子任务。' : '' }}
             </p>
             <p v-if="!capability.operator" class="muted small">
               当前角色 {{ capability.role }}（{{ roleHint }}），不能启动任务。
             </p>
+          </div>
+
+          <div
+            v-for="plan in plans"
+            :key="plan.planId"
+            class="card"
+            data-testid="remote-cluster-plan"
+          >
+            <strong>Agent 集群计划待确认</strong>
+            <p class="muted small">{{ plan.tasks.length }} 个节点，确认前不会执行。</p>
+            <ol class="stack">
+              <li v-for="task in plan.tasks" :key="task.key" class="card">
+                <strong>{{ task.key }}</strong>
+                <p class="small">{{ task.goal }}</p>
+                <p v-if="task.deps?.length" class="muted small">依赖：{{ task.deps.join('、') }}</p>
+              </li>
+            </ol>
+            <div class="row row-end">
+              <button class="btn-ghost" type="button" @click="decidePlan(plan, false)">拒绝</button>
+              <button class="btn-primary" type="button" @click="decidePlan(plan, true)">
+                确认并执行
+              </button>
+            </div>
           </div>
 
           <div class="row row-between">

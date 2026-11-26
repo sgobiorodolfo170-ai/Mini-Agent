@@ -11,12 +11,7 @@ function killTree(child) {
   if (!child || child.killed) return
   try {
     if (process.platform === 'win32') {
-      execFile(
-        'taskkill',
-        ['/pid', String(child.pid), '/T', '/F'],
-        { windowsHide: true },
-        () => {}
-      )
+      execFile('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true }, () => {})
     } else {
       child.kill('SIGTERM')
     }

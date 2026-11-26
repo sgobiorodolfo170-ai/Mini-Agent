@@ -200,6 +200,31 @@ function intersectMandate(parent, child) {
   }
 }
 
+function deriveSubMandate(parentMandate, parentState = {}, request = {}) {
+  const parent = parentMandate
+    ? normalizeMandate(parentMandate)
+    : normalizeMandate({
+        allowedTools: null,
+        deniedTools: [],
+        permissionMode: parentState.permission || 'autonomous',
+        authorizedDirs: {
+          read: [...(parentState.authorizedDirs || [])],
+          write: [...(parentState.authorizedDirs || [])]
+        },
+        limits: { maxSteps: parentState.maxSteps || null, maxTokens: null },
+        canDelegate: !!parentState.cluster
+      })
+  const child = normalizeMandate({
+    allowedTools: null,
+    deniedTools: [],
+    permissionMode: request.permission || parent.permissionMode,
+    authorizedDirs: parent.authorizedDirs,
+    limits: { maxSteps: request.maxSteps || parent.limits.maxSteps, maxTokens: null },
+    canDelegate: false
+  })
+  return intersectMandate(parent, child)
+}
+
 // 无 mandate 时的受限默认（方案四 §4.3：不得自动全继承）
 function defaultSubMandate(parentMandate) {
   const p = normalizeMandate(parentMandate)
@@ -237,7 +262,7 @@ function authorizeToolCall({ toolName, args, mandate, riskLevel = 'readonly' }) 
   }
 
   // 高风险工具必须有显式授权（出现在 allowedTools 中即视为显式）
-  const explicitlyAllowed = Array.isArray(m.allowedTools) && m.allowedTools.includes(toolName)
+  const explicitlyAllowed = !Array.isArray(m.allowedTools) || m.allowedTools.includes(toolName)
   if (HIGH_RISK_TOOLS.has(toolName) && !explicitlyAllowed) {
     return {
       allowed: false,
@@ -291,6 +316,7 @@ module.exports = {
   HIGH_RISK_TOOLS,
   normalizeMandate,
   intersectMandate,
+  deriveSubMandate,
   defaultSubMandate,
   authorizeToolCall,
   pathAllowed,

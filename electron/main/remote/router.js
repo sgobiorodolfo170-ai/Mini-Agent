@@ -142,6 +142,9 @@ class RemoteCommandRouter {
     }
     if (c.type === 'agent.run.start') {
       const permission = p.permission === 'readonly' ? 'readonly' : 'autonomous'
+      const cluster = !!p.cluster
+      if (cluster && permission !== 'autonomous')
+        throw remoteError('INVALID_MESSAGE', '远程只读模式不可开启集群', 400)
       const goal = String(p.goal || p.content || '').trim()
       if (!goal || goal.length > 16000)
         throw remoteError('INVALID_MESSAGE', '任务目标为空或超过长度限制')
@@ -149,6 +152,7 @@ class RemoteCommandRouter {
         conversationId: cid,
         goal,
         permission,
+        cluster,
         idempotencyKey: `${auth.deviceId}:${c.request_id}`
       })
       return { status: 'accepted', runId: result.runId, reused: !!result.reused }
@@ -176,6 +180,17 @@ class RemoteCommandRouter {
         mode,
         retryOfRunId: result.retryOfRunId || (mode === 'retry' ? runId : null)
       }
+    }
+    if (c.type === 'agent.plan.confirm' || c.type === 'agent.plan.reject') {
+      const planId = String(p.planId || '')
+      const plan = agent.getDraftPlan(planId)
+      if (!plan) throw remoteError('NOT_FOUND', '计划不存在', 404)
+      this.auth.requireGrant(auth, plan.conversationId, 'operate')
+      const result =
+        c.type === 'agent.plan.confirm'
+          ? agent.confirmDraftPlan({ planId, etag: p.etag })
+          : agent.rejectDraftPlan({ planId, etag: p.etag })
+      return { status: 'accepted', plan: result }
     }
     if (['agent.run.pause', 'agent.run.resume', 'agent.run.stop'].includes(c.type)) {
       const runId = p.runId || c.run_id

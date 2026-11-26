@@ -9,7 +9,13 @@ const emit = defineEmits(['select'])
 </script>
 
 <template>
-  <div v-if="items.length" class="ac-status" role="status" aria-live="polite">
+  <div
+    v-if="items.length"
+    class="ac-status"
+    role="status"
+    aria-live="polite"
+    data-testid="composer-runtime"
+  >
     <ComposerStatusPill
       v-for="item in items"
       :key="item.id"

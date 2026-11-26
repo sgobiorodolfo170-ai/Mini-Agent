@@ -2,7 +2,7 @@ const fs = require('fs')
 const path = require('path')
 
 const { RUN_SCHEMA, recoverRuns } = require('./run-storage')
-const SCHEMA_VERSION = 18
+const SCHEMA_VERSION = 19
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS settings (
@@ -313,6 +313,19 @@ CREATE TABLE IF NOT EXISTS run_dependencies (
   run_id TEXT NOT NULL,
   depends_on_run_id TEXT NOT NULL,
   PRIMARY KEY (run_id, depends_on_run_id)
+);
+CREATE TABLE IF NOT EXISTS cluster_plans (
+  id TEXT PRIMARY KEY,
+  parent_run_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'draft',
+  spec_json TEXT NOT NULL,
+  etag TEXT NOT NULL,
+  request_key TEXT,
+  created_at INTEGER NOT NULL,
+  confirmed_at INTEGER,
+  graph_id TEXT,
+  UNIQUE(parent_run_id, request_key)
 );
 CREATE TABLE IF NOT EXISTS run_checkpoints (
   run_id TEXT PRIMARY KEY,

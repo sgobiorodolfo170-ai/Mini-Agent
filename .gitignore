@@ -6,6 +6,8 @@ dist/
 out/
 dist-app/
 dist-app-new/
+dist-app-cluster/
+dist-icon-check/
 release/
 coverage/
 .tmp-spike-models/

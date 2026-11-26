@@ -25,6 +25,46 @@ const sessionsApi = require('./agent/sessions')
 const { getHub } = require('./events/hub')
 const { parseHooks, runHooks, STAGES, ACTIONS } = require('./events/hooks')
 const runtimeLog = require('./runtime-log')
+const { parseMcpServersDetailed } = require('./agent/mcp-client')
+
+// 校验结果只回传稳定诊断元数据，不回传 command、args、env 等配置正文。
+function validateMcpConfig(raw) {
+  const { configured, diagnostics } = parseMcpServersDetailed(raw)
+  return {
+    configured,
+    valid: diagnostics.length === 0,
+    diagnostics: diagnostics.map((d) => {
+      const out = { code: String(d.code || 'invalid_config'), reason: String(d.reason || '') }
+      if (typeof d.name === 'string') out.name = d.name.slice(0, 120)
+      if (Number.isInteger(d.index)) out.index = d.index
+      return out
+    })
+  }
+}
+
+function mcpConfigError(result) {
+  const details = result.diagnostics
+    .map((d) => {
+      const target = d.name ? `服务器「${d.name}」：` : ''
+      const arg = Number.isInteger(d.index) ? `args[${d.index}] ` : ''
+      return `${target}${arg}${d.reason}`
+    })
+    .join('；')
+  return `MCP 配置无效：${details}`
+}
+
+// MCP 设置统一按可编辑文本存储；同时兼容修复前直接存入的 JSON 对象。
+function normalizeMcpConfig(raw) {
+  if (raw == null) return null
+  if (typeof raw === 'string') return raw.trim() || null
+  try {
+    const serialized = JSON.stringify(raw)
+    if (typeof serialized === 'string') return serialized
+  } catch {
+    // 序列化失败统一返回稳定错误，不向渲染进程暴露实现细节。
+  }
+  throw new Error('MCP 配置必须是 JSON 字符串或可序列化对象')
+}
 
 function safeParse(s, d) {
   try {
@@ -137,12 +177,29 @@ function registerIpc(ctx) {
   const h = (ch, fn) => ipcMain.handle(ch, async (_e, ...args) => fn(...args))
 
   // settings
-  h('settings:get', (k) => repos.getSetting(dbm.get(), k))
+  h('settings:get', (k) => {
+    const value = repos.getSetting(dbm.get(), k)
+    return k === 'agentMcpServers' ? normalizeMcpConfig(value) : value
+  })
   h('settings:set', (k, v) => {
+    if (k === 'agentMcpServers') {
+      const raw = normalizeMcpConfig(v)
+      const result = validateMcpConfig(raw)
+      if (!result.valid) throw new Error(mcpConfigError(result))
+      v = raw
+    }
     repos.setSetting(dbm.get(), k, v)
     return true
   })
-  h('settings:all', () => repos.getAllSettings(dbm.get()))
+  h('settings:all', () => {
+    const settings = repos.getAllSettings(dbm.get())
+    if (Object.prototype.hasOwnProperty.call(settings, 'agentMcpServers')) {
+      settings.agentMcpServers = normalizeMcpConfig(settings.agentMcpServers)
+    }
+    return settings
+  })
+  // 只读校验：不启动 MCP 进程，也不返回可能含密钥的服务器配置。
+  h('settings:validateMcp', (raw) => validateMcpConfig(raw))
 
   // providers & keys
   h('providers:list', () => {
@@ -238,7 +295,12 @@ function registerIpc(ctx) {
   const assertWorkspace = (target) => {
     const p = String(target || '')
     if (!p) throw new Error('缺少文件路径')
-    if (!isPathAllowed(workspaceRoots().map((r) => r.path), p)) {
+    if (
+      !isPathAllowed(
+        workspaceRoots().map((r) => r.path),
+        p
+      )
+    ) {
       throw new Error('路径不在项目工作区内：' + p)
     }
     return p
@@ -280,7 +342,6 @@ function registerIpc(ctx) {
   // 侧边任务：临时子会话，只做流式回传，不写入主会话历史
   h('side:send', (o) => sideTask.send(o || {}))
   h('side:stop', (o) => sideTask.stop(o || {}))
-
 
   // projects（项目工作目录：会话分类 + Agent 命令执行目录）
   h('projects:list', () => {
@@ -496,6 +557,7 @@ function registerIpc(ctx) {
   h('agent:respond', (o) => agent.respondConfirm(o))
   h('agent:acceptance:decide', (o) => agent.decideAcceptance(o))
   h('agent:runs', () => repos.listRuns(dbm.get(), 50))
+  h('agent:queue', () => agent.getQueueSnapshot())
   h('agent:calls', (runId) => repos.getRunCalls(dbm.get(), runId))
   h('agent:graph', (runId) => agent.getGraphForParent(runId))
   h('agent:graph:layout:get', (runId) => agent.getGraphLayoutForParent(runId))
@@ -507,6 +569,10 @@ function registerIpc(ctx) {
     })
   )
   h('agent:graph:mutate', (o) => agent.mutateRunGraph(o || {}))
+  h('agent:plan:list', (runId) => agent.listDraftPlans(runId))
+  h('agent:plan:get', (planId) => agent.getDraftPlan(planId))
+  h('agent:plan:confirm', (o) => agent.confirmDraftPlan(o || {}))
+  h('agent:plan:reject', (o) => agent.rejectDraftPlan(o || {}))
   h('computer:stop', () => agent.stopComputer())
 
   // 内置浏览器：仅主窗口可调用，Agent 通过主进程 BrowserService 访问自己的临时标签。

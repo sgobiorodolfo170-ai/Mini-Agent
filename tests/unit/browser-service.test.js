@@ -1,6 +1,53 @@
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { EventEmitter } from 'node:events'
-import { describe, expect, it, vi } from 'vitest'
+import zlib from 'node:zlib'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createBrowserService } from '../../electron/main/browser/service'
+
+const VALID_PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+  'base64'
+)
+const PNG_CACHE = new Map([[1, VALID_PNG]])
+
+function pngCrc32(buffer) {
+  let crc = 0xffffffff
+  for (const byte of buffer) {
+    crc ^= byte
+    for (let bit = 0; bit < 8; bit += 1) crc = crc & 1 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+
+function pngChunk(type, data) {
+  const content = Buffer.concat([Buffer.from(type), data])
+  const chunk = Buffer.alloc(data.length + 12)
+  chunk.writeUInt32BE(data.length, 0)
+  content.copy(chunk, 4)
+  chunk.writeUInt32BE(pngCrc32(content), data.length + 8)
+  return chunk
+}
+
+function pngWithSize(width, height) {
+  const key = width * 100000 + height
+  if (PNG_CACHE.has(key)) return Buffer.from(PNG_CACHE.get(key))
+  const header = Buffer.alloc(13)
+  header.writeUInt32BE(width, 0)
+  header.writeUInt32BE(height, 4)
+  header[8] = 8
+  header[9] = 6
+  const pixels = Buffer.alloc((width * 4 + 1) * height)
+  const png = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', header),
+    pngChunk('IDAT', zlib.deflateSync(pixels)),
+    pngChunk('IEND', Buffer.alloc(0))
+  ])
+  PNG_CACHE.set(key, png)
+  return Buffer.from(png)
+}
 
 class FakeWebContents extends EventEmitter {
   constructor(url = 'about:blank') {
@@ -21,6 +68,11 @@ class FakeWebContents extends EventEmitter {
     this.styleResult = undefined
     this.selectedInfo = null
     this.focusBlocked = false
+    this.captureSize = { width: 0, height: 0 }
+    this.capturePng = Buffer.alloc(0)
+    this.captureError = null
+    this.capturePngError = null
+    this.captureHandler = null
     this.zoomFactor = 1
     this.zoomHistory = []
     this.debugger = {
@@ -62,6 +114,18 @@ class FakeWebContents extends EventEmitter {
     }
     this.emit('did-navigate', {}, url)
     this.emit('did-stop-loading')
+  }
+
+  async capturePage() {
+    if (this.captureError) throw this.captureError
+    if (this.captureHandler) return this.captureHandler()
+    return {
+      getSize: () => ({ ...this.captureSize }),
+      toPNG: () => {
+        if (this.capturePngError) throw this.capturePngError
+        return Buffer.from(this.capturePng)
+      }
+    }
   }
 
   setWindowOpenHandler(handler) {
@@ -204,13 +268,21 @@ class FakeSession extends EventEmitter {
   flushStorageData() {}
 }
 
-function harness({ allowPrivateNetwork = true } = {}) {
+function harness({
+  allowPrivateNetwork = true,
+  artifactDir = process.cwd(),
+  screenshotCaptureTimeoutMs,
+  screenshotQueueTimeoutMs
+} = {}) {
   const sessions = new Map()
   const children = []
   const mainWindow = {
     destroyed: false,
     isDestroyed() {
       return this.destroyed
+    },
+    getContentSize() {
+      return [1024, 768]
     },
     contentView: {
       addChildView(view) {
@@ -232,7 +304,20 @@ function harness({ allowPrivateNetwork = true } = {}) {
         return sessions.get(partition)
       }
     },
-    app: { getPath: () => process.cwd() }
+    app: { getPath: () => process.cwd() },
+    nativeImage: {
+      createFromBuffer(png) {
+        return {
+          isEmpty: () => png.length < 33,
+          getSize: () => ({ width: png.readUInt32BE(16), height: png.readUInt32BE(20) }),
+          toBitmap: () => {
+            const width = png.readUInt32BE(16)
+            const height = png.readUInt32BE(20)
+            return Buffer.alloc(width * height * 4)
+          }
+        }
+      }
+    }
   }
   const service = createBrowserService({
     electronApi,
@@ -240,9 +325,11 @@ function harness({ allowPrivateNetwork = true } = {}) {
     getSetting: (key) => (key === 'browserAllowPrivateNetwork' ? allowPrivateNetwork : null),
     emit: () => {},
     downloadDir: process.cwd(),
-    artifactDir: process.cwd()
+    artifactDir,
+    screenshotCaptureTimeoutMs,
+    screenshotQueueTimeoutMs
   })
-  return { service, children, sessions }
+  return { service, children, sessions, mainWindow, electronApi }
 }
 
 function emitKey(webContents, input) {
@@ -769,5 +856,421 @@ describe('browser service', () => {
     expect(service.getState().tabs).toHaveLength(0)
     expect(children).toHaveLength(0)
     expect(() => service.open({ kind: 'user' })).toThrow(/停用/)
+  })
+
+  describe('screenshots', () => {
+    let artifactDir
+
+    beforeEach(() => {
+      artifactDir = fs.mkdtempSync(path.join(os.tmpdir(), 'miniagent-browser-screenshot-'))
+    })
+
+    afterEach(() => {
+      vi.restoreAllMocks()
+      fs.rmSync(artifactDir, { recursive: true, force: true })
+    })
+
+    async function hiddenAgentScreenshot(options = {}) {
+      const context = harness({ artifactDir, ...options })
+      const agent = context.service.forRun('run-screenshot')
+      await agent.navigate({ url: 'about:blank' })
+      const tab = agent.tabs()[0]
+      const view = context.children[0]
+      const webContents = view.webContents
+      webContents.captureSize = { width: 800, height: 600 }
+      webContents.capturePng = pngWithSize(800, 600)
+      return { ...context, agent, tab, view, webContents }
+    }
+
+    it('captures a hidden unmounted Agent tab and restores its zero-sized hidden view', async () => {
+      const { service, agent, tab, view, webContents, children } = await hiddenAgentScreenshot()
+      expect(service.getState().attachedTabId).toBe(null)
+      expect(tab.bounds).toEqual({ x: 0, y: 0, width: 0, height: 0 })
+      webContents.captureHandler = () => {
+        expect(view.visible).toBe(true)
+        expect(view.bounds).toEqual({ x: -799, y: -599, width: 800, height: 600 })
+        return {
+          getSize: () => ({ width: 800, height: 600 }),
+          toPNG: () => pngWithSize(800, 600)
+        }
+      }
+
+      const screenshot = await agent.screenshot({ tabId: tab.id })
+      const png = fs.readFileSync(screenshot.path)
+      expect(screenshot).toMatchObject({ width: 800, height: 600 })
+      expect(png.equals(webContents.capturePng)).toBe(true)
+      expect(fs.readdirSync(artifactDir)).toHaveLength(1)
+      expect(service.getState().attachedTabId).toBe(null)
+      expect(view.visible).toBe(false)
+      expect(view.bounds).toEqual({ x: 0, y: 0, width: 0, height: 0 })
+      expect(children).toHaveLength(1)
+    })
+
+    it('preserves a debugger session that was already attached before capture', async () => {
+      const { agent, tab, webContents } = await hiddenAgentScreenshot()
+      const debuggerApi = webContents.debugger
+      debuggerApi.attached = true
+      debuggerApi.sendCommand = async () => ({ data: pngWithSize(800, 600).toString('base64') })
+
+      await agent.screenshot({ tabId: tab.id })
+      expect(debuggerApi.isAttached()).toBe(true)
+    })
+
+    it('rejects zero-sized captures without leaving an artifact', async () => {
+      const { agent, tab, view, webContents } = await hiddenAgentScreenshot()
+      webContents.captureSize = { width: 0, height: 0 }
+
+      await expect(agent.screenshot({ tabId: tab.id })).rejects.toMatchObject({
+        name: 'BrowserError',
+        code: 'BROWSER_SCREENSHOT_INVALID',
+        message: expect.stringContaining('宽高必须大于 0')
+      })
+      expect(fs.readdirSync(artifactDir)).toEqual([])
+      expect(view.visible).toBe(false)
+      expect(view.bounds).toEqual({ x: 0, y: 0, width: 0, height: 0 })
+    })
+
+    it('rejects an empty PNG buffer without leaving an artifact', async () => {
+      const { agent, tab, view, webContents } = await hiddenAgentScreenshot()
+      webContents.capturePng = Buffer.alloc(0)
+
+      await expect(agent.screenshot({ tabId: tab.id })).rejects.toMatchObject({
+        code: 'BROWSER_SCREENSHOT_INVALID',
+        message: expect.stringContaining('PNG 缓冲为空')
+      })
+      expect(fs.readdirSync(artifactDir)).toEqual([])
+      expect(view.visible).toBe(false)
+      expect(view.bounds.width).toBe(0)
+    })
+
+    it('wraps toPNG failures in BrowserError and restores the hidden view', async () => {
+      const { agent, tab, view, webContents } = await hiddenAgentScreenshot()
+      webContents.capturePngError = new Error('encoder failed')
+
+      await expect(agent.screenshot({ tabId: tab.id })).rejects.toMatchObject({
+        name: 'BrowserError',
+        code: 'BROWSER_SCREENSHOT_FAILED',
+        message: expect.stringContaining('encoder failed')
+      })
+      expect(fs.readdirSync(artifactDir)).toEqual([])
+      expect(view.visible).toBe(false)
+      expect(view.bounds).toEqual({ x: 0, y: 0, width: 0, height: 0 })
+    })
+
+    it('rejects a non-PNG payload without leaving an artifact', async () => {
+      const { agent, tab, view } = await hiddenAgentScreenshot()
+      view.webContents.capturePng = Buffer.from('not-a-png')
+
+      await expect(agent.screenshot({ tabId: tab.id })).rejects.toMatchObject({
+        code: 'BROWSER_SCREENSHOT_INVALID',
+        message: expect.stringContaining('不是有效的 PNG')
+      })
+      expect(fs.readdirSync(artifactDir)).toEqual([])
+      expect(view.visible).toBe(false)
+    })
+
+    it.each([
+      ['缺少 IDAT', (png) => Buffer.concat([png.subarray(0, 33), png.subarray(png.length - 12)])],
+      ['缺少 IEND', (png) => png.subarray(0, png.length - 12)],
+      [
+        'IDAT CRC 损坏',
+        (png) => {
+          const damaged = Buffer.from(png)
+          const idatLength = damaged.readUInt32BE(33)
+          damaged[41 + idatLength] ^= 0xff
+          return damaged
+        }
+      ],
+      ['IHDR 后截断', (png) => png.subarray(0, 33)]
+    ])('rejects incomplete PNG chunks: %s', async (_label, damage) => {
+      const { agent, tab, view } = await hiddenAgentScreenshot()
+      view.webContents.capturePng = damage(pngWithSize(1, 1))
+
+      await expect(agent.screenshot({ tabId: tab.id })).rejects.toMatchObject({
+        code: 'BROWSER_SCREENSHOT_INVALID'
+      })
+      expect(fs.readdirSync(artifactDir)).toEqual([])
+      expect(view.visible).toBe(false)
+    })
+
+    it('cleans the temporary file when the atomic rename fails', async () => {
+      const { agent, tab } = await hiddenAgentScreenshot()
+      vi.spyOn(fs, 'renameSync').mockImplementation(() => {
+        throw new Error('disk full')
+      })
+
+      await expect(agent.screenshot({ tabId: tab.id })).rejects.toMatchObject({
+        code: 'BROWSER_SCREENSHOT_FAILED',
+        message: expect.stringContaining('disk full')
+      })
+      expect(fs.readdirSync(artifactDir)).toEqual([])
+    })
+
+    it('does not undo an attachment requested while the capture is in flight', async () => {
+      const { service, agent, tab, view, webContents } = await hiddenAgentScreenshot()
+      const attachedBounds = { x: 20, y: 30, width: 900, height: 700 }
+      webContents.captureHandler = () => {
+        service.attach(tab.id, attachedBounds)
+        return {
+          getSize: () => ({ width: 800, height: 600 }),
+          toPNG: () => pngWithSize(800, 600)
+        }
+      }
+
+      await agent.screenshot({ tabId: tab.id })
+      expect(service.getState().attachedTabId).toBe(tab.id)
+      expect(view.visible).toBe(true)
+      expect(view.bounds).toEqual(attachedBounds)
+    })
+
+    it('keeps a detachment requested during an attached capture', async () => {
+      const { service, agent, tab, view, webContents } = await hiddenAgentScreenshot()
+      service.attach(tab.id, { x: 10, y: 20, width: 800, height: 600 })
+      webContents.captureHandler = () => {
+        service.detach()
+        return {
+          getSize: () => ({ width: 800, height: 600 }),
+          toPNG: () => pngWithSize(800, 600)
+        }
+      }
+
+      await agent.screenshot({ tabId: tab.id })
+      expect(service.getState().attachedTabId).toBe(null)
+      expect(view.visible).toBe(false)
+      expect(view.bounds).toEqual({ x: 10, y: 20, width: 800, height: 600 })
+    })
+
+    it('serializes concurrent captures of the same hidden tab', async () => {
+      const { agent, tab, webContents } = await hiddenAgentScreenshot()
+      let releaseFirst
+      let markStarted
+      const firstStarted = new Promise((resolve) => {
+        markStarted = resolve
+      })
+      const gate = new Promise((resolve) => {
+        releaseFirst = resolve
+      })
+      let captureCalls = 0
+      let activeCaptures = 0
+      let maxActiveCaptures = 0
+      webContents.captureHandler = async () => {
+        captureCalls += 1
+        activeCaptures += 1
+        maxActiveCaptures = Math.max(maxActiveCaptures, activeCaptures)
+        if (captureCalls === 1) {
+          markStarted()
+          await gate
+        }
+        activeCaptures -= 1
+        return {
+          getSize: () => ({ width: 800, height: 600 }),
+          toPNG: () => pngWithSize(800, 600)
+        }
+      }
+
+      const first = agent.screenshot({ tabId: tab.id })
+      const second = agent.screenshot({ tabId: tab.id })
+      await firstStarted
+      expect(captureCalls).toBe(1)
+      releaseFirst()
+      await Promise.all([first, second])
+      expect(maxActiveCaptures).toBe(1)
+      expect(captureCalls).toBe(2)
+      expect(fs.readdirSync(artifactDir)).toHaveLength(2)
+    })
+
+    it('times out a hung native capture without starting an overlapping capture', async () => {
+      vi.useFakeTimers()
+      try {
+        const { service, children } = harness({
+          artifactDir,
+          screenshotCaptureTimeoutMs: 20,
+          screenshotQueueTimeoutMs: 25
+        })
+        const tab = service.open({ kind: 'user' })
+        service.attach(tab.id, { x: 10, y: 20, width: 800, height: 600 })
+        const view = children[0]
+        const webContents = view.webContents
+        let releaseCapture
+        const captureGate = new Promise((resolve) => {
+          releaseCapture = resolve
+        })
+        let captureCalls = 0
+        webContents.captureHandler = () => {
+          captureCalls += 1
+          return captureGate.then(() => ({
+            getSize: () => ({ width: 800, height: 600 }),
+            toPNG: () => pngWithSize(800, 600)
+          }))
+        }
+        const first = expect(service.screenshot(tab.id)).rejects.toMatchObject({
+          name: 'BrowserError',
+          code: 'BROWSER_SCREENSHOT_TIMEOUT'
+        })
+        await vi.advanceTimersByTimeAsync(25)
+        await first
+        expect(view.visible).toBe(true)
+        expect(view.bounds).toEqual({ x: 10, y: 20, width: 800, height: 600 })
+
+        webContents.captureHandler = null
+        const blocked = expect(service.screenshot(tab.id)).rejects.toMatchObject({
+          code: 'BROWSER_SCREENSHOT_TIMEOUT'
+        })
+        await vi.advanceTimersByTimeAsync(25)
+        await blocked
+        expect(captureCalls).toBe(1)
+
+        releaseCapture()
+        await vi.advanceTimersByTimeAsync(0)
+        webContents.captureSize = { width: 800, height: 600 }
+        webContents.capturePng = pngWithSize(800, 600)
+        await expect(service.screenshot(tab.id)).resolves.toMatchObject({ width: 800, height: 600 })
+        expect(fs.readdirSync(artifactDir)).toHaveLength(1)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('keeps the internal queue serialized after the caller deadline expires', async () => {
+      vi.useFakeTimers()
+      try {
+        const { agent, tab, view, webContents } = await hiddenAgentScreenshot({
+          screenshotCaptureTimeoutMs: 1000,
+          screenshotQueueTimeoutMs: 25
+        })
+        let releaseCapture
+        const captureGate = new Promise((resolve) => {
+          releaseCapture = resolve
+        })
+        let captureCalls = 0
+        webContents.captureHandler = () => {
+          captureCalls += 1
+          return captureGate.then(() => ({
+            getSize: () => ({ width: 800, height: 600 }),
+            toPNG: () => pngWithSize(800, 600)
+          }))
+        }
+        const first = expect(agent.screenshot({ tabId: tab.id })).rejects.toMatchObject({
+          code: 'BROWSER_SCREENSHOT_TIMEOUT',
+          message: expect.stringContaining('队列超时')
+        })
+        await vi.advanceTimersByTimeAsync(25)
+        await first
+        expect(view.visible).toBe(false)
+        expect(view.bounds).toEqual({ x: 0, y: 0, width: 0, height: 0 })
+
+        webContents.captureHandler = null
+        const second = agent.screenshot({ tabId: tab.id })
+        await vi.advanceTimersByTimeAsync(0)
+        expect(captureCalls).toBe(1)
+        releaseCapture()
+        await expect(second).resolves.toMatchObject({ width: 800, height: 600 })
+        await vi.advanceTimersByTimeAsync(0)
+        expect(fs.readdirSync(artifactDir)).toHaveLength(1)
+        expect(view.visible).toBe(false)
+        expect(view.bounds).toEqual({ x: 0, y: 0, width: 0, height: 0 })
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('does not re-show a detached view when frame settling invalidates the attempt', async () => {
+      const { service, agent, tab, view, webContents } = await hiddenAgentScreenshot()
+      let detached = false
+      const executeJavaScript = webContents.executeJavaScript.bind(webContents)
+      webContents.executeJavaScript = async (code) => {
+        if (code.includes('requestAnimationFrame')) {
+          detached = true
+          service.detach()
+        }
+        return executeJavaScript(code)
+      }
+      const visibleCalls = []
+      const setVisible = view.setVisible.bind(view)
+      view.setVisible = (visible) => {
+        if (detached) visibleCalls.push(visible)
+        setVisible(visible)
+      }
+
+      await expect(agent.screenshot({ tabId: tab.id })).rejects.toMatchObject({
+        code: 'BROWSER_SCREENSHOT_ABORTED'
+      })
+      expect(visibleCalls).not.toContain(true)
+      expect(service.getState().attachedTabId).toBe(null)
+      expect(view.visible).toBe(false)
+      expect(fs.readdirSync(artifactDir)).toEqual([])
+    })
+
+    it('never restores or re-shows a view closed during capture', async () => {
+      const { service, agent, tab, view, webContents } = await hiddenAgentScreenshot()
+      service.attach(tab.id, { x: 10, y: 20, width: 800, height: 600 })
+      const visibleCalls = []
+      const setVisible = view.setVisible.bind(view)
+      view.setVisible = (visible) => {
+        visibleCalls.push(visible)
+        setVisible(visible)
+      }
+      webContents.captureHandler = () => {
+        service.close(tab.id)
+        return {
+          getSize: () => ({ width: 800, height: 600 }),
+          toPNG: () => pngWithSize(800, 600)
+        }
+      }
+
+      await expect(agent.screenshot({ tabId: tab.id })).rejects.toMatchObject({
+        code: 'BROWSER_TAB_NOT_FOUND'
+      })
+      expect(visibleCalls).not.toContain(true)
+      expect(view.visible).toBe(false)
+      expect(fs.readdirSync(artifactDir)).toEqual([])
+    })
+
+    it('rejects a 24-byte truncated PNG from native capture', async () => {
+      const { service, agent, tab, webContents } = await hiddenAgentScreenshot()
+      const truncated = pngWithSize(1, 1).subarray(0, 24)
+      webContents.captureSize = { width: 1, height: 1 }
+      webContents.capturePng = truncated
+      service.attach(tab.id, { x: 0, y: 0, width: 800, height: 600 })
+
+      await expect(agent.screenshot({ tabId: tab.id })).rejects.toMatchObject({
+        name: 'BrowserError',
+        code: 'BROWSER_SCREENSHOT_INVALID',
+        message: expect.stringContaining('PNG')
+      })
+      expect(fs.readdirSync(artifactDir)).toEqual([])
+    })
+
+    it('rejects mismatches between returned, IHDR and fully decoded image dimensions', async () => {
+      const { service, children, electronApi } = harness({ artifactDir })
+      const tab = service.open({ kind: 'user' })
+      service.attach(tab.id, { x: 0, y: 0, width: 800, height: 600 })
+      const webContents = children[0].webContents
+      webContents.captureSize = { width: 800, height: 600 }
+      webContents.capturePng = pngWithSize(1, 1)
+      await expect(service.screenshot(tab.id)).rejects.toMatchObject({
+        code: 'BROWSER_SCREENSHOT_INVALID',
+        message: expect.stringContaining('尺寸不一致')
+      })
+
+      webContents.captureSize = { width: 640, height: 480 }
+      webContents.capturePng = pngWithSize(640, 480)
+      await expect(service.screenshot(tab.id)).rejects.toMatchObject({
+        code: 'BROWSER_SCREENSHOT_INVALID',
+        message: expect.stringContaining('尺寸不一致')
+      })
+
+      webContents.captureSize = { width: 1, height: 1 }
+      const createFromBuffer = electronApi.nativeImage.createFromBuffer
+      electronApi.nativeImage.createFromBuffer = (png) => {
+        const image = createFromBuffer(png)
+        return { ...image, getSize: () => ({ width: 2, height: 1 }) }
+      }
+      await expect(service.screenshot(tab.id)).rejects.toMatchObject({
+        code: 'BROWSER_SCREENSHOT_INVALID',
+        message: expect.stringContaining('尺寸不一致')
+      })
+      expect(fs.readdirSync(artifactDir)).toEqual([])
+    })
   })
 })

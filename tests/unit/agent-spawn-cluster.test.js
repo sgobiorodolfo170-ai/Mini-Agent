@@ -5,6 +5,7 @@ import { defineTools } from '../../electron/main/agent/tools'
 // 这里只验证工具层的参数归一与校验，真实并发由 agent/index.js 的 Promise.all 承担。
 function buildCtx(spawnAgent) {
   return {
+    cluster: true,
     authorizedDirs: [],
     workingDir: process.cwd(),
     clipboard: { readText: () => '', writeText: () => {} },

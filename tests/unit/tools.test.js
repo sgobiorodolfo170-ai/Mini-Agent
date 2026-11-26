@@ -14,6 +14,7 @@ beforeAll(() => {
   fs.writeFileSync(path.join(dir, 'a.txt'), '文件内容ABC')
   fs.writeFileSync(path.join(dir, 'sub', 'deep-target-xyz.log'), 'log')
   ctx = {
+    cluster: true,
     authorizedDirs: [dir],
     workingDir: dir,
     clipboard: {
@@ -114,19 +115,172 @@ describe('file tools honor the authorized-directory guard', () => {
     expect(r).toContain('deep-target-xyz.log')
   })
 
+  it('grep_files skips file symlinks that escape the authorized root', async () => {
+    const outside = path.join(
+      os.tmpdir(),
+      `miniagent-grep-outside-${process.pid}-${Date.now()}.txt`
+    )
+    const link = path.join(dir, 'escaped-link.txt')
+    fs.writeFileSync(outside, 'OUTSIDE_SECRET_MARKER')
+    fs.symlinkSync(outside, link)
+    try {
+      const result = await map.grep_files.handler({ dir, pattern: 'OUTSIDE_SECRET_MARKER' })
+      expect(result).not.toContain('OUTSIDE_SECRET_MARKER')
+      expect(result).not.toContain('escaped-link.txt')
+    } finally {
+      fs.rmSync(link, { force: true })
+      fs.rmSync(outside, { force: true })
+    }
+  })
+
   it('read_file refuses oversized files', async () => {
     const big = path.join(dir, 'big.bin')
     fs.writeFileSync(big, Buffer.alloc(3 * 1024 * 1024, 1))
     expect(await map.read_file.handler({ path: big })).toContain('过大')
     fs.rmSync(big, { force: true })
   })
+
+  it('keeps concurrent file operations independent and supports a symlinked root', async () => {
+    const rootLink = path.join(os.tmpdir(), `miniagent-root-link-${process.pid}-${Date.now()}`)
+    fs.symlinkSync(dir, rootLink, process.platform === 'win32' ? 'junction' : 'dir')
+    const linked = Object.fromEntries(
+      defineTools({ ...ctx, authorizedDirs: [rootLink] }).map((t) => [t.name, t])
+    )
+    try {
+      expect(await linked.read_file.handler({ path: path.join(rootLink, 'a.txt') })).toBe(
+        '文件内容ABC'
+      )
+      const targets = ['concurrent-a.txt', 'concurrent-b.txt'].map((name) =>
+        path.join(rootLink, name)
+      )
+      await Promise.all(
+        targets.map((target, i) => linked.write_file.handler({ path: target, content: `v${i}` }))
+      )
+      expect(
+        await Promise.all(targets.map((target) => linked.read_file.handler({ path: target })))
+      ).toEqual(['v0', 'v1'])
+    } finally {
+      fs.rmSync(rootLink, { force: true })
+    }
+  })
+
+  it('does not expose an outside file when a link is swapped during grep traversal', async () => {
+    const outside = path.join(os.tmpdir(), `miniagent-grep-swap-${process.pid}-${Date.now()}.txt`)
+    const inside = path.join(dir, 'swap-target.txt')
+    fs.writeFileSync(outside, 'SWAP_SECRET_MARKER')
+    fs.writeFileSync(inside, 'inside')
+    const originalReaddir = fs.readdirSync
+    let swapped = false
+    const spy = vi.spyOn(fs, 'readdirSync').mockImplementation((p, ...args) => {
+      const entries = originalReaddir(p, ...args)
+      if (!swapped && path.resolve(p) === path.resolve(dir)) {
+        swapped = true
+        fs.rmSync(inside)
+        fs.symlinkSync(outside, inside)
+      }
+      return entries
+    })
+    try {
+      const result = await map.grep_files.handler({ dir, pattern: 'SWAP_SECRET_MARKER' })
+      expect(result).not.toContain('SWAP_SECRET_MARKER')
+      expect(swapped).toBe(true)
+    } finally {
+      spy.mockRestore()
+      fs.rmSync(inside, { force: true })
+      fs.rmSync(outside, { force: true })
+    }
+  })
 })
 
 describe('clipboard / shell tools', () => {
+  const toolsWithClipboard = (clipboard) =>
+    Object.fromEntries(defineTools({ ...ctx, clipboard }).map((t) => [t.name, t]))
+
   it('writes and reads through the injected clipboard', async () => {
     await map.clipboard_write.handler({ text: '剪贴板文本' })
     expect(ctx.clipboard.readText()).toBe('剪贴板文本')
     expect(await map.clipboard_read.handler({})).toBe('剪贴板文本')
+  })
+
+  it('awaits delayed clipboard reads', async () => {
+    let resolveRead
+    const readText = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          resolveRead = resolve
+        })
+    )
+    const clipboardMap = toolsWithClipboard({ readText })
+    const result = clipboardMap.clipboard_read.handler({})
+
+    expect(readText).toHaveBeenCalledOnce()
+    resolveRead('延迟文本')
+    await expect(result).resolves.toBe('延迟文本')
+  })
+
+  it('normalizes reads, preserves empty semantics and truncates to 5000 characters', async () => {
+    const readText = vi
+      .fn()
+      .mockReturnValueOnce('')
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(0)
+      .mockResolvedValueOnce('x'.repeat(5001))
+    const clipboardMap = toolsWithClipboard({ readText })
+
+    await expect(clipboardMap.clipboard_read.handler({})).resolves.toBe('(剪贴板为空)')
+    await expect(clipboardMap.clipboard_read.handler({})).resolves.toBe('(剪贴板为空)')
+    await expect(clipboardMap.clipboard_read.handler({})).resolves.toBe('(剪贴板为空)')
+    await expect(clipboardMap.clipboard_read.handler({})).resolves.toBe('0')
+    await expect(clipboardMap.clipboard_read.handler({})).resolves.toBe('x'.repeat(5000))
+  })
+
+  it('awaits delayed clipboard writes before reporting success', async () => {
+    let resolveWrite
+    const writeText = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          resolveWrite = resolve
+        })
+    )
+    const clipboardMap = toolsWithClipboard({ writeText })
+    let settled = false
+    const result = clipboardMap.clipboard_write.handler({ text: '延迟写入' })
+    const observed = result.then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      }
+    )
+
+    await Promise.resolve()
+    expect(writeText).toHaveBeenCalledWith('延迟写入')
+    expect(settled).toBe(false)
+    resolveWrite()
+    await expect(result).resolves.toBe('已写入剪贴板')
+    await observed
+  })
+
+  it('propagates asynchronous clipboard read and write failures', async () => {
+    const readError = new Error('read failed')
+    const writeError = new Error('write failed')
+    const readMap = toolsWithClipboard({ readText: vi.fn().mockRejectedValue(readError) })
+    const writeMap = toolsWithClipboard({ writeText: vi.fn().mockRejectedValue(writeError) })
+
+    await expect(readMap.clipboard_read.handler({})).rejects.toBe(readError)
+    await expect(writeMap.clipboard_write.handler({ text: 'x' })).rejects.toBe(writeError)
+  })
+
+  it('propagates synchronous clipboard write failures', async () => {
+    const writeError = new Error('write failed')
+    const writeText = vi.fn(() => {
+      throw writeError
+    })
+    const clipboardMap = toolsWithClipboard({ writeText })
+
+    await expect(clipboardMap.clipboard_write.handler({ text: 'x' })).rejects.toBe(writeError)
   })
 
   it('open_url allows only http(s)', async () => {
@@ -360,7 +514,7 @@ describe('browser_* tools share one offscreen session', () => {
 
   it('errors when browserFactory is unavailable', async () => {
     const local = Object.fromEntries(
-      defineTools({ todo: { seq: 0, items: [] } }).map((t) => [t.name, t])
+      defineTools({ cluster: true, todo: { seq: 0, items: [] } }).map((t) => [t.name, t])
     )
     await expect(local.browser_navigate.handler({ url: 'https://b.example/' })).rejects.toThrow(
       /不支持/
@@ -471,6 +625,7 @@ describe('会话管理工具（session_*）', () => {
     })
     const local = Object.fromEntries(
       defineTools({
+        cluster: true,
         todo: { seq: 0, items: [] },
         waitForSession: async ({ conversationId }) => {
           await gate
@@ -496,6 +651,7 @@ describe('会话管理工具（session_*）', () => {
     const calls = []
     const local = Object.fromEntries(
       defineTools({
+        cluster: true,
         todo: { seq: 0, items: [] },
         sendToSession: async (opts) => {
           calls.push(opts)
@@ -528,7 +684,7 @@ describe('会话管理工具（session_*）', () => {
 
   it('会话管理未注入时给出明确错误，而不是静默失败', async () => {
     const bare = Object.fromEntries(
-      defineTools({ todo: { seq: 0, items: [] } }).map((t) => [t.name, t])
+      defineTools({ cluster: true, todo: { seq: 0, items: [] } }).map((t) => [t.name, t])
     )
     await expect(bare.session_create.handler({ title: 'x' })).rejects.toThrow('会话管理未启用')
     await expect(bare.session_send.handler({ conversationId: 'c', content: 'x' })).rejects.toThrow(

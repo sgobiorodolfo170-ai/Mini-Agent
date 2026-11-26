@@ -46,6 +46,24 @@ function tool(name, args) {
   }
 }
 
+async function approveWorkspacePlan() {
+  const approvals = agent.getApprovalService()
+  const original = approvals.decide.bind(approvals)
+  approvals.decide = (input) => {
+    const pending = original(input)
+    setImmediate(() => {
+      const row = dbm
+        .get()
+        .prepare(
+          "SELECT approval_id FROM agent_approvals WHERE run_id=? AND tool='run_plan_confirm' AND status='pending' ORDER BY created_at DESC LIMIT 1"
+        )
+        .get(input.runId)
+      if (row) approvals.respond({ approvalId: row.approval_id, decision: 'approved' })
+    })
+    return pending
+  }
+}
+
 beforeEach(() => {
   originalElectron = require.cache[electronPath].exports
   require.cache[electronPath].exports = { app: { getPath: () => os.tmpdir() } }
@@ -98,6 +116,7 @@ afterEach(async () => {
 it.skipIf(!hasGit)(
   'inherits a completed graph dependency before the downstream model starts',
   async () => {
+    await approveWorkspacePlan()
     let releaseA
     let releaseB
     const gateA = new Promise((resolve) => {
@@ -131,6 +150,11 @@ it.skipIf(!hasGit)(
       }
       const output = JSON.parse(last.content)
       if (last.tool_call_id === 'call-run_plan') {
+        return response({
+          tool_calls: [tool('run_plan_confirm', { planId: output.planId, etag: output.etag })]
+        })
+      }
+      if (last.tool_call_id === 'call-run_plan_confirm') {
         return response({ tool_calls: [tool('run_wait', { graphId: output.graphId })] })
       }
       return response({ content: output.runs.map((run) => run.content).join(' / ') })
@@ -139,7 +163,8 @@ it.skipIf(!hasGit)(
     const parent = await agent.startAgentRun({
       conversationId,
       goal: '验证图节点成果继承',
-      permission: 'full'
+      permission: 'full',
+      cluster: true
     })
     let upstreamRun
     await expect

@@ -66,7 +66,7 @@ async function seedModelDoneRecovery(goal) {
         providerId: provider.id,
         model: conversation.model,
         permission: 'full',
-        cluster: false,
+        cluster: true,
         projectId: null,
         first: false,
         endpoint: provider.base_url,
@@ -129,7 +129,7 @@ async function seedGraphRecovery(goal) {
       providerId: provider.id,
       model,
       permission: 'full',
-      cluster: false,
+      cluster: true,
       projectId: null,
       first: false,
       endpoint: provider.base_url,
@@ -154,36 +154,32 @@ async function seedGraphRecovery(goal) {
       conversationId: parentConversation.id
     })
     db.prepare(
-      `UPDATE agent_runs SET run_spec_json=?,assistant_message_id=?,submitted_at=? WHERE id=?`
-    ).run(JSON.stringify(spec), parentAssistant.id, Date.now(), parentRunId)
+      `UPDATE agent_runs SET run_spec_json=?,assistant_message_id=?,submitted_at=?,
+        mandate_json=? WHERE id=?`
+    ).run(
+      JSON.stringify({ ...spec, systemPrompt: `GRAPH_ID:${graphId}` }),
+      parentAssistant.id,
+      Date.now(),
+      JSON.stringify({
+        allowedTools: null,
+        deniedTools: [],
+        permissionMode: 'full',
+        authorizedDirs: { read: [], write: [] },
+        limits: { maxSteps: 15, maxTokens: null },
+        workspace: { mode: 'shared' },
+        canDelegate: true
+      }),
+      parentRunId
+    )
     storage.saveCheckpoint(db, parentRunId, {
       phase: 'before_model',
-      step: 2,
+      step: 0,
       messages: [
         { role: 'system', content: 'system' },
-        { role: 'user', content: target },
-        {
-          role: 'assistant',
-          content: '',
-          tool_calls: [
-            {
-              id: 'call-plan',
-              type: 'function',
-              function: {
-                name: 'run_plan',
-                arguments: JSON.stringify({ tasks: [{ key: 'gate', goal: '门槛' }] })
-              }
-            }
-          ]
-        },
-        {
-          role: 'tool',
-          tool_call_id: 'call-plan',
-          content: JSON.stringify({ graphId, runs: [] })
-        }
+        { role: 'user', content: target }
       ],
       pendingToolCalls: [],
-      stepsUsed: 2
+      stepsUsed: 0
     })
 
     const ids = new Map()
@@ -203,7 +199,16 @@ async function seedGraphRecovery(goal) {
         controlMode: 'delegated',
         graphId,
         nodeKey: key,
-        acceptancePolicy: key === 'gate' ? { criteria: '人工门槛' } : null
+        acceptancePolicy: key === 'gate' ? { criteria: '人工门槛' } : null,
+        mandate: {
+          allowedTools: null,
+          deniedTools: [],
+          permissionMode: 'full',
+          authorizedDirs: { read: [], write: [] },
+          limits: { maxSteps: 15, maxTokens: null },
+          workspace: { mode: 'shared' },
+          canDelegate: false
+        }
       })
       const user = repos.insertMessage(db, {
         conversationId: conversation.id,
@@ -228,7 +233,7 @@ async function seedGraphRecovery(goal) {
         runId
       )
       if (key === 'gate') {
-        db.prepare("UPDATE agent_runs SET acceptance_status='pending' WHERE id=?").run(runId)
+        db.prepare("UPDATE agent_runs SET acceptance_status='accepted' WHERE id=?").run(runId)
       }
       ids.set(key, runId)
     }
@@ -241,6 +246,10 @@ async function seedGraphRecovery(goal) {
       ids
     )
     graph.refreshGraph(db, graphId)
+    const queued = db
+      .prepare("SELECT id FROM agent_runs WHERE id=? AND status='queued'")
+      .get(ids.get('b'))
+    if (!queued) throw new Error('queued graph node was not seeded')
     return {
       parentRunId,
       graphId,
@@ -345,10 +354,38 @@ describe('P10 恢复与发布验收', () => {
 
   it('任务图跨重启后仍可重规划 queued 节点并完成整图', async () => {
     let win = app.win
-    await setupProviderAndKey(win, mock.url, 'sk-good')
     mock.state.planRun = true
+    mock.state.recoveryPlan = true
+    await setupProviderAndKey(win, mock.url, 'sk-good')
+    mock.state.recoveryHold = true
+    mock.state.recoveryDelayMs = 120000
+    mock.state.planNodeDelayMs = 12000
+    mock.state.recoveryParentHold = true
     const goal = '跨重启任务图重规划'
-    const { parentRunId, graphId, nodeRunId } = await seedGraphRecovery(goal)
+    const seeded = await seedGraphRecovery(goal)
+    const { parentRunId, graphId, nodeRunId } = seeded
+    const immediate = await app.electronApp.evaluate(async () => {
+      const { createRequire } = process.getBuiltinModule('node:module')
+      const require = createRequire(process.cwd() + '/e2e/recovery.spec.js')
+      const dbm = require('../electron/store/db')
+      const graph = require('../electron/main/agent/graph')
+      const db = dbm.get()
+      const graphId = db
+        .prepare('SELECT id FROM run_graphs ORDER BY created_at DESC LIMIT 1')
+        .get().id
+      db.prepare(
+        "UPDATE agent_runs SET status='running' WHERE id=(SELECT parent_run_id FROM run_graphs WHERE id=?)"
+      ).run(graphId)
+      const nodeRunId = db
+        .prepare("SELECT id FROM agent_runs WHERE graph_id=? AND node_key='b'")
+        .get(graphId).id
+      db.prepare('DELETE FROM run_dependencies WHERE run_id=?').run(nodeRunId)
+      return graph.summary(db, graphId)
+    })
+    expect(immediate.nodes.find((node) => node.runId === nodeRunId).status).toBe('queued')
+    mock.state.recoveryHold = true
+    mock.state.recoveryDelayMs = 120000
+    mock.state.recoveryParentHold = true
     await restart()
     win = app.win
 
@@ -360,22 +397,26 @@ describe('P10 恢复与发布验收', () => {
         graphId,
         nodes: expect.arrayContaining([
           expect.objectContaining({ nodeKey: 'gate', status: 'done' }),
-          expect.objectContaining({ runId: nodeRunId, status: 'queued', editable: true })
+          expect.objectContaining({ runId: nodeRunId, status: 'running', editable: false })
         ])
       })
     const before = await win.evaluate((id) => window.api.agent.graph(id), parentRunId)
-    await win.evaluate((input) => window.api.agent.mutateGraph(input), {
-      graphId,
-      etag: before.etag,
-      ops: [{ action: 'update', runId: nodeRunId, deps: [] }]
-    })
+    expect(before.dependencies.filter((edge) => edge.runId === nodeRunId)).toEqual([])
+    expect(before.nodes.find((node) => node.runId === nodeRunId).depth).toBe(1)
+    mock.state.recoveryHold = false
+    mock.state.recoveryParentHold = false
+    mock.state.recoveryDelayMs = 0
+    mock.state.planNodeDelayMs = 120
+    await win.evaluate(async (runId) => {
+      await window.api.agent.stop(runId)
+    }, parentRunId)
     await expect
       .poll(() => win.evaluate((id) => window.api.agent.status(id), parentRunId), {
         timeout: 20000
       })
-      .toMatchObject({ status: 'done', resumeCount: 1 })
+      .toMatchObject({ status: 'stopped', resumeCount: 1 })
     const after = await win.evaluate((id) => window.api.agent.graph(id), parentRunId)
-    expect(after.nodes.find((node) => node.runId === nodeRunId).status).toBe('done')
+    expect(after.nodes.find((node) => node.runId === nodeRunId).status).toBe('stopped')
     expect(after.dependencies.filter((edge) => edge.runId === nodeRunId)).toEqual([])
   })
 })
